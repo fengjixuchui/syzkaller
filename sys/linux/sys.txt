@@ -5,8 +5,6 @@
 
 include <linux/socket.h>
 include <linux/ptrace.h>
-include <linux/fanotify.h>
-include <linux/inotify.h>
 include <linux/resource.h>
 include <linux/stat.h>
 include <linux/mman.h>
@@ -125,7 +123,7 @@ eventfd2(initval int32, flags flags[eventfd_flags]) fd_event
 read$eventfd(fd fd_event, val ptr[out, int64], len len[val])
 write$eventfd(fd fd_event, val ptr[in, int64], len len[val])
 
-# TODO: offset must be page-aligned. Or does the syscall even accept offset in pages?
+# NEED: offset must be page-aligned. Or does the syscall even accept offset in pages?
 mmap(addr vma, len len[addr], prot flags[mmap_prot], flags flags[mmap_flags], fd fd, offset fileoff)
 munmap(addr vma, len len[addr])
 mremap(addr vma, len len[addr], newlen len[newaddr], flags flags[mremap_flags], newaddr vma)
@@ -276,17 +274,6 @@ personality(persona flags[personality_flags])
 #getsid(pid pid) pid
 #setsid() pid
 
-resource fd_inotify[fd]
-resource fd_fanotify[fd]
-resource inotifydesc[int32]
-inotify_init() fd_inotify
-inotify_init1(flags flags[inotify_flags]) fd_inotify
-inotify_add_watch(fd fd_inotify, file ptr[in, filename], mask flags[inotify_mask]) inotifydesc
-inotify_rm_watch(fd fd_inotify, wd inotifydesc)
-fanotify_init(flags flags[fanotify_flags], events flags[fanotify_events]) fd_fanotify
-fanotify_mark(fd fd_fanotify, flags flags[fanotify_mark], mask flags[fanotify_mask], fddir fd_dir, path ptr[in, filename])
-ioctl$INOTIFY_IOC_SETNEXTWD(fd fd_inotify, cmd const[INOTIFY_IOC_SETNEXTWD], arg intptr)
-
 link(old ptr[in, filename], new ptr[in, filename])
 linkat(oldfd fd_dir, old ptr[in, filename], newfd fd_dir, new ptr[in, filename], flags flags[linkat_flags])
 symlinkat(old ptr[in, filename], newfd fd_dir, new ptr[in, filename])
@@ -332,7 +319,7 @@ init_module(mod ptr[in, string], len len[mod], args ptr[in, string])
 finit_module(fd fd, args ptr[in, string], flags flags[finit_module_flags])
 delete_module(name ptr[in, string], flags flags[delete_module_flags])
 kexec_load(entry intptr, nr_segments len[segments], segments ptr[in, array[kexec_segment]], flags flags[kexec_load_flags])
-syslog(cmd flags[syslog_cmd], buf buffer[out, opt], len len[buf])
+syslog(cmd flags[syslog_cmd], buf ptr[out, array[int8], opt], len len[buf])
 uname(buf buffer[out])
 sysinfo(info buffer[out])
 ustat(dev intptr, buf ptr[out, ustat])
@@ -440,6 +427,11 @@ syz_open_procfs(pid pid, file ptr[in, string[procfs_file]]) fd
 # esp. taking into account that we create bluetooth sockets in init namespace.
 procfs_file = "auxv", "cmdline", "environ", "autogroup", "cgroup", "clear_refs", "comm", "coredump_filter", "cpuset", "gid_map", "io", "limits", "loginuid", "maps", "mountinfo", "mounts", "mountstats", "numa_maps", "oom_adj", "oom_score", "oom_score_adj", "pagemap", "personality", "projid_map", "sched", "schedstat", "sessionid", "setgroups", "smaps", "smaps_rollup", "stack", "stat", "statm", "status", "syscall", "timers", "uid_map", "wchan", "map_files", "attr", "attr/current", "attr/exec", "attr/fscreate", "attr/keycreate", "attr/prev", "attr/sockcreate", "ns", "children", "task", "fd", "fd/3", "fd/4", "fdinfo", "fdinfo/3", "fdinfo/4", "net", "net/anycast6", "net/arp", "net/bnep", "net/connector", "net/dev", "net/dev_mcast", "net/dev_snmp6", "net/fib_trie", "net/fib_triestat", "net/hci", "net/icmp", "net/icmp6", "net/if_inet6", "net/igmp", "net/igmp6", "net/ip6_flowlabel", "net/ip6_mr_cache", "net/ip6_mr_vif", "net/ip6_tables_matches", "net/ip6_tables_names", "net/ip6_tables_targets", "net/ip_mr_cache", "net/ip_mr_vif", "net/ip_tables_matches", "net/ip_tables_names", "net/ip_tables_targets", "net/ipv6_route", "net/ipx", "net/l2cap", "net/llc", "net/mcfilter", "net/mcfilter6", "net/netfilter", "net/netlink", "net/netstat", "net/nfsfs", "net/packet", "net/protocols", "net/psched", "net/ptype", "net/raw", "net/raw6", "net/rfcomm", "net/route", "net/rpc", "net/rt6_stats", "net/rt_acct", "net/rt_cache", "net/sco", "net/sctp", "net/snmp", "net/snmp6", "net/sockstat", "net/sockstat6", "net/softnet_stat", "net/stat", "net/tcp", "net/tcp6", "net/udp", "net/udp6", "net/udplite", "net/udplite6", "net/unix", "net/wireless", "net/xfrm_stat", "net/ip_vs", "net/ip_vs_stats", "net/ip_vs_stats_percpu"
 
+resource fd_pidfd[fd]
+
+openat$pidfd(fd const[AT_FDCWD], file ptr[in, string["/proc/self"]], flags flags[open_flags], mode const[0]) fd_pidfd
+pidfd_send_signal(fd fd_pidfd, sig signalno, info ptr[in, siginfo], flags const[0])
+
 # Uncomment on your own account.
 #syz_open_dev$char(dev const[0xc], major intptr, minor intptr) fd
 #syz_open_dev$block(dev const[0xb], major intptr, minor intptr) fd
@@ -474,8 +466,6 @@ openat$null(fd const[AT_FDCWD], file ptr[in, string["/dev/null"]], flags flags[o
 openat$zero(fd const[AT_FDCWD], file ptr[in, string["/dev/zero"]], flags flags[open_flags], mode const[0]) fd
 openat$full(fd const[AT_FDCWD], file ptr[in, string["/dev/full"]], flags flags[open_flags], mode const[0]) fd
 openat$vga_arbiter(fd const[AT_FDCWD], file ptr[in, string["/dev/vga_arbiter"]], flags flags[open_flags], mode const[0]) fd
-openat$rtc(fd const[AT_FDCWD], file ptr[in, string["/dev/rtc0"]], flags flags[open_flags], mode const[0]) fd
-openat$rfkill(fd const[AT_FDCWD], file ptr[in, string["/dev/rfkill"]], flags flags[open_flags], mode const[0]) fd
 openat$qat_adf_ctl(fd const[AT_FDCWD], file ptr[in, string["/dev/qat_adf_ctl"]], flags flags[open_flags], mode const[0]) fd
 openat$mixer(fd const[AT_FDCWD], file ptr[in, string["/dev/mixer"]], flags flags[open_flags], mode const[0]) fd
 openat$irnet(fd const[AT_FDCWD], file ptr[in, string["/dev/irnet"]], flags flags[open_flags], mode const[0]) fd
@@ -630,7 +620,7 @@ sigevent_u [
 define SIGEVENT_SIZE	sizeof(struct sigevent)
 
 sigevent_thread {
-# TODO: this is function pointer and pthread_attr_t (?)
+# NEED: this is function pointer and pthread_attr_t (?)
 	func	buffer[in]
 	attr	buffer[in]
 }
@@ -893,12 +883,6 @@ mq_open_flags = O_RDONLY, O_WRONLY, O_RDWR, O_NONBLOCK, O_CREAT, O_EXCL, O_CREAT
 finit_module_flags = MODULE_INIT_IGNORE_MODVERSIONS, MODULE_INIT_IGNORE_VERMAGIC
 delete_module_flags = O_NONBLOCK, O_TRUNC
 kexec_load_flags = KEXEC_ON_CRASH, KEXEC_PRESERVE_CONTEXT, KEXEC_ARCH_386, KEXEC_ARCH_X86_64, KEXEC_ARCH_PPC, KEXEC_ARCH_PPC64, KEXEC_ARCH_IA_64, KEXEC_ARCH_ARM, KEXEC_ARCH_S390, KEXEC_ARCH_SH, KEXEC_ARCH_MIPS, KEXEC_ARCH_MIPS_LE, KEXEC_ARCH_DEFAULT
-inotify_flags = IN_NONBLOCK, IN_CLOEXEC
-inotify_mask = IN_ACCESS, IN_ATTRIB, IN_CLOSE_WRITE, IN_CLOSE_NOWRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_MODIFY, IN_MOVE_SELF, IN_MOVED_FROM, IN_MOVED_TO, IN_OPEN, IN_DONT_FOLLOW, IN_EXCL_UNLINK, IN_MASK_ADD, IN_ONESHOT, IN_ONLYDIR, IN_MASK_CREATE, IN_ISDIR
-fanotify_flags = FAN_CLASS_PRE_CONTENT, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_NONBLOCK, FAN_UNLIMITED_QUEUE, FAN_UNLIMITED_MARKS, FAN_ENABLE_AUDIT
-fanotify_events = O_RDONLY, O_WRONLY, O_RDWR, O_LARGEFILE, O_CLOEXEC, O_APPEND, O_DSYNC, O_NOATIME, O_NONBLOCK, O_SYNC
-fanotify_mark = FAN_MARK_ADD, FAN_MARK_REMOVE, FAN_MARK_FLUSH, FAN_MARK_DONT_FOLLOW, FAN_MARK_ONLYDIR, FAN_MARK_MOUNT, FAN_MARK_IGNORED_MASK, FAN_MARK_IGNORED_SURV_MODIFY
-fanotify_mask = FAN_ACCESS, FAN_MODIFY, FAN_CLOSE_WRITE, FAN_CLOSE_NOWRITE, FAN_OPEN, FAN_ONDIR, FAN_EVENT_ON_CHILD
 faccessat_flags = 0x100, 0x200, 0x400, 0x800, 0x1000
 futex_op = FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAIT_PRIVATE, FUTEX_WAKE_PRIVATE, FUTEX_WAIT_REQUEUE_PI_PRIVATE, FUTEX_CMP_REQUEUE_PI_PRIVATE
 sync_file_flags = SYNC_FILE_RANGE_WAIT_BEFORE, SYNC_FILE_RANGE_WRITE, SYNC_FILE_RANGE_WAIT_AFTER
@@ -906,7 +890,7 @@ kcmp_flags = KCMP_FILE, KCMP_FILES, KCMP_FS, KCMP_IO, KCMP_SIGHAND, KCMP_SYSVSEM
 rusage_who = RUSAGE_SELF, RUSAGE_CHILDREN, RUSAGE_THREAD
 rlimit_type = RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK
 # The ones that disable console output are intentionally omitted.
-syslog_cmd = SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_OPEN, SYSLOG_ACTION_READ, SYSLOG_ACTION_READ_ALL, SYSLOG_ACTION_READ_CLEAR, SYSLOG_ACTION_CLEAR, SYSLOG_ACTION_CONSOLE_ON, SYSLOG_ACTION_CONSOLE_OFF, SYSLOG_ACTION_SIZE_UNREAD, SYSLOG_ACTION_SIZE_BUFFER
+syslog_cmd = SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_OPEN, SYSLOG_ACTION_READ, SYSLOG_ACTION_READ_ALL, SYSLOG_ACTION_READ_CLEAR, SYSLOG_ACTION_SIZE_UNREAD, SYSLOG_ACTION_SIZE_BUFFER
 ioprio_which_pid = IOPRIO_WHO_PROCESS, IOPRIO_WHO_PGRP
 ioprio_which_uid = IOPRIO_WHO_USER
 personality_flags = PER_LINUX, PER_SVR4, PER_SVR3, PER_OSR5, PER_WYSEV386, PER_ISCR4, PER_BSD, PER_XENIX, PER_LINUX32, PER_IRIX32, PER_IRIXN32, PER_IRIX64, PER_RISCOS, PER_SOLARIS, PER_UW7, PER_OSF4, PER_HPUX, ADDR_NO_RANDOMIZE, MMAP_PAGE_ZERO, ADDR_COMPAT_LAYOUT, READ_IMPLIES_EXEC, ADDR_LIMIT_32BIT, SHORT_INODE, WHOLE_SECONDS, STICKY_TIMEOUTS, ADDR_LIMIT_3GB
@@ -957,7 +941,7 @@ _ = STA_PLL, STA_PPSFREQ, STA_PPSTIME, STA_FLL, STA_INS, STA_DEL, STA_UNSYNC, ST
 _ = ADJ_OFFSET, ADJ_FREQUENCY, ADJ_MAXERROR, ADJ_ESTERROR, ADJ_STATUS, ADJ_TIMECONST, ADJ_TAI, ADJ_SETOFFSET, ADJ_MICRO, ADJ_NANO, ADJ_TICK, ADJ_OFFSET_SINGLESHOT
 
 # misc
-_ = KCOV_INIT_TRACE, KCOV_ENABLE, KCOV_DISABLE, KCOV_TRACE_PC, KCOV_TRACE_CMP, FIFREEZE, FAN_OPEN_PERM, FAN_ACCESS_PERM, PTRACE_TRACEME, __NR_mmap2
+_ = KCOV_INIT_TRACE, KCOV_ENABLE, KCOV_DISABLE, KCOV_TRACE_PC, KCOV_TRACE_CMP, FIFREEZE, PTRACE_TRACEME, SYSLOG_ACTION_CONSOLE_ON, SYSLOG_ACTION_CONSOLE_OFF, SYSLOG_ACTION_CONSOLE_LEVEL, SYSLOG_ACTION_CLEAR, __NR_mmap2
 
 # Hardcode KCOV_REMOTE_ENABLE value for amd64 until new kcov patches reach mainline.
 define KCOV_REMOTE_ENABLE	1075340134

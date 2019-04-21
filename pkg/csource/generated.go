@@ -9,7 +9,7 @@ var commonHeader = `
 #define _GNU_SOURCE
 #endif
 
-#if GOOS_freebsd
+#if GOOS_freebsd || GOOS_test && HOSTGOOS_freebsd
 #include <sys/endian.h>
 #else
 #include <endian.h>
@@ -35,7 +35,7 @@ NORETURN void doexit(int status)
 
 #if SYZ_EXECUTOR || SYZ_PROCS || SYZ_REPEAT && SYZ_ENABLE_CGROUPS ||         \
     SYZ_ENABLE_NETDEV || __NR_syz_mount_image || __NR_syz_read_part_table || \
-    (GOOS_openbsd || GOOS_freebsd) && SYZ_TUN_ENABLE
+    __NR_syz_usb_connect || (GOOS_openbsd || GOOS_freebsd) && SYZ_TUN_ENABLE
 unsigned long long procid;
 #endif
 
@@ -122,7 +122,8 @@ static void kill_and_wait(int pid, int* status)
 #endif
 
 #if !GOOS_windows
-#if SYZ_EXECUTOR || SYZ_THREADED || SYZ_REPEAT && SYZ_EXECUTOR_USES_FORK_SERVER
+#if SYZ_EXECUTOR || SYZ_THREADED || SYZ_REPEAT && SYZ_EXECUTOR_USES_FORK_SERVER || \
+    __NR_syz_usb_connect
 static void sleep_ms(uint64 ms)
 {
 	usleep(ms * 1000);
@@ -208,6 +209,7 @@ static int inject_fault(int nth)
 	return 0;
 }
 #endif
+
 #if SYZ_EXECUTOR
 static int fault_injected(int fail_fd)
 {
@@ -218,6 +220,7 @@ static int fault_injected(int fail_fd)
 
 #if !GOOS_windows
 #if SYZ_EXECUTOR || SYZ_THREADED
+#include <errno.h>
 #include <pthread.h>
 
 static void thread_start(void* (*fn)(void*), void* arg)
@@ -226,9 +229,19 @@ static void thread_start(void* (*fn)(void*), void* arg)
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 128 << 10);
-	if (pthread_create(&th, &attr, fn, arg))
-		exitf("pthread_create failed");
-	pthread_attr_destroy(&attr);
+	int i;
+	for (i = 0; i < 100; i++) {
+		if (pthread_create(&th, &attr, fn, arg) == 0) {
+			pthread_attr_destroy(&attr);
+			return;
+		}
+		if (errno == EAGAIN) {
+			usleep(50);
+			continue;
+		}
+		break;
+	}
+	exitf("pthread_create failed");
 }
 
 #endif
@@ -349,14 +362,6 @@ static uint16 csum_inet_digest(struct csum_inet* csum)
 }
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_execute_func
-static long syz_execute_func(long text)
-{
-	((void (*)(void))(text))();
-	return 0;
-}
-#endif
-
 #if GOOS_akaros
 
 #include <ros/syscall.h>
@@ -368,7 +373,7 @@ static void loop();
 static int do_sandbox_none(void)
 {
 	loop();
-	doexit(0);
+	return 0;
 }
 #endif
 
@@ -536,7 +541,7 @@ static void initialize_tun(int tun_id)
 #include <stdbool.h>
 #include <sys/uio.h>
 
-static long syz_emit_ethernet(long a0, long a1)
+static long syz_emit_ethernet(volatile long a0, volatile long a1)
 {
 	if (tunfd < 0)
 		return (uintptr_t)-1;
@@ -587,7 +592,7 @@ struct tcp_resources {
 #include <netinet/tcp.h>
 #include <netinet/if_ether.h>
 
-static long syz_extract_tcp_res(long a0, long a1, long a2)
+static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile long a2)
 {
 
 	if (tunfd < 0)
@@ -731,7 +736,7 @@ static int do_sandbox_setuid(void)
 #elif GOOS_fuchsia
 
 #include <fcntl.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/directory.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -901,12 +906,16 @@ long syz_mmap(size_t addr, size_t size)
 		fail("zx_object_get_info(ZX_INFO_VMAR) failed: %d", status);
 	zx_handle_t vmo;
 	status = zx_vmo_create(size, 0, &vmo);
+	if (status != ZX_OK) {
+		debug("zx_vmo_create failed with: %d\n", status);
+		return status;
+	}
+	status = zx_vmo_replace_as_executable(vmo, ZX_HANDLE_INVALID, &vmo);
 	if (status != ZX_OK)
 		return status;
 	uintptr_t mapped_addr;
 	status = zx_vmar_map(root, ZX_VM_FLAG_SPECIFIC_OVERWRITE | ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE,
 			     addr - info.base, vmo, 0, size,
-
 			     &mapped_addr);
 	return status;
 }
@@ -941,16 +950,19 @@ static long syz_job_default(void)
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_future_time
-static long syz_future_time(long when)
+static long syz_future_time(volatile long when)
 {
 	zx_time_t delta_ms;
 	switch (when) {
 	case 0:
 		delta_ms = 5;
+		break;
 	case 1:
 		delta_ms = 30;
+		break;
 	default:
 		delta_ms = 10000;
+		break;
 	}
 	zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
 	return now + delta_ms * 1000 * 1000;
@@ -975,6 +987,7 @@ static int do_sandbox_none(void)
 #include <unistd.h>
 
 #if SYZ_EXECUTOR
+const int kExtraCoverSize = 256 << 10;
 struct cover_t;
 static void cover_reset(cover_t* cov);
 #endif
@@ -1035,7 +1048,7 @@ static int event_timedwait(event_t* ev, uint64 timeout)
 }
 #endif
 
-#if SYZ_EXECUTOR || SYZ_FAULT_INJECTION || SYZ_ENABLE_CGROUPS || SYZ_SANDBOX_NONE || \
+#if SYZ_EXECUTOR || SYZ_REPEAT || SYZ_TUN_ENABLE || SYZ_FAULT_INJECTION || SYZ_SANDBOX_NONE || \
     SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
 #include <errno.h>
 #include <fcntl.h>
@@ -1389,7 +1402,7 @@ static void initialize_tun(void)
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #define DEV_IPV4 "172.20.20.%d"
-#define DEV_IPV6 "fe80::%02hx"
+#define DEV_IPV6 "fe80::%02x"
 #define DEV_MAC 0x00aaaaaaaaaa
 static void initialize_netdevices(void)
 {
@@ -1519,7 +1532,7 @@ static void initialize_netdevices_init(void)
 		sprintf(addr, "172.30.%d.%d", i, (int)procid + 1);
 		netlink_add_addr4(sock, dev, addr);
 		if (!devtypes[i].noipv6) {
-			sprintf(addr, "fe88::%02hx:%02hx", i, (int)procid + 1);
+			sprintf(addr, "fe88::%02x:%02x", i, (int)procid + 1);
 			netlink_add_addr6(sock, dev, addr);
 		}
 		int macsize = devtypes[i].macsize;
@@ -1562,7 +1575,7 @@ struct vnet_fragmentation {
 	uint32 frags[MAX_FRAGS];
 };
 
-static long syz_emit_ethernet(long a0, long a1, long a2)
+static long syz_emit_ethernet(volatile long a0, volatile long a1, volatile long a2)
 {
 	if (tunfd < 0)
 		return (uintptr_t)-1;
@@ -1640,7 +1653,7 @@ struct tcp_resources {
 	uint32 ack;
 };
 
-static long syz_extract_tcp_res(long a0, long a1, long a2)
+static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile long a2)
 {
 
 	if (tunfd < 0)
@@ -1690,13 +1703,473 @@ static long syz_extract_tcp_res(long a0, long a1, long a2)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/usb/ch9.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#define USB_MAX_EP_NUM 32
+
+struct usb_device_index {
+	struct usb_device_descriptor* dev;
+	struct usb_config_descriptor* config;
+	unsigned config_length;
+	struct usb_interface_descriptor* iface;
+	struct usb_endpoint_descriptor* eps[USB_MAX_EP_NUM];
+	unsigned eps_num;
+};
+
+static bool parse_usb_descriptor(char* buffer, size_t length, struct usb_device_index* index)
+{
+	if (length < sizeof(*index->dev) + sizeof(*index->config) + sizeof(*index->iface))
+		return false;
+
+	index->dev = (struct usb_device_descriptor*)buffer;
+	index->config = (struct usb_config_descriptor*)(buffer + sizeof(*index->dev));
+	index->config_length = length - sizeof(*index->dev);
+	index->iface = (struct usb_interface_descriptor*)(buffer + sizeof(*index->dev) + sizeof(*index->config));
+
+	index->eps_num = 0;
+	size_t offset = 0;
+
+	while (true) {
+		if (offset == length)
+			break;
+		if (offset + 1 < length)
+			break;
+		uint8 length = buffer[offset];
+		uint8 type = buffer[offset + 1];
+		if (type == USB_DT_ENDPOINT) {
+			index->eps[index->eps_num] = (struct usb_endpoint_descriptor*)(buffer + offset);
+			index->eps_num++;
+		}
+		if (index->eps_num == USB_MAX_EP_NUM)
+			break;
+		offset += length;
+	}
+
+	return true;
+}
+
+enum usb_fuzzer_event_type {
+	USB_FUZZER_EVENT_INVALID,
+	USB_FUZZER_EVENT_CONNECT,
+	USB_FUZZER_EVENT_DISCONNECT,
+	USB_FUZZER_EVENT_SUSPEND,
+	USB_FUZZER_EVENT_RESUME,
+	USB_FUZZER_EVENT_CONTROL,
+};
+
+struct usb_fuzzer_event {
+	uint32 type;
+	uint32 length;
+	char data[0];
+};
+
+struct usb_fuzzer_init {
+	uint64 speed;
+	const char* driver_name;
+	const char* device_name;
+};
+
+struct usb_fuzzer_ep_io {
+	uint16 ep;
+	uint16 flags;
+	uint32 length;
+	char data[0];
+};
+
+#define USB_FUZZER_IOCTL_INIT _IOW('U', 0, struct usb_fuzzer_init)
+#define USB_FUZZER_IOCTL_RUN _IO('U', 1)
+#define USB_FUZZER_IOCTL_EP0_READ _IOWR('U', 2, struct usb_fuzzer_event)
+#define USB_FUZZER_IOCTL_EP0_WRITE _IOW('U', 3, struct usb_fuzzer_ep_io)
+#define USB_FUZZER_IOCTL_EP_ENABLE _IOW('U', 4, struct usb_endpoint_descriptor)
+#define USB_FUZZER_IOCTL_EP_WRITE _IOW('U', 6, struct usb_fuzzer_ep_io)
+#define USB_FUZZER_IOCTL_CONFIGURE _IO('U', 8)
+#define USB_FUZZER_IOCTL_VBUS_DRAW _IOW('U', 9, uint32)
+
+int usb_fuzzer_open()
+{
+	return open("/sys/kernel/debug/usb-fuzzer", O_RDWR);
+}
+
+int usb_fuzzer_init(int fd, uint32 speed, const char* driver, const char* device)
+{
+	struct usb_fuzzer_init arg;
+	arg.speed = speed;
+	arg.driver_name = driver;
+	arg.device_name = device;
+	return ioctl(fd, USB_FUZZER_IOCTL_INIT, &arg);
+}
+
+int usb_fuzzer_run(int fd)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_RUN, 0);
+}
+
+int usb_fuzzer_ep0_read(int fd, struct usb_fuzzer_event* event)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_EP0_READ, event);
+}
+
+int usb_fuzzer_ep0_write(int fd, struct usb_fuzzer_ep_io* io)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_EP0_WRITE, io);
+}
+
+int usb_fuzzer_ep_write(int fd, struct usb_fuzzer_ep_io* io)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_EP_WRITE, io);
+}
+
+int usb_fuzzer_ep_enable(int fd, struct usb_endpoint_descriptor* desc)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_EP_ENABLE, desc);
+}
+
+int usb_fuzzer_configure(int fd)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_CONFIGURE, 0);
+}
+
+int usb_fuzzer_vbus_draw(int fd, uint32 power)
+{
+	return ioctl(fd, USB_FUZZER_IOCTL_VBUS_DRAW, power);
+}
+
+#define USB_MAX_PACKET_SIZE 1024
+
+struct usb_fuzzer_control_event {
+	struct usb_fuzzer_event inner;
+	struct usb_ctrlrequest ctrl;
+};
+
+struct usb_fuzzer_ep_io_data {
+	struct usb_fuzzer_ep_io inner;
+	char data[USB_MAX_PACKET_SIZE];
+};
+
+struct vusb_connect_string_descriptor {
+	uint32 len;
+	char* str;
+} __attribute__((packed));
+
+struct vusb_connect_descriptors {
+	uint32 qual_len;
+	char* qual;
+	uint32 bos_len;
+	char* bos;
+	uint32 strs_len;
+	struct vusb_connect_string_descriptor strs[0];
+} __attribute__((packed));
+
+static volatile long syz_usb_connect(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+{
+	int64_t speed = a0;
+	int64_t dev_len = a1;
+	char* dev = (char*)a2;
+	struct vusb_connect_descriptors* conn_descs = (struct vusb_connect_descriptors*)a3;
+
+	debug("syz_usb_connect: dev: %p\n", dev);
+	if (!dev)
+		return -1;
+
+	debug("syz_usb_connect: device data:\n");
+	debug_dump_data(dev, dev_len);
+
+	struct usb_device_index index;
+	memset(&index, 0, sizeof(index));
+	int rv = parse_usb_descriptor(dev, dev_len, &index);
+	if (!rv)
+		return -1;
+	debug("syz_usb_connect: parsed usb descriptor\n");
+
+	int fd = usb_fuzzer_open();
+	if (fd < 0)
+		return -1;
+	debug("syz_usb_connect: usb_fuzzer_open success\n");
+
+	char device[32];
+	sprintf(&device[0], "dummy_udc.%llu", procid);
+	rv = usb_fuzzer_init(fd, speed, "dummy_udc", &device[0]);
+	if (rv < 0)
+		return -1;
+	debug("syz_usb_connect: usb_fuzzer_init success\n");
+
+	rv = usb_fuzzer_run(fd);
+	if (rv < 0)
+		return -1;
+	debug("syz_usb_connect: usb_fuzzer_run success\n");
+
+	bool done = false;
+	while (!done) {
+		char* response_data = NULL;
+		uint32 response_length = 0;
+
+		unsigned ep;
+		uint8 str_idx;
+
+		struct usb_fuzzer_control_event event;
+		event.inner.type = 0;
+		event.inner.length = sizeof(event.ctrl);
+		rv = usb_fuzzer_ep0_read(fd, (struct usb_fuzzer_event*)&event);
+		if (rv < 0)
+			return -1;
+		if (event.inner.type != USB_FUZZER_EVENT_CONTROL)
+			continue;
+
+		debug("syz_usb_connect: bRequestType: 0x%x, bRequest: 0x%x, wValue: 0x%x, wIndex: 0x%x, wLength: %d\n",
+		      event.ctrl.bRequestType, event.ctrl.bRequest, event.ctrl.wValue, event.ctrl.wIndex, event.ctrl.wLength);
+
+		switch (event.ctrl.bRequestType & USB_TYPE_MASK) {
+		case USB_TYPE_STANDARD:
+			switch (event.ctrl.bRequest) {
+			case USB_REQ_GET_DESCRIPTOR:
+				switch (event.ctrl.wValue >> 8) {
+				case USB_DT_DEVICE:
+					response_data = (char*)index.dev;
+					response_length = sizeof(*index.dev);
+					goto reply;
+				case USB_DT_CONFIG:
+					response_data = (char*)index.config;
+					response_length = index.config_length;
+					goto reply;
+				case USB_DT_STRING:
+					str_idx = (uint8)event.ctrl.wValue;
+					if (str_idx >= conn_descs->strs_len)
+						goto reply;
+					response_data = conn_descs->strs[str_idx].str;
+					response_length = conn_descs->strs[str_idx].len;
+					goto reply;
+				case USB_DT_BOS:
+					response_data = conn_descs->bos;
+					response_length = conn_descs->bos_len;
+					goto reply;
+				case USB_DT_DEVICE_QUALIFIER:
+					response_data = conn_descs->qual;
+					response_length = conn_descs->qual_len;
+					goto reply;
+				default:
+					fail("syz_usb_connect: no response");
+					continue;
+				}
+				break;
+			case USB_REQ_SET_CONFIGURATION:
+				rv = usb_fuzzer_vbus_draw(fd, index.config->bMaxPower);
+				if (rv < 0)
+					return -1;
+				rv = usb_fuzzer_configure(fd);
+				if (rv < 0)
+					return -1;
+				for (ep = 0; ep < index.eps_num; ep++) {
+					rv = usb_fuzzer_ep_enable(fd, index.eps[ep]);
+					if (rv < 0)
+						fail("syz_usb_connect: ep enable failed");
+				}
+				done = true;
+				goto reply;
+			default:
+				fail("syz_usb_connect: no response");
+				continue;
+			}
+			break;
+		default:
+			fail("syz_usb_connect: no response");
+			continue;
+		}
+
+		struct usb_fuzzer_ep_io_data response;
+
+	reply:
+		response.inner.ep = 0;
+		response.inner.flags = 0;
+		if (response_length > sizeof(response.data))
+			response_length = 0;
+		response.inner.length = response_length;
+		if (response_data)
+			memcpy(&response.data[0], response_data, response_length);
+		if (event.ctrl.wLength < response.inner.length)
+			response.inner.length = event.ctrl.wLength;
+		debug("syz_usb_connect: reply length = %d\n", response.inner.length);
+		usb_fuzzer_ep0_write(fd, (struct usb_fuzzer_ep_io*)&response);
+	}
+
+	sleep_ms(200);
+
+	debug("syz_usb_connect: configured\n");
+
+	return fd;
+}
+
+#if SYZ_EXECUTOR || __NR_syz_usb_control_io
+struct vusb_descriptor {
+	uint8 req_type;
+	uint8 desc_type;
+	uint32 len;
+	char data[0];
+} __attribute__((packed));
+
+struct vusb_descriptors {
+	uint32 len;
+	struct vusb_descriptor* generic;
+	struct vusb_descriptor* descs[0];
+} __attribute__((packed));
+
+struct vusb_response {
+	uint8 type;
+	uint8 req;
+	uint32 len;
+	char data[0];
+} __attribute__((packed));
+
+struct vusb_responses {
+	uint32 len;
+	struct vusb_response* generic;
+	struct vusb_response* resps[0];
+} __attribute__((packed));
+
+static volatile long syz_usb_control_io(volatile long a0, volatile long a1, volatile long a2)
+{
+	int fd = a0;
+	struct vusb_descriptors* descs = (struct vusb_descriptors*)a1;
+	struct vusb_responses* resps = (struct vusb_responses*)a2;
+
+	struct usb_fuzzer_control_event event;
+	event.inner.type = 0;
+	event.inner.length = sizeof(event.ctrl);
+	int rv = usb_fuzzer_ep0_read(fd, (struct usb_fuzzer_event*)&event);
+	if (rv < 0)
+		return -1;
+	if (event.inner.type != USB_FUZZER_EVENT_CONTROL)
+		return -1;
+
+	debug("syz_usb_control_io: bRequestType: 0x%x, bRequest: 0x%x, wValue: 0x%x, wIndex: 0x%x, wLength: %d\n",
+	      event.ctrl.bRequestType, event.ctrl.bRequest, event.ctrl.wValue, event.ctrl.wIndex, event.ctrl.wLength);
+
+	uint8 req = event.ctrl.bRequest;
+	uint8 req_type = event.ctrl.bRequestType & USB_TYPE_MASK;
+	uint8 desc_type = event.ctrl.wValue >> 8;
+
+	char* response_data = NULL;
+	uint32 response_length = 0;
+
+	if (req == USB_REQ_GET_DESCRIPTOR) {
+		int i;
+		int descs_num = (descs->len - offsetof(struct vusb_descriptors, descs)) / sizeof(descs->descs[0]);
+
+		for (i = 0; i < descs_num; i++) {
+			struct vusb_descriptor* desc = descs->descs[i];
+			if (!desc)
+				continue;
+			if (desc->req_type == req_type && desc->desc_type == desc_type) {
+				response_length = desc->len;
+				if (response_length != 0)
+					response_data = &desc->data[0];
+				goto reply;
+			}
+		}
+
+		if (descs->generic) {
+			response_data = &descs->generic->data[0];
+			response_length = descs->generic->len;
+			goto reply;
+		}
+	} else {
+		int i;
+		int resps_num = (resps->len - offsetof(struct vusb_responses, resps)) / sizeof(resps->resps[0]);
+
+		for (i = 0; i < resps_num; i++) {
+			struct vusb_response* resp = resps->resps[i];
+			if (!resp)
+				continue;
+			if (resp->type == req_type && resp->req == req) {
+				response_length = resp->len;
+				if (response_length != 0)
+					response_data = &resp->data[0];
+				goto reply;
+			}
+		}
+
+		if (resps->generic) {
+			response_data = &resps->generic->data[0];
+			response_length = resps->generic->len;
+			goto reply;
+		}
+	}
+
+	return -1;
+
+	struct usb_fuzzer_ep_io_data response;
+
+reply:
+	response.inner.ep = 0;
+	response.inner.flags = 0;
+	if (response_length > sizeof(response.data))
+		response_length = 0;
+	response.inner.length = response_length;
+	if (response_data)
+		memcpy(&response.data[0], response_data, response_length);
+	if (event.ctrl.wLength < response.inner.length)
+		response.inner.length = event.ctrl.wLength;
+	debug("syz_usb_control_io: reply length = %d\n", response.inner.length);
+	usb_fuzzer_ep0_write(fd, (struct usb_fuzzer_ep_io*)&response);
+
+	sleep_ms(200);
+
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_usb_ep_write
+static volatile long syz_usb_ep_write(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+{
+	int fd = a0;
+	uint16 ep = a1;
+	uint32 len = a2;
+	char* data = (char*)a3;
+
+	struct usb_fuzzer_ep_io_data response;
+	response.inner.ep = ep;
+	response.inner.flags = 0;
+	if (len > sizeof(response.data))
+		len = 0;
+	response.inner.length = len;
+	if (data)
+		memcpy(&response.data[0], data, len);
+
+	return usb_fuzzer_ep_write(fd, (struct usb_fuzzer_ep_io*)&response);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_usb_disconnect
+static volatile long syz_usb_disconnect(volatile long a0)
+{
+	int fd = a0;
+
+	int rv = close(fd);
+
+	sleep_ms(200);
+
+	return rv;
+}
+#endif
+
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_open_dev
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-static long syz_open_dev(long a0, long a1, long a2)
+static long syz_open_dev(volatile long a0, volatile long a1, volatile long a2)
 {
 	if (a0 == 0xc || a0 == 0xb) {
 		char buf[128];
@@ -1722,7 +2195,7 @@ static long syz_open_dev(long a0, long a1, long a2)
 #include <sys/stat.h>
 #include <sys/types.h>
 
-static long syz_open_procfs(long a0, long a1)
+static long syz_open_procfs(volatile long a0, volatile long a1)
 {
 
 	char buf[128];
@@ -1747,7 +2220,7 @@ static long syz_open_procfs(long a0, long a1)
 #include <sys/stat.h>
 #include <sys/types.h>
 
-static long syz_open_pts(long a0, long a1)
+static long syz_open_pts(volatile long a0, volatile long a1)
 {
 	int ptyno = 0;
 	if (ioctl(a0, TIOCGPTN, &ptyno))
@@ -1767,7 +2240,7 @@ static long syz_open_pts(long a0, long a1)
 #include <unistd.h>
 
 const int kInitNetNsFd = 239;
-static long syz_init_net_socket(long domain, long type, long proto)
+static long syz_init_net_socket(volatile long domain, volatile long type, volatile long proto)
 {
 	int netns = open("/proc/self/ns/net", O_RDONLY);
 	if (netns == -1)
@@ -1783,7 +2256,7 @@ static long syz_init_net_socket(long domain, long type, long proto)
 	return sock;
 }
 #else
-static long syz_init_net_socket(long domain, long type, long proto)
+static long syz_init_net_socket(volatile long domain, volatile long type, volatile long proto)
 {
 	return syscall(__NR_socket, domain, type, proto);
 }
@@ -1797,7 +2270,7 @@ static long syz_init_net_socket(long domain, long type, long proto)
 #include <sys/socket.h>
 #include <sys/types.h>
 
-static long syz_genetlink_get_family_id(long name)
+static long syz_genetlink_get_family_id(volatile long name)
 {
 	char buf[512] = {0};
 	struct nlmsghdr* hdr = (struct nlmsghdr*)buf;
@@ -1875,7 +2348,7 @@ struct fs_image_segment {
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_read_part_table
-static long syz_read_part_table(unsigned long size, unsigned long nsegs, long segments)
+static long syz_read_part_table(volatile unsigned long size, volatile unsigned long nsegs, volatile long segments)
 {
 	char loopname[64], linkname[64];
 	int loopfd, err = 0, res = -1;
@@ -1966,7 +2439,7 @@ error:
 #if SYZ_EXECUTOR || __NR_syz_mount_image
 #include <string.h>
 #include <sys/mount.h>
-static long syz_mount_image(long fsarg, long dir, unsigned long size, unsigned long nsegs, long segments, long flags, long optsarg)
+static long syz_mount_image(volatile long fsarg, volatile long dir, volatile unsigned long size, volatile unsigned long nsegs, volatile long segments, volatile long flags, volatile long optsarg)
 {
 	char loopname[64], fs[32], opts[256];
 	int loopfd, err = 0, res = -1;
@@ -2394,7 +2867,7 @@ struct kvm_opt {
 #define KVM_SETUP_VIRT86 (1 << 4)
 #define KVM_SETUP_SMM (1 << 5)
 #define KVM_SETUP_VM (1 << 6)
-static uintptr_t syz_kvm_setup_cpu(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7)
+static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5, volatile long a6, volatile long a7)
 {
 	const int vmfd = a0;
 	const int cpufd = a1;
@@ -2944,7 +3417,7 @@ struct kvm_opt {
 	uint64 typ;
 	uint64 val;
 };
-static uintptr_t syz_kvm_setup_cpu(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7)
+static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5, volatile long a6, volatile long a7)
 {
 	const int vmfd = a0;
 	const int cpufd = a1;
@@ -3011,7 +3484,7 @@ static uintptr_t syz_kvm_setup_cpu(uintptr_t a0, uintptr_t a1, uintptr_t a2, uin
 }
 
 #else
-static long syz_kvm_setup_cpu(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7)
+static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5, volatile long a6, volatile long a7)
 {
 	return 0;
 }
@@ -3476,6 +3949,8 @@ static void reset_ebtables()
 static void checkpoint_net_namespace(void)
 {
 #if SYZ_EXECUTOR
+	if (!flag_enable_net_reset)
+		return;
 	if (flag_sandbox == sandbox_setuid)
 		return;
 #endif
@@ -3488,6 +3963,8 @@ static void checkpoint_net_namespace(void)
 static void reset_net_namespace(void)
 {
 #if SYZ_EXECUTOR
+	if (!flag_enable_net_reset)
+		return;
 	if (flag_sandbox == sandbox_setuid)
 		return;
 #endif
@@ -3498,7 +3975,7 @@ static void reset_net_namespace(void)
 }
 #endif
 
-#if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
+#if SYZ_EXECUTOR || (SYZ_ENABLE_CGROUPS && (SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP))
 #include <fcntl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -3506,6 +3983,10 @@ static void reset_net_namespace(void)
 
 static void setup_cgroups()
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
 	if (mkdir("/syzcgroup", 0777)) {
 		debug("mkdir(/syzcgroup) failed: %d\n", errno);
 	}
@@ -3539,8 +4020,108 @@ static void setup_cgroups()
 		debug("chmod(/syzcgroup/net) failed: %d\n", errno);
 	}
 }
+
+#if SYZ_EXECUTOR || SYZ_REPEAT
+static void setup_cgroups_loop()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	int pid = getpid();
+	char file[128];
+	char cgroupdir[64];
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/unified/syz%llu", procid);
+	if (mkdir(cgroupdir, 0777)) {
+		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(file, sizeof(file), "%s/pids.max", cgroupdir);
+	write_file(file, "32");
+	snprintf(file, sizeof(file), "%s/memory.low", cgroupdir);
+	write_file(file, "%d", 298 << 20);
+	snprintf(file, sizeof(file), "%s/memory.high", cgroupdir);
+	write_file(file, "%d", 299 << 20);
+	snprintf(file, sizeof(file), "%s/memory.max", cgroupdir);
+	write_file(file, "%d", 300 << 20);
+	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+	write_file(file, "%d", pid);
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
+	if (mkdir(cgroupdir, 0777)) {
+		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+	write_file(file, "%d", pid);
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
+	if (mkdir(cgroupdir, 0777)) {
+		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+	write_file(file, "%d", pid);
+}
+
+static void setup_cgroups_test()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	char cgroupdir[64];
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/unified/syz%llu", procid);
+	if (symlink(cgroupdir, "./cgroup")) {
+		debug("symlink(%s, ./cgroup) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
+	if (symlink(cgroupdir, "./cgroup.cpu")) {
+		debug("symlink(%s, ./cgroup.cpu) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
+	if (symlink(cgroupdir, "./cgroup.net")) {
+		debug("symlink(%s, ./cgroup.net) failed: %d\n", cgroupdir, errno);
+	}
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NAMESPACE
+void initialize_cgroups()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	if (mkdir("./syz-tmp/newroot/syzcgroup", 0700))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/syzcgroup/unified", 0700))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/syzcgroup/cpu", 0700))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/syzcgroup/net", 0700))
+		fail("mkdir failed");
+	unsigned bind_mount_flags = MS_BIND | MS_REC | MS_PRIVATE;
+	if (mount("/syzcgroup/unified", "./syz-tmp/newroot/syzcgroup/unified", NULL, bind_mount_flags, NULL)) {
+		debug("mount(cgroup2, MS_BIND) failed: %d\n", errno);
+	}
+	if (mount("/syzcgroup/cpu", "./syz-tmp/newroot/syzcgroup/cpu", NULL, bind_mount_flags, NULL)) {
+		debug("mount(cgroup/cpu, MS_BIND) failed: %d\n", errno);
+	}
+	if (mount("/syzcgroup/net", "./syz-tmp/newroot/syzcgroup/net", NULL, bind_mount_flags, NULL)) {
+		debug("mount(cgroup/net, MS_BIND) failed: %d\n", errno);
+	}
+}
+#endif
+#endif
+
+#if SYZ_EXECUTOR || (SYZ_ENABLE_BINFMT_MISC && (SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP))
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 static void setup_binfmt_misc()
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_binfmt_misc)
+		return;
+#endif
 	if (mount(0, "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, 0)) {
 		debug("mount(binfmt_misc) failed: %d\n", errno);
 	}
@@ -3560,6 +4141,8 @@ static void setup_common()
 	}
 #if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
 	setup_cgroups();
+#endif
+#if SYZ_EXECUTOR || SYZ_ENABLE_BINFMT_MISC
 	setup_binfmt_misc();
 #endif
 }
@@ -3786,23 +4369,7 @@ static int namespace_sandbox_proc(void* arg)
 	if (mount("/sys", "./syz-tmp/newroot/sys", 0, bind_mount_flags, NULL))
 		fail("mount(sysfs) failed");
 #if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
-	if (mkdir("./syz-tmp/newroot/syzcgroup", 0700))
-		fail("mkdir failed");
-	if (mkdir("./syz-tmp/newroot/syzcgroup/unified", 0700))
-		fail("mkdir failed");
-	if (mkdir("./syz-tmp/newroot/syzcgroup/cpu", 0700))
-		fail("mkdir failed");
-	if (mkdir("./syz-tmp/newroot/syzcgroup/net", 0700))
-		fail("mkdir failed");
-	if (mount("/syzcgroup/unified", "./syz-tmp/newroot/syzcgroup/unified", NULL, bind_mount_flags, NULL)) {
-		debug("mount(cgroup2, MS_BIND) failed: %d\n", errno);
-	}
-	if (mount("/syzcgroup/cpu", "./syz-tmp/newroot/syzcgroup/cpu", NULL, bind_mount_flags, NULL)) {
-		debug("mount(cgroup/cpu, MS_BIND) failed: %d\n", errno);
-	}
-	if (mount("/syzcgroup/net", "./syz-tmp/newroot/syzcgroup/net", NULL, bind_mount_flags, NULL)) {
-		debug("mount(cgroup/net, MS_BIND) failed: %d\n", errno);
-	}
+	initialize_cgroups();
 #endif
 	if (mkdir("./syz-tmp/pivot", 0777))
 		fail("mkdir failed");
@@ -4074,12 +4641,15 @@ retry:
 
 static int inject_fault(int nth)
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_fault_injection)
+		return 0;
+#endif
 	int fd;
-	char buf[16];
-
 	fd = open("/proc/thread-self/fail-nth", O_RDWR);
 	if (fd == -1)
 		exitf("failed to open /proc/thread-self/fail-nth");
+	char buf[16];
 	sprintf(buf, "%d", nth + 1);
 	if (write(fd, buf, strlen(buf)) != (ssize_t)strlen(buf))
 		exitf("failed to write /proc/thread-self/fail-nth");
@@ -4090,6 +4660,8 @@ static int inject_fault(int nth)
 #if SYZ_EXECUTOR
 static int fault_injected(int fail_fd)
 {
+	if (!flag_enable_fault_injection)
+		return 0;
 	char buf[16];
 	int n = read(fail_fd, buf, sizeof(buf) - 1);
 	if (n <= 0)
@@ -4165,35 +4737,7 @@ static void kill_and_wait(int pid, int* status)
 static void setup_loop()
 {
 #if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
-	int pid = getpid();
-	char cgroupdir[64];
-	char file[128];
-	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/unified/syz%llu", procid);
-	if (mkdir(cgroupdir, 0777)) {
-		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
-	}
-	snprintf(file, sizeof(file), "%s/pids.max", cgroupdir);
-	write_file(file, "32");
-	snprintf(file, sizeof(file), "%s/memory.low", cgroupdir);
-	write_file(file, "%d", 298 << 20);
-	snprintf(file, sizeof(file), "%s/memory.high", cgroupdir);
-	write_file(file, "%d", 299 << 20);
-	snprintf(file, sizeof(file), "%s/memory.max", cgroupdir);
-	write_file(file, "%d", 300 << 20);
-	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
-	write_file(file, "%d", pid);
-	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
-	if (mkdir(cgroupdir, 0777)) {
-		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
-	}
-	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
-	write_file(file, "%d", pid);
-	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
-	if (mkdir(cgroupdir, 0777)) {
-		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
-	}
-	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
-	write_file(file, "%d", pid);
+	setup_cgroups_loop();
 #endif
 #if SYZ_EXECUTOR || SYZ_RESET_NET_NAMESPACE
 	checkpoint_net_namespace();
@@ -4229,29 +4773,23 @@ static void setup_test()
 	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 	setpgrp();
 #if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
-	char cgroupdir[64];
-	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/unified/syz%llu", procid);
-	if (symlink(cgroupdir, "./cgroup")) {
-		debug("symlink(%s, ./cgroup) failed: %d\n", cgroupdir, errno);
-	}
-	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
-	if (symlink(cgroupdir, "./cgroup.cpu")) {
-		debug("symlink(%s, ./cgroup.cpu) failed: %d\n", cgroupdir, errno);
-	}
-	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
-	if (symlink(cgroupdir, "./cgroup.net")) {
-		debug("symlink(%s, ./cgroup.net) failed: %d\n", cgroupdir, errno);
-	}
-	write_file("/proc/self/oom_score_adj", "1000");
+	setup_cgroups_test();
 #endif
+	write_file("/proc/self/oom_score_adj", "1000");
 #if SYZ_EXECUTOR || SYZ_TUN_ENABLE
 	flush_tun();
 #endif
 }
+#endif
 
-#define SYZ_HAVE_RESET_TEST 1
-static void reset_test()
+#if SYZ_EXECUTOR || SYZ_ENABLE_CLOSE_FDS
+#define SYZ_HAVE_CLOSE_FDS 1
+static void close_fds()
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_close_fds)
+		return;
+#endif
 	int fd;
 	for (fd = 3; fd < 30; fd++)
 		close(fd);
@@ -4265,7 +4803,7 @@ static void reset_test()
 
 #if SYZ_EXECUTOR || __NR_syz_mmap
 #include <sys/mman.h>
-static long syz_mmap(long a0, long a1)
+static long syz_mmap(volatile long a0, volatile long a1)
 {
 	return (long)mmap((void*)a0, a1, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
 }
@@ -4273,17 +4811,25 @@ static long syz_mmap(long a0, long a1)
 
 #if SYZ_EXECUTOR || __NR_syz_errno
 #include <errno.h>
-static long syz_errno(long v)
+static long syz_errno(volatile long v)
 {
 	errno = v;
 	return v == 0 ? 0 : -1;
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_exit
+static long syz_exit(volatile long status)
+{
+	_exit(status);
+	return 0;
+}
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_compare
 #include <errno.h>
 #include <string.h>
-static long syz_compare(long want, long want_len, long got, long got_len)
+static long syz_compare(volatile long want, volatile long want_len, volatile long got, volatile long got_len)
 {
 	if (want_len != got_len) {
 		debug("syz_compare: want_len=%lu got_len=%lu\n", want_len, got_len);
@@ -4305,7 +4851,7 @@ static long syz_compare(long want, long want_len, long got, long got_len)
 #if SYZ_EXECUTOR || __NR_syz_compare_int
 #include <errno.h>
 #include <stdarg.h>
-static long syz_compare_int(long n, ...)
+static long syz_compare_int(volatile long n, ...)
 {
 	va_list args;
 	va_start(args, n);
@@ -4335,7 +4881,7 @@ static void loop();
 static int do_sandbox_none(void)
 {
 	loop();
-	doexit(0);
+	return 0;
 }
 #endif
 
@@ -4446,93 +4992,26 @@ static void loop();
 static int do_sandbox_none(void)
 {
 	loop();
-	doexit(0);
-}
-#endif
-
-#elif GOOS_test
-
-#include <stdlib.h>
-#include <unistd.h>
-
-#if SYZ_EXECUTOR || __NR_syz_mmap
-#include <sys/mman.h>
-static long syz_mmap(long a0, long a1)
-{
-	return (long)mmap((void*)a0, a1, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
-}
-#endif
-
-#if SYZ_EXECUTOR || __NR_syz_errno
-#include <errno.h>
-static long syz_errno(long v)
-{
-	errno = v;
-	return v == 0 ? 0 : -1;
-}
-#endif
-
-#if SYZ_EXECUTOR || __NR_syz_compare
-#include <errno.h>
-#include <string.h>
-static long syz_compare(long want, long want_len, long got, long got_len)
-{
-	if (want_len != got_len) {
-		debug("syz_compare: want_len=%lu got_len=%lu\n", want_len, got_len);
-		errno = EBADF;
-		return -1;
-	}
-	if (memcmp((void*)want, (void*)got, want_len)) {
-		debug("syz_compare: data differs, want:\n");
-		debug_dump_data((char*)want, want_len);
-		debug("got:\n");
-		debug_dump_data((char*)got, got_len);
-		errno = EINVAL;
-		return -1;
-	}
 	return 0;
-}
-#endif
-
-#if SYZ_EXECUTOR || __NR_syz_compare_int
-#include <errno.h>
-#include <stdarg.h>
-static long syz_compare_int(long n, ...)
-{
-	va_list args;
-	va_start(args, n);
-	long v0 = va_arg(args, long);
-	long v1 = va_arg(args, long);
-	long v2 = va_arg(args, long);
-	long v3 = va_arg(args, long);
-	va_end(args);
-	if (n < 2 || n > 4)
-		return errno = E2BIG, -1;
-	if (n <= 2 && v2 != 0)
-		return errno = EFAULT, -1;
-	if (n <= 3 && v3 != 0)
-		return errno = EFAULT, -1;
-	if (v0 != v1)
-		return errno = EINVAL, -1;
-	if (n > 2 && v0 != v2)
-		return errno = EINVAL, -1;
-	if (n > 3 && v0 != v3)
-		return errno = EINVAL, -1;
-	return 0;
-}
-#endif
-
-#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
-static void loop();
-static int do_sandbox_none(void)
-{
-	loop();
-	doexit(0);
 }
 #endif
 
 #else
 #error "unknown OS"
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_execute_func
+static long syz_execute_func(volatile long text)
+{
+	volatile long p[8] = {0};
+	(void)p;
+#if GOARCH_amd64
+	asm volatile("" ::"r"(0l), "r"(1l), "r"(2l), "r"(3l), "r"(4l), "r"(5l), "r"(6l),
+		     "r"(7l), "r"(8l), "r"(9l), "r"(10l), "r"(11l), "r"(12l), "r"(13l));
+#endif
+	NONFAILING(((void (*)(void))(text))());
+	return 0;
+}
 #endif
 
 #if SYZ_THREADED
@@ -4569,14 +5048,14 @@ static void loop(void)
 	}
 #endif
 #if SYZ_TRACE
-	printf("### start\n");
+	fprintf(stderr, "### start\n");
 #endif
 	int i, call, thread;
 #if SYZ_COLLIDE
 	int collide = 0;
 again:
 #endif
-	for (call = 0; call < [[NUM_CALLS]]; call++) {
+	for (call = 0; call < /*NUM_CALLS*/; call++) {
 		for (thread = 0; thread < (int)(sizeof(threads) / sizeof(threads[0])); thread++) {
 			struct thread_t* th = &threads[thread];
 			if (!th->created) {
@@ -4602,6 +5081,9 @@ again:
 	}
 	for (i = 0; i < 100 && __atomic_load_n(&running, __ATOMIC_RELAXED); i++)
 		sleep_ms(1);
+#if SYZ_HAVE_CLOSE_FDS
+	close_fds();
+#endif
 #if SYZ_COLLIDE
 	if (!collide) {
 		collide = 1;
@@ -4643,7 +5125,7 @@ static void loop(void)
 #endif
 	int iter;
 #if SYZ_REPEAT_TIMES
-	for (iter = 0; iter < [[REPEAT_TIMES]]; iter++) {
+	for (iter = 0; iter < /*REPEAT_TIMES*/; iter++) {
 #else
 	for (iter = 0;; iter++) {
 #endif
@@ -4686,8 +5168,8 @@ static void loop(void)
 			close(kOutPipeFd);
 #endif
 			execute_one();
-#if SYZ_HAVE_RESET_TEST
-			reset_test();
+#if SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED
+			close_fds();
 #endif
 			doexit(0);
 #endif
@@ -4725,11 +5207,10 @@ static void loop(void)
 			break;
 		}
 #if SYZ_EXECUTOR
-		status = WEXITSTATUS(status);
-		if (status == kFailStatus)
+		if (WEXITSTATUS(status) == kFailStatus) {
+			errno = 0;
 			fail("child failed");
-		if (status == kErrorStatus)
-			error("child errored");
+		}
 		reply_execute(0);
 #endif
 #if SYZ_EXECUTOR || SYZ_USE_TMP_DIR
@@ -4744,10 +5225,11 @@ static void loop(void)
 }
 #endif
 #endif
-#if !SYZ_EXECUTOR
-[[SYSCALL_DEFINES]]
 
-[[RESULTS]]
+#if !SYZ_EXECUTOR
+/*SYSCALL_DEFINES*/
+
+/*RESULTS*/
 
 #if SYZ_THREADED || SYZ_REPEAT || SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
 #if SYZ_THREADED
@@ -4758,7 +5240,10 @@ void execute_one(void)
 void loop(void)
 #endif
 {
-	[[SYSCALLS]]
+	/*SYSCALLS*/
+#if SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED && !SYZ_REPEAT
+	close_fds();
+#endif
 }
 #endif
 #if GOOS_akaros && SYZ_REPEAT
@@ -4766,7 +5251,7 @@ void loop(void)
 
 int main(int argc, char** argv)
 {
-	[[MMAP_DATA]]
+	/*MMAP_DATA*/
 
 	program_name = argv[0];
 	if (argc == 2 && strcmp(argv[1], "child") == 0)
@@ -4774,20 +5259,24 @@ int main(int argc, char** argv)
 #else
 int main(void)
 {
-	[[MMAP_DATA]]
+	/*MMAP_DATA*/
 #endif
 
 #if SYZ_HANDLE_SEGV
 	install_segv_handler();
 #endif
 #if SYZ_PROCS
-	for (procid = 0; procid < [[PROCS]]; procid++) {
+	for (procid = 0; procid < /*PROCS*/; procid++) {
 		if (fork() == 0) {
 #endif
 #if SYZ_USE_TMP_DIR || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
 			use_temporary_dir();
 #endif
-			[[SANDBOX_FUNC]]
+			/*SANDBOX_FUNC*/
+#if SYZ_HAVE_CLOSE_FDS && !SYZ_THREADED && !SYZ_REPEAT && !SYZ_SANDBOX_NONE && \
+    !SYZ_SANDBOX_SETUID && !SYZ_SANDBOX_NAMESPACE && !SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
+			close_fds();
+#endif
 #if SYZ_PROCS
 		}
 	}

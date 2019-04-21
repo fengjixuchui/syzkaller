@@ -25,11 +25,10 @@ var layerToLibs = map[string][]string{
 		"fuchsia-io",
 		"fuchsia-net",
 		"fuchsia-net-stack",
-		"zircon-ethernet",
+		"fuchsia-hardware-ethernet",
 	},
 	"garnet": {
 		"fuchsia.devicesettings",
-		"fuchsia.mediacodec",
 		"fuchsia.timezone",
 		"fuchsia.power",
 		"fuchsia.scpi",
@@ -63,14 +62,24 @@ func main() {
 	var newFiles []string
 
 	for layer := range layerToLibs {
-		jsonPathBase := filepath.Join(
-			sourceDir,
-			"out",
-			arch,
-			"fidling/gen",
-			layer,
-			"public/fidl",
-		)
+		var jsonPathBase string
+		if layer == "garnet" {
+			jsonPathBase = filepath.Join(
+				sourceDir,
+				"out",
+				arch,
+				"fidling/gen/sdk/fidl",
+			)
+		} else {
+			jsonPathBase = filepath.Join(
+				sourceDir,
+				"out",
+				arch,
+				"fidling/gen",
+				layer,
+				"public/fidl",
+			)
+		}
 
 		for _, lib := range layerToLibs[layer] {
 			jsonPath := filepath.Join(

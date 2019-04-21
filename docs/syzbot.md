@@ -7,6 +7,10 @@ bugs. All `syzbot`-reported bugs are also CCed to
 [syzkaller-bugs mailing list](https://groups.google.com/forum/#!forum/syzkaller-bugs).
 Direct all questions to `syzkaller@googlegroups.com`.
 
+<!-- These anchors are used in external links , don't touch, is there a better syntax for this? -->
+<div id="bug-status-tracking"/>
+<div id="status"/>
+
 ## Bug status tracking
 
 `syzbot` needs to know when a bug is fixed in order to (1) verify that it is
@@ -53,6 +57,8 @@ override the commit simply by sending another `#syz fix` command.
 **Note**: please keep `syzkaller-bugs@googlegroups.com` mailing list in CC.
 It serves as a history of what happened with each bug report.
 
+<div id="testing-patches"/>
+
 ## Testing patches
 
 `syzbot` can test patches for bugs *with reproducers*. This can be used for
@@ -80,7 +86,57 @@ After sending an email you should get a reply email with results within an hour.
 Note: you may send the request only to `syzbot` email address, as patches sent
 to some mailing lists (e.g. netdev, netfilter-devel) will trigger patchwork.
 
-Note: see [below](#kmsan-bugs) for testing `KMSAN` bugs.
+Note: see [below](#kmsan-bugs) for `KMSAN` bugs testing.
+
+Note: see [below](#usb-bugs) for `USB` bugs testing.
+
+<div id="bisection"/>
+
+## Bisection
+
+`syzbot` bisects bugs with reproducers to find commit that introduced the bug.
+`syzbot` starts with the commit on which the bug was discovered, ensures that it
+can reproduce the bug and then goes back release-by-release to find the first
+release where kernel does not crash. Once such release is found, `syzbot` starts
+bisection on that range. `syzbot` has limitation of how far back in time it can
+go (currently `v4.1`), going back in time is [very hard](/pkg/vcs/linux.go)
+because of incompatible compiler/linker/asm/perl/make/libc/etc, kernel
+build/boot breakages and large amounts of bugs.
+
+The predicate for bisection is binary (crash/doesn't crash), `syzbot` does not
+look at the exact crash and does not try to differentiate them. This is
+intentional because lots of bugs can manifest in different ways (sometimes 50+
+different ways). For each revision `syzbot` repeats testing 10 times and
+a single crash marks revision as bad (lots of bugs are due to races and are
+hard to trigger).
+
+During bisection `syzbot` uses different compilers depending on kernel revision
+(a single compiler can't build all revisions). These compilers are available
+[here](https://storage.googleapis.com/syzkaller/bisect_bin.tar.gz).
+Exact compiler used to test a particular revision is specified in the bisection
+log.
+
+Bisection is best-effort and may not find the right commit for multiple reasons,
+including:
+
+- hard to reproduce bugs that trigger with very low probability
+- bug being introduced before the tool that reliably detects it (LOCKDEP, KASAN,
+  FAULT_INJECTION, WARNING, etc);\
+  such bugs may be bisection to the addition/improvement of the tool
+- kernel build/boot errors that force skipping revisions
+- some kernel configs are [disabled](/pkg/vcs/linux.go) as bisection goes back
+  in time because they build/boot break release tags;\
+  bugs in these subsystems may be bisected to release tags
+- reproducers triggering multiple kernel bugs at once
+- unrelated kernel bugs that break even simple programs
+
+A single incorrect decision during bisection leads to an incorrect result,
+so please treat the results with understanding. You may consult the provided
+`bisection log` to see how/why `syzbot` has arrived to a particular commit.
+Suggestions and patches that improve bisection quality for common cases are
+[welcome](https://github.com/google/syzkaller/issues/1051).
+
+<div id="bisection"/>
 
 ## syzkaller reproducers
 
@@ -98,7 +154,7 @@ parallel).
 A syzkaller program can be converted to an almost equivalent C source using `syz-prog2c` utility. `syz-prog2c` has lots of flags in common with [syz-execprog](https://github.com/google/syzkaller/blob/master/docs/executing_syzkaller_programs.md), e.g. `-threaded`/`-collide` which control if the syscalls are executed sequentially or in parallel. An example invocation:
 
 ```
-syz-prog2c -prog repro.syz.txt -threaded -collide -repeat -procs=8 -sandbox=namespace -tun -tmpdir -waitrepeat
+syz-prog2c -prog repro.syz.txt -enable=all -threaded -collide -repeat -procs=8 -sandbox=namespace -segv -tmpdir -waitrepeat
 ```
 
 However, note that if `syzbot` did not provide a C reproducer, it wasn't able to trigger the bug using the C program (though, it can be just because the bug is triggered by a subtle race condition).
@@ -166,7 +222,7 @@ existing IPC object) and there is long tail of other reasons.
 Bugs with reproducers are automatically reported to kernel mailing lists.
 Bugs without reproducers are first staged in moderation queue to filter out
 invalid, unactionable or duplicate reports. Staged bugs are shown on dashboard
-in [moderation](https://syzkaller.appspot.com/#upstream-moderation2) section
+in [moderation](https://syzkaller.appspot.com/upstream#moderation2) section
 and mailed to
 [syzkaller-upstream-moderation](https://groups.google.com/forum/#!forum/syzkaller-upstream-moderation)
 mailing list. Staged bugs accept all commands supported for reported bugs
@@ -208,6 +264,20 @@ more "Uninit was stored to memory at:" stacks which denote how the unint value
 travelled through memory. Finally there is a "Uninit was created at:"
 section which points either to a heap allocation or a stack variable which
 is the original source of uninitialized-ness.
+
+## USB bugs
+
+syzkaller has an ability to perform fuzzing of the Linux kernel USB stack, see
+the details [here](/docs/linux/external_fuzzing_usb.md). This requires
+non-yet-upstreamed kernel changes and thus patch testing is only possible on
+the `usb-fuzzer` branch of the `https://github.com/google/kasan.git` tree.
+The standard way for triggering tests with the `usb-fuzzer` tree is to send an
+email to `syzbot+HASH` address containing the following line:
+```
+#syz test: https://github.com/google/kasan.git usb-fuzzer
+```
+and attach/inline your test patch in the same email.
+
 
 ## No custom patches
 

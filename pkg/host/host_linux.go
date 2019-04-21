@@ -67,29 +67,35 @@ func isSupported(c *prog.Syscall, target *prog.Target, sandbox string) (bool, st
 		if len(kallsyms) == 0 {
 			return
 		}
-		var re *regexp.Regexp
-		switch target.Arch {
-		case "386", "amd64":
-			re = regexp.MustCompile(` T (__ia32_|__x64_)?sys_([^\n]+)\n`)
-		case "arm64":
-			re = regexp.MustCompile(` T (__arm64_)?sys_([^\n]+)\n`)
-		case "ppc64le":
-			re = regexp.MustCompile(` T ()?sys_([^\n]+)\n`)
-		default:
-			panic("unsupported arch for kallsyms parsing")
-		}
-		matches := re.FindAllSubmatch(kallsyms, -1)
-		for _, m := range matches {
-			name := string(m[2])
-			log.Logf(2, "found in kallsyms: %v", name)
-			kallsymsSyscallSet[name] = true
-		}
+		kallsymsSyscallSet = parseKallsyms(kallsyms, target.Arch)
 	})
 	if !testFallback && len(kallsymsSyscallSet) != 0 {
 		r, v := isSupportedKallsyms(c)
 		return r, v
 	}
 	return isSupportedTrial(c)
+}
+
+func parseKallsyms(kallsyms []byte, arch string) map[string]bool {
+	set := make(map[string]bool)
+	var re *regexp.Regexp
+	switch arch {
+	case "386", "amd64":
+		re = regexp.MustCompile(` T (__ia32_|__x64_)?sys_([^\n]+)\n`)
+	case "arm", "arm64":
+		re = regexp.MustCompile(` T (__arm64_)?sys_([^\n]+)\n`)
+	case "ppc64le":
+		re = regexp.MustCompile(` T ()?sys_([^\n]+)\n`)
+	default:
+		panic("unsupported arch for kallsyms parsing")
+	}
+	matches := re.FindAllSubmatch(kallsyms, -1)
+	for _, m := range matches {
+		name := string(m[2])
+		log.Logf(2, "found in kallsyms: %v", name)
+		set[name] = true
+	}
+	return set
 }
 
 func isSupportedKallsyms(c *prog.Syscall) (bool, string) {
@@ -144,7 +150,7 @@ func init() {
 // Where umount is renamed to oldumount is unclear.
 var (
 	kallsymsOnce       sync.Once
-	kallsymsSyscallSet = make(map[string]bool)
+	kallsymsSyscallSet map[string]bool
 	kallsymsRenameMap  = map[string]string{
 		"umount":  "oldumount",
 		"umount2": "umount",
@@ -194,6 +200,9 @@ func isSupportedSyzkall(sandbox string, c *prog.Syscall) (bool, string) {
 		return true, ""
 	case "syz_emit_ethernet", "syz_extract_tcp_res":
 		reason := checkNetworkInjection()
+		return reason == "", reason
+	case "syz_usb_connect", "syz_usb_disconnect", "syz_usb_control_io", "syz_usb_ep_write":
+		reason := checkUSBInjection()
 		return reason == "", reason
 	case "syz_kvm_setup_cpu":
 		switch c.Name {
@@ -467,26 +476,29 @@ func checkFaultInjection() string {
 		return reason
 	}
 	if err := osutil.IsAccessible("/sys/kernel/debug/failslab/ignore-gfp-wait"); err != nil {
-		return "CONFIG_FAULT_INJECTION_DEBUG_FS is not enabled"
+		return "CONFIG_FAULT_INJECTION_DEBUG_FS or CONFIG_FAILSLAB are not enabled"
 	}
 	return ""
 }
 
 func setupFaultInjection() error {
+	// Note: these files are also hardcoded in pkg/csource/csource.go.
 	if err := osutil.WriteFile("/sys/kernel/debug/failslab/ignore-gfp-wait", []byte("N")); err != nil {
 		return fmt.Errorf("failed to write /failslab/ignore-gfp-wait: %v", err)
 	}
+	// These are enabled by separate configs (e.g. CONFIG_FAIL_FUTEX)
+	// and we did not check all of them in checkFaultInjection, so we ignore errors.
 	if err := osutil.WriteFile("/sys/kernel/debug/fail_futex/ignore-private", []byte("N")); err != nil {
-		return fmt.Errorf("failed to write /fail_futex/ignore-private: %v", err)
+		log.Logf(0, "failed to write /sys/kernel/debug/fail_futex/ignore-private: %v", err)
 	}
 	if err := osutil.WriteFile("/sys/kernel/debug/fail_page_alloc/ignore-gfp-highmem", []byte("N")); err != nil {
-		return fmt.Errorf("failed to write /fail_page_alloc/ignore-gfp-highmem: %v", err)
+		log.Logf(0, "failed to write /sys/kernel/debug/fail_page_alloc/ignore-gfp-highmem: %v", err)
 	}
 	if err := osutil.WriteFile("/sys/kernel/debug/fail_page_alloc/ignore-gfp-wait", []byte("N")); err != nil {
-		return fmt.Errorf("failed to write /fail_page_alloc/ignore-gfp-wait: %v", err)
+		log.Logf(0, "failed to write /sys/kernel/debug/fail_page_alloc/ignore-gfp-wait: %v", err)
 	}
 	if err := osutil.WriteFile("/sys/kernel/debug/fail_page_alloc/min-order", []byte("0")); err != nil {
-		return fmt.Errorf("failed to write /fail_page_alloc/min-order: %v", err)
+		log.Logf(0, "failed to write /sys/kernel/debug/fail_page_alloc/min-order: %v", err)
 	}
 	return nil
 }
@@ -623,6 +635,13 @@ func checkNetworkInjection() string {
 		return err.Error()
 	}
 	return checkNetworkDevices()
+}
+
+func checkUSBInjection() string {
+	if err := osutil.IsAccessible("/sys/kernel/debug/usb-fuzzer"); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func checkNetworkDevices() string {

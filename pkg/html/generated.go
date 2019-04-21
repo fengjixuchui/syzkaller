@@ -38,6 +38,12 @@ table td, table th {
 	overflow: hidden;
 }
 
+.namespace {
+	font-weight: bold;
+	font-size: large;
+	color: #375EAB;
+}
+
 .position_table {
 	border: 0px;
 	margin: 0px;
@@ -62,7 +68,7 @@ table td, table th {
 	background: #F4F4F4;
 }
 
-.list_table tr:nth-child(2n+1) {
+.list_table tr:nth-child(2n) {
 	background: #F4F4F4;
 }
 
@@ -78,6 +84,11 @@ table td, table th {
 .list_table .title {
 	width: 350pt;
 	max-width: 350pt;
+}
+
+.list_table .commit_list {
+	width: 500pt;
+	max-width: 500pt;
 }
 
 .list_table .tag {
@@ -104,8 +115,8 @@ table td, table th {
 }
 
 .list_table .kernel {
-	width: 60pt;
-	max-width: 60pt;
+	width: 80pt;
+	max-width: 80pt;
 }
 
 .list_table .maintainers {
@@ -121,6 +132,13 @@ table td, table th {
 .list_table .stat {
 	width: 50pt;
 	max-width: 50pt;
+	font-family: monospace;
+	text-align: right;
+}
+
+.list_table .date {
+	width: 60pt;
+	max-width: 60pt;
 	font-family: monospace;
 	text-align: right;
 }
@@ -154,13 +172,17 @@ textarea {
 	width:100%;
 	font-family: monospace;
 }
+
+.mono {
+	font-family: monospace;
+}
 `
 const js = `
 // Copyright 2018 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 function sortTable(item, colName, conv, desc = false) {
-	table = item.parentNode.parentNode.parentNode;
+	table = item.parentNode.parentNode.parentNode.parentNode;
 	rows = table.rows;
 	col = findColumnByName(rows[0].getElementsByTagName("th"), colName);
 	values = [];
@@ -176,7 +198,7 @@ function sortTable(item, colName, conv, desc = false) {
 		return 1;
 	});
 	for (i = 0; i < values.length; i++)
-		table.appendChild(values[i][1]);
+		table.tBodies[0].appendChild(values[i][1]);
 	return false;
 }
 
@@ -199,6 +221,7 @@ function isSorted(values) {
 function textSort(v) { return v.toLowerCase(); }
 function numSort(v) { return -parseInt(v); }
 function floatSort(v) { return -parseFloat(v); }
+function yesSort(v) { return v == "yes" ? 0 : 1; }
 function reproSort(v) { return v == "C" ? 0 : v == "syz" ? 1 : 2; }
 function patchedSort(v) { return v == "" ? -1 : parseInt(v); }
 

@@ -102,7 +102,7 @@ func (ctx *context) generateSyscalls(calls []string, hasVars bool) string {
 			fmt.Fprintf(buf, "\tif (write(1, \"executing program\\n\", sizeof(\"executing program\\n\") - 1)) {}\n")
 		}
 		if opts.Trace {
-			fmt.Fprintf(buf, "\tprintf(\"### start\\n\");\n")
+			fmt.Fprintf(buf, "\tfprintf(stderr, \"### start\\n\");\n")
 		}
 		for _, c := range calls {
 			fmt.Fprintf(buf, "%s", c)
@@ -174,8 +174,12 @@ func (ctx *context) generateCalls(p prog.ExecProg, trace bool) ([]string, []uint
 		}
 
 		if ctx.opts.Fault && ctx.opts.FaultCall == ci {
+			// Note: these files are also hardcoded in pkg/host/host_linux.go.
 			fmt.Fprintf(w, "\twrite_file(\"/sys/kernel/debug/failslab/ignore-gfp-wait\", \"N\");\n")
 			fmt.Fprintf(w, "\twrite_file(\"/sys/kernel/debug/fail_futex/ignore-private\", \"N\");\n")
+			fmt.Fprintf(w, "\twrite_file(\"/sys/kernel/debug/fail_page_alloc/ignore-gfp-highmem\", \"N\");\n")
+			fmt.Fprintf(w, "\twrite_file(\"/sys/kernel/debug/fail_page_alloc/ignore-gfp-wait\", \"N\");\n")
+			fmt.Fprintf(w, "\twrite_file(\"/sys/kernel/debug/fail_page_alloc/min-order\", \"0\");\n")
 			fmt.Fprintf(w, "\tinject_fault(%v);\n", ctx.opts.FaultNth)
 		}
 		// Call itself.
@@ -249,7 +253,7 @@ func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCo
 			// So instead of long -1 we can get 0x00000000ffffffff. Sign extend it to long.
 			cast = "(long)(int)"
 		}
-		fmt.Fprintf(w, "\tprintf(\"### call=%v errno=%%u\\n\", %vres == -1 ? errno : 0);\n", ci, cast)
+		fmt.Fprintf(w, "\tfprintf(stderr, \"### call=%v errno=%%u\\n\", %vres == -1 ? errno : 0);\n", ci, cast)
 	}
 }
 
@@ -422,7 +426,6 @@ func (ctx *context) postProcess(result []byte) []byte {
 	result = regexp.MustCompile(`\t*debug_dump_data\((.*\n)*?.*\);\n`).ReplaceAll(result, nil)
 	result = regexp.MustCompile(`\t*exitf\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
 	result = regexp.MustCompile(`\t*fail\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
-	result = regexp.MustCompile(`\t*error\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
 
 	result = ctx.hoistIncludes(result)
 	result = ctx.removeEmptyLines(result)
@@ -442,19 +445,24 @@ func (ctx *context) hoistIncludes(result []byte) []byte {
 	}
 	result = includeRe.ReplaceAll(result, nil)
 	// Certain linux and bsd headers are broken and go to the bottom.
-	var sorted, sortedBottom []string
+	var sorted, sortedBottom, sortedTop []string
 	for include := range includes {
 		if strings.Contains(include, "<linux/") {
 			sortedBottom = append(sortedBottom, include)
 		} else if strings.Contains(include, "<netinet/if_ether.h>") {
 			sortedBottom = append(sortedBottom, include)
+		} else if ctx.target.OS == freebsd && strings.Contains(include, "<sys/types.h>") {
+			sortedTop = append(sortedTop, include)
 		} else {
 			sorted = append(sorted, include)
 		}
 	}
+	sort.Strings(sortedTop)
 	sort.Strings(sorted)
 	sort.Strings(sortedBottom)
 	newResult := append([]byte{}, result[:includesStart]...)
+	newResult = append(newResult, strings.Join(sortedTop, "")...)
+	newResult = append(newResult, '\n')
 	newResult = append(newResult, strings.Join(sorted, "")...)
 	newResult = append(newResult, '\n')
 	newResult = append(newResult, strings.Join(sortedBottom, "")...)

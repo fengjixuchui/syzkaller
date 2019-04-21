@@ -23,6 +23,7 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/vcs"
+	"github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
 )
@@ -60,25 +61,24 @@ func init() {
 //  - latest: latest known good kernel build
 //  - current: currently used kernel build
 type Manager struct {
-	name            string
-	workDir         string
-	kernelDir       string
-	currentDir      string
-	latestDir       string
-	compilerID      string
-	syzkallerCommit string
-	configTag       string
-	configData      []byte
-	cfg             *Config
-	repo            vcs.Repo
-	mgrcfg          *ManagerConfig
-	managercfg      *mgrconfig.Config
-	cmd             *ManagerCmd
-	dash            *dashapi.Dashboard
-	stop            chan struct{}
+	name       string
+	workDir    string
+	kernelDir  string
+	currentDir string
+	latestDir  string
+	compilerID string
+	configTag  string
+	configData []byte
+	cfg        *Config
+	repo       vcs.Repo
+	mgrcfg     *ManagerConfig
+	managercfg *mgrconfig.Config
+	cmd        *ManagerCmd
+	dash       *dashapi.Dashboard
+	stop       chan struct{}
 }
 
-func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}) *Manager {
+func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}) (*Manager, error) {
 	dir := osutil.Abs(filepath.Join("managers", mgrcfg.Name))
 	if err := osutil.MkdirAll(dir); err != nil {
 		log.Fatal(err)
@@ -95,17 +95,13 @@ func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}) *Mana
 	// Assume compiler and config don't change underneath us.
 	compilerID, err := build.CompilerIdentity(mgrcfg.Compiler)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	var configData []byte
 	if mgrcfg.KernelConfig != "" {
 		if configData, err = ioutil.ReadFile(mgrcfg.KernelConfig); err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
-	}
-	syzkallerCommit, _ := readTag(filepath.FromSlash("syzkaller/current/tag"))
-	if syzkallerCommit == "" {
-		log.Fatalf("no tag in syzkaller/current/tag")
 	}
 	kernelDir := filepath.Join(dir, "kernel")
 	repo, err := vcs.NewRepo(mgrcfg.managercfg.TargetOS, mgrcfg.managercfg.Type, kernelDir)
@@ -114,24 +110,23 @@ func createManager(cfg *Config, mgrcfg *ManagerConfig, stop chan struct{}) *Mana
 	}
 
 	mgr := &Manager{
-		name:            mgrcfg.managercfg.Name,
-		workDir:         filepath.Join(dir, "workdir"),
-		kernelDir:       kernelDir,
-		currentDir:      filepath.Join(dir, "current"),
-		latestDir:       filepath.Join(dir, "latest"),
-		compilerID:      compilerID,
-		syzkallerCommit: syzkallerCommit,
-		configTag:       hash.String(configData),
-		configData:      configData,
-		cfg:             cfg,
-		repo:            repo,
-		mgrcfg:          mgrcfg,
-		managercfg:      mgrcfg.managercfg,
-		dash:            dash,
-		stop:            stop,
+		name:       mgrcfg.managercfg.Name,
+		workDir:    filepath.Join(dir, "workdir"),
+		kernelDir:  kernelDir,
+		currentDir: filepath.Join(dir, "current"),
+		latestDir:  filepath.Join(dir, "latest"),
+		compilerID: compilerID,
+		configTag:  hash.String(configData),
+		configData: configData,
+		cfg:        cfg,
+		repo:       repo,
+		mgrcfg:     mgrcfg,
+		managercfg: mgrcfg.managercfg,
+		dash:       dash,
+		stop:       stop,
 	}
 	os.RemoveAll(mgr.currentDir)
-	return mgr
+	return mgr, nil
 }
 
 // Gates kernel builds.
@@ -298,10 +293,11 @@ func (mgr *Manager) build(kernelCommit *vcs.Commit) error {
 	if err := build.Image(mgr.managercfg.TargetOS, mgr.managercfg.TargetVMArch, mgr.managercfg.Type,
 		mgr.kernelDir, tmpDir, mgr.mgrcfg.Compiler, mgr.mgrcfg.Userspace,
 		mgr.mgrcfg.KernelCmdline, mgr.mgrcfg.KernelSysctl, mgr.configData); err != nil {
-		if _, ok := err.(build.KernelBuildError); ok {
+		if buildErr, ok := err.(build.KernelBuildError); ok {
 			rep := &report.Report{
 				Title:  fmt.Sprintf("%v build error", mgr.mgrcfg.RepoAlias),
-				Output: []byte(err.Error()),
+				Report: []byte(buildErr.Title),
+				Output: buildErr.Output,
 			}
 			if err := mgr.reportBuildError(rep, info, tmpDir); err != nil {
 				mgr.Errorf("failed to report image error: %v", err)
@@ -440,7 +436,7 @@ func (mgr *Manager) createTestConfig(imageDir string, info *BuildInfo) (*mgrconf
 	mgrcfg.Name += "-test"
 	mgrcfg.Tag = info.KernelCommit
 	mgrcfg.Workdir = filepath.Join(imageDir, "workdir")
-	if err := instance.SetConfigImage(mgrcfg, imageDir); err != nil {
+	if err := instance.SetConfigImage(mgrcfg, imageDir, true); err != nil {
 		return nil, err
 	}
 	mgrcfg.KernelSrc = mgr.kernelDir
@@ -466,7 +462,7 @@ func (mgr *Manager) writeConfig(buildTag string) (string, error) {
 	}
 	mgrcfg.Tag = buildTag
 	mgrcfg.Workdir = mgr.workDir
-	if err := instance.SetConfigImage(mgrcfg, mgr.currentDir); err != nil {
+	if err := instance.SetConfigImage(mgrcfg, mgr.currentDir, false); err != nil {
 		return "", err
 	}
 	// Strictly saying this is somewhat racy as builder can concurrently
@@ -522,22 +518,23 @@ func (mgr *Manager) createDashboardBuild(info *BuildInfo, imageDir, typ string) 
 	// Also mix in build type, so that image error builds are not merged into normal builds.
 	var tagData []byte
 	tagData = append(tagData, info.Tag...)
-	tagData = append(tagData, mgr.syzkallerCommit...)
+	tagData = append(tagData, sys.GitRevisionBase...)
 	tagData = append(tagData, typ...)
 	build := &dashapi.Build{
-		Manager:           mgr.name,
-		ID:                hash.String(tagData),
-		OS:                mgr.managercfg.TargetOS,
-		Arch:              mgr.managercfg.TargetArch,
-		VMArch:            mgr.managercfg.TargetVMArch,
-		SyzkallerCommit:   mgr.syzkallerCommit,
-		CompilerID:        info.CompilerID,
-		KernelRepo:        info.KernelRepo,
-		KernelBranch:      info.KernelBranch,
-		KernelCommit:      info.KernelCommit,
-		KernelCommitTitle: info.KernelCommitTitle,
-		KernelCommitDate:  info.KernelCommitDate,
-		KernelConfig:      kernelConfig,
+		Manager:             mgr.name,
+		ID:                  hash.String(tagData),
+		OS:                  mgr.managercfg.TargetOS,
+		Arch:                mgr.managercfg.TargetArch,
+		VMArch:              mgr.managercfg.TargetVMArch,
+		SyzkallerCommit:     sys.GitRevisionBase,
+		SyzkallerCommitDate: sys.GitRevisionDate,
+		CompilerID:          info.CompilerID,
+		KernelRepo:          info.KernelRepo,
+		KernelBranch:        info.KernelBranch,
+		KernelCommit:        info.KernelCommit,
+		KernelCommitTitle:   info.KernelCommitTitle,
+		KernelCommitDate:    info.KernelCommitDate,
+		KernelConfig:        kernelConfig,
 	}
 	return build, nil
 }
@@ -545,7 +542,7 @@ func (mgr *Manager) createDashboardBuild(info *BuildInfo, imageDir, typ string) 
 // pollCommits asks dashboard what commits it is interested in (i.e. fixes for
 // open bugs) and returns subset of these commits that are present in a build
 // on commit buildCommit.
-func (mgr *Manager) pollCommits(buildCommit string) ([]string, []dashapi.FixCommit, error) {
+func (mgr *Manager) pollCommits(buildCommit string) ([]string, []dashapi.Commit, error) {
 	resp, err := mgr.dash.BuilderPoll(mgr.name)
 	if err != nil || len(resp.PendingCommits) == 0 && resp.ReportEmail == "" {
 		return nil, nil, err
@@ -566,19 +563,18 @@ func (mgr *Manager) pollCommits(buildCommit string) ([]string, []dashapi.FixComm
 			}
 		}
 	}
-	var fixCommits []dashapi.FixCommit
+	var fixCommits []dashapi.Commit
 	if resp.ReportEmail != "" {
-		// TODO(dvyukov): mmots contains weird squashed commits titled "linux-next" or "origin",
-		// which contain hundreds of other commits. This makes fix attribution totally broken.
-		if mgr.mgrcfg.Repo != "git://git.cmpxchg.org/linux-mmots.git" {
+		if !brokenRepo(mgr.mgrcfg.Repo) {
 			commits, err := mgr.repo.ExtractFixTagsFromCommits(buildCommit, resp.ReportEmail)
 			if err != nil {
 				return nil, nil, err
 			}
 			for _, com := range commits {
-				fixCommits = append(fixCommits, dashapi.FixCommit{
-					Title: com.Title,
-					BugID: com.Tag,
+				fixCommits = append(fixCommits, dashapi.Commit{
+					Title:  com.Title,
+					BugIDs: com.Tags,
+					Date:   com.Date,
 				})
 			}
 		}

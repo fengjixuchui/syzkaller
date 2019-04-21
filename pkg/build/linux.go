@@ -10,7 +10,6 @@
 package build
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -67,7 +66,7 @@ func (linux) buildKernel(kernelDir, outputDir, compiler string, config []byte) e
 	}
 	cmd.Dir = kernelDir
 	if _, err := osutil.Run(time.Hour, cmd); err != nil {
-		return extractRootCause(err)
+		return err
 	}
 	vmlinux := filepath.Join(kernelDir, "vmlinux")
 	outputVmlinux := filepath.Join(outputDir, "obj", "vmlinux")
@@ -114,7 +113,7 @@ func (linux) createImage(vmType, kernelDir, outputDir, userspaceDir, cmdlineFile
 	return nil
 }
 
-func (linux) clean(kernelDir string) error {
+func (linux) clean(kernelDir, targetArch string) error {
 	cpu := strconv.Itoa(runtime.NumCPU())
 	cmd := osutil.Command("make", "distclean", "-j", cpu)
 	if err := osutil.Sandbox(cmd, true, true); err != nil {
@@ -123,40 +122,4 @@ func (linux) clean(kernelDir string) error {
 	cmd.Dir = kernelDir
 	_, err := osutil.Run(10*time.Minute, cmd)
 	return err
-}
-
-func extractRootCause(err error) error {
-	verr, ok := err.(*osutil.VerboseError)
-	if !ok {
-		return err
-	}
-	var cause []byte
-	for _, line := range bytes.Split(verr.Output, []byte{'\n'}) {
-		for _, pattern := range buildFailureCauses {
-			if pattern.weak && cause != nil {
-				continue
-			}
-			if bytes.Contains(line, pattern.pattern) {
-				cause = line
-				break
-			}
-		}
-	}
-	if cause != nil {
-		verr.Title = string(cause)
-	}
-	return KernelBuildError{verr}
-}
-
-type buildFailureCause struct {
-	pattern []byte
-	weak    bool
-}
-
-var buildFailureCauses = [...]buildFailureCause{
-	{pattern: []byte(": error: ")},
-	{pattern: []byte(": fatal error: ")},
-	{pattern: []byte(": undefined reference to")},
-	{weak: true, pattern: []byte(": final link failed: ")},
-	{weak: true, pattern: []byte("collect2: error: ")},
 }

@@ -474,7 +474,7 @@ func (ctx *linux) getMaintainersImpl(file string, blame bool) ([]string, error) 
 	if blame {
 		args = append(args, "--git-blame")
 	}
-	args = append(args, file)
+	args = append(args, "-f", file)
 	output, err := osutil.RunCmd(time.Minute, ctx.kernelSrc, filepath.FromSlash("scripts/get_maintainer.pl"), args...)
 	if err != nil {
 		return nil, err
@@ -637,8 +637,7 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("^sock_do_ioctl"),
 	compile("^sock_ioctl"),
 	compile("^compat_sock_ioctl"),
-	compile("^(compat_)?(SYSC|SyS|__sys|___sys|__do_sys|__se_sys|__x64_sys)_socketpair"),
-	compile("^(compat_)?(SYSC|SyS|__sys|___sys|__do_sys|__se_sys|__x64_sys)_connect"),
+	compile("^(compat_)?(SYSC|SyS|__sys|___sys|__do_sys|__se_sys|__x64_sys)_(socketpair|connect|ioctl)"),
 	// Page fault entry points:
 	compile("__do_fault"),
 	compile("handle_mm_fault"),
@@ -704,9 +703,13 @@ var linuxStackParams = &stackParams{
 		"lock_release",
 		"register_lock_class",
 		"spin_lock",
+		"spin_trylock",
 		"spin_unlock",
 		"raw_read_lock",
+		"raw_read_trylock",
 		"raw_write_lock",
+		"raw_write_trylock",
+		"down",
 		"down_read",
 		"down_write",
 		"down_read_trylock",
@@ -714,10 +717,13 @@ var linuxStackParams = &stackParams{
 		"up_read",
 		"up_write",
 		"mutex_lock",
+		"mutex_trylock",
 		"mutex_unlock",
 		"memcpy",
 		"memcmp",
 		"memset",
+		"memchr",
+		"memmove",
 		"strcmp",
 		"strncmp",
 		"strcpy",
@@ -726,6 +732,7 @@ var linuxStackParams = &stackParams{
 		"strlen",
 		"strnstr",
 		"strnlen",
+		"strchr",
 		"copy_to_user",
 		"copy_from_user",
 		"put_user",
@@ -737,6 +744,7 @@ var linuxStackParams = &stackParams{
 		"list_replace",
 		"list_move",
 		"list_splice",
+		"_indirect_thunk_", // retpolines
 	},
 	corruptedLines: []*regexp.Regexp{
 		// Fault injection stacks are frequently intermixed with crash reports.
@@ -937,11 +945,6 @@ var linuxOopses = []*oops{
 				report: compile("BUG: workqueue leaked lock or atomic(?:.*\\n)+?" +
 					".*last function: ([a-zA-Z0-9_]+)\\n"),
 				fmt:          "BUG: workqueue leaked lock or atomic in %[1]v",
-				noStackTrace: true,
-			},
-			{
-				title:        compile("BUG: executor-detected bug"),
-				fmt:          "BUG: executor-detected bug",
 				noStackTrace: true,
 			},
 			{
@@ -1167,7 +1170,7 @@ var linuxOopses = []*oops{
 						parseStackTrace,
 					},
 					skip: []string{"sched", "_lock", "down", "completion", "kthread",
-						"wait", "synchronize"},
+						"wait", "synchronize", "context_switch"},
 				},
 			},
 			{

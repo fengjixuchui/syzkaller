@@ -142,6 +142,12 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, reporter report.Reporter, vmPoo
 		wg.Wait()
 		close(ctx.instances)
 	}()
+	defer func() {
+		close(ctx.bootRequests)
+		for inst := range ctx.instances {
+			inst.Close()
+		}
+	}()
 
 	res, err := ctx.repro(entries, crashStart)
 	if err != nil {
@@ -165,11 +171,6 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, reporter report.Reporter, vmPoo
 		ctx.reproLog(3, "final repro crashed as (corrupted=%v):\n%s",
 			ctx.report.Corrupted, ctx.report.Report)
 		res.Report = ctx.report
-	}
-
-	close(ctx.bootRequests)
-	for inst := range ctx.instances {
-		inst.Close()
 	}
 	return res, ctx.stats, nil
 }
@@ -547,6 +548,7 @@ func (ctx *context) testProgs(entries []*prog.LogEntry, duration time.Duration, 
 		ctx.cfg.TargetOS, ctx.cfg.TargetArch, opts.Sandbox, opts.Repeat,
 		opts.Threaded, opts.Collide, opts.Procs, -1, -1, vmProgFile)
 	ctx.reproLog(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
+	ctx.reproLog(3, "detailed listing:\n%s", pstr)
 	return ctx.testImpl(inst.Instance, command, duration)
 }
 
@@ -555,7 +557,7 @@ func (ctx *context) testCProg(p *prog.Prog, duration time.Duration, opts csource
 	if err != nil {
 		return false, err
 	}
-	bin, err := csource.Build(p.Target, src)
+	bin, err := csource.BuildNoWarn(p.Target, src)
 	if err != nil {
 		return false, err
 	}
@@ -776,7 +778,7 @@ var progSimplifies = []Simplify{
 		}
 		opts.Repeat = false
 		opts.EnableCgroups = false
-		opts.ResetNet = false
+		opts.EnableNetReset = false
 		opts.Procs = 1
 		return true
 	},
@@ -803,9 +805,11 @@ var cSimplifies = append(progSimplifies, []Simplify{
 		}
 		opts.Sandbox = ""
 		opts.EnableTun = false
+		opts.EnableNetDev = false
+		opts.EnableNetReset = false
 		opts.EnableCgroups = false
-		opts.EnableNetdev = false
-		opts.ResetNet = false
+		opts.EnableBinfmtMisc = false
+		opts.EnableCloseFds = false
 		return true
 	},
 	func(opts *csource.Options) bool {
@@ -816,6 +820,20 @@ var cSimplifies = append(progSimplifies, []Simplify{
 		return true
 	},
 	func(opts *csource.Options) bool {
+		if !opts.EnableNetDev {
+			return false
+		}
+		opts.EnableNetDev = false
+		return true
+	},
+	func(opts *csource.Options) bool {
+		if !opts.EnableNetReset {
+			return false
+		}
+		opts.EnableNetReset = false
+		return true
+	},
+	func(opts *csource.Options) bool {
 		if !opts.EnableCgroups {
 			return false
 		}
@@ -823,17 +841,19 @@ var cSimplifies = append(progSimplifies, []Simplify{
 		return true
 	},
 	func(opts *csource.Options) bool {
-		if !opts.EnableNetdev {
+		if !opts.EnableBinfmtMisc {
 			return false
 		}
-		opts.EnableNetdev = false
+		opts.EnableBinfmtMisc = false
 		return true
 	},
 	func(opts *csource.Options) bool {
-		if !opts.ResetNet {
+		// We don't want to remove close_fds() call when repeat is enabled,
+		// since that can lead to deadlocks, see executor/common_linux.h.
+		if !opts.EnableCloseFds || opts.Repeat {
 			return false
 		}
-		opts.ResetNet = false
+		opts.EnableCloseFds = false
 		return true
 	},
 	func(opts *csource.Options) bool {

@@ -2,7 +2,7 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 function sortTable(item, colName, conv, desc = false) {
-	table = item.parentNode.parentNode.parentNode;
+	table = item.parentNode.parentNode.parentNode.parentNode;
 	rows = table.rows;
 	col = findColumnByName(rows[0].getElementsByTagName("th"), colName);
 	values = [];
@@ -18,7 +18,7 @@ function sortTable(item, colName, conv, desc = false) {
 		return 1;
 	});
 	for (i = 0; i < values.length; i++)
-		table.appendChild(values[i][1]);
+		table.tBodies[0].appendChild(values[i][1]);
 	return false;
 }
 
@@ -41,6 +41,7 @@ function isSorted(values) {
 function textSort(v) { return v.toLowerCase(); }
 function numSort(v) { return -parseInt(v); }
 function floatSort(v) { return -parseFloat(v); }
+function yesSort(v) { return v == "yes" ? 0 : 1; }
 function reproSort(v) { return v == "C" ? 0 : v == "syz" ? 1 : 2; }
 function patchedSort(v) { return v == "" ? -1 : parseInt(v); }
 

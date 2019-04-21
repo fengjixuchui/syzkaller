@@ -25,6 +25,7 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/signal"
+	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys"
 )
@@ -116,13 +117,10 @@ func (mgr *Manager) collectStats() []UIStat {
 	defer mgr.mu.Unlock()
 
 	rawStats := mgr.stats.all()
-	head := strings.Replace(sys.GitRevision, "+", "", -1)
-	if head == "" {
-		head = "master"
-	}
+	head := sys.GitRevisionBase
 	stats := []UIStat{
-		{Name: "revision", Value: fmt.Sprint(head[:8]), Link: "https://github.com/google/syzkaller/commit/" + head},
-		{Name: "config", Value: "config", Link: "/config"},
+		{Name: "revision", Value: fmt.Sprint(head[:8]), Link: vcs.LogLink(vcs.SyzkallerRepo, head)},
+		{Name: "config", Value: mgr.cfg.Name, Link: "/config"},
 		{Name: "uptime", Value: fmt.Sprint(time.Since(mgr.startTime) / 1e9 * 1e9)},
 		{Name: "fuzzing", Value: fmt.Sprint(mgr.fuzzingTime / 60e9 * 60e9)},
 		{Name: "corpus", Value: fmt.Sprint(len(mgr.corpus)), Link: "/corpus"},

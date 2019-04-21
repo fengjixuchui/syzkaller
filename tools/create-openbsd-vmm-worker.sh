@@ -11,7 +11,7 @@
 set -eu -o pipefail
 
 readonly MIRROR="${MIRROR:-cdn.openbsd.org}"
-readonly VERSION="${VERSION:-6.4}"
+readonly VERSION="${VERSION:-6.5}"
 readonly DOWNLOAD_VERSION="${DOWNLOAD_VERSION:-snapshots}"
 readonly RELNO="${2:-${VERSION/./}}"
 
@@ -43,6 +43,7 @@ EOF
 
 cat >etc/sysctl.conf <<EOF
 ddb.max_line=0
+ddb.max_width=0
 hw.smt=1
 EOF
 

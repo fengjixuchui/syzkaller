@@ -31,10 +31,14 @@ const (
 	FlagSandboxSetuid                                   // impersonate nobody user
 	FlagSandboxNamespace                                // use namespaces for sandboxing
 	FlagSandboxAndroidUntrustedApp                      // use Android sandboxing for the untrusted_app domain
-	FlagEnableTun                                       // initialize and use tun in executor
-	FlagEnableNetDev                                    // setup a bunch of various network devices for testing
-	FlagEnableFault                                     // enable fault injection support
 	FlagExtraCover                                      // collect extra coverage
+	FlagEnableFault                                     // enable fault injection support
+	FlagEnableTun                                       // setup and use /dev/tun for packet injection
+	FlagEnableNetDev                                    // setup more network devices for testing
+	FlagEnableNetReset                                  // reset network namespace between programs
+	FlagEnableCgroups                                   // setup cgroups for testing
+	FlagEnableBinfmtMisc                                // setup binfmt_misc for testing
+	FlagEnableCloseFds                                  // close fds after each program
 	// Executor does not know about these:
 	FlagUseShmem      // use shared memory instead of pipes for communication
 	FlagUseForkServer // use extended protocol with handshake
@@ -56,14 +60,6 @@ type ExecOpts struct {
 	Flags     ExecFlags
 	FaultCall int // call index for fault injection (0-based)
 	FaultNth  int // fault n-th operation in the call (0-based)
-}
-
-// ExecutorFailure is returned from MakeEnv or from env.Exec when executor terminates
-// by calling fail function. This is considered a logical error (a failed assert).
-type ExecutorFailure string
-
-func (err ExecutorFailure) Error() string {
-	return string(err)
 }
 
 // Config is the configuration for Env.
@@ -120,9 +116,7 @@ type Env struct {
 const (
 	outputSize = 16 << 20
 
-	statusFail  = 67
-	statusError = 68
-	statusRetry = 69
+	statusFail = 67
 
 	// Comparison types masks taken from KCOV headers.
 	compSizeMask  = 6
@@ -200,14 +194,16 @@ func MakeEnv(config *Config, pid int) (*Env, error) {
 	env.bin[0] = osutil.Abs(env.bin[0]) // we are going to chdir
 	// Append pid to binary name.
 	// E.g. if binary is 'syz-executor' and pid=15,
-	// we create a link from 'syz-executor15' to 'syz-executor' and use 'syz-executor15' as binary.
+	// we create a link from 'syz-executor.15' to 'syz-executor' and use 'syz-executor.15' as binary.
 	// This allows to easily identify program that lead to a crash in the log.
-	// Log contains pid in "executing program 15" and crashes usually contain "Comm: syz-executor15".
+	// Log contains pid in "executing program 15" and crashes usually contain "Comm: syz-executor.15".
+	// Note: pkg/report knowns about this and converts "syz-executor.15" back to "syz-executor".
 	base := filepath.Base(env.bin[0])
-	pidStr := fmt.Sprint(pid)
-	if len(base)+len(pidStr) >= 16 {
-		// TASK_COMM_LEN is currently set to 16
-		base = base[:15-len(pidStr)]
+	pidStr := fmt.Sprintf(".%v", pid)
+	const maxLen = 16 // TASK_COMM_LEN is currently set to 16
+	if len(base)+len(pidStr) >= maxLen {
+		// Remove beginning of file name, in tests temp files have unique numbers at the end.
+		base = base[len(base)+len(pidStr)-maxLen+1:]
 	}
 	binCopy := filepath.Join(filepath.Dir(env.bin[0]), base+pidStr)
 	if err := os.Link(env.bin[0], binCopy); err == nil {
@@ -248,10 +244,9 @@ var rateLimit = time.NewTicker(1 * time.Second)
 // Exec starts executor binary to execute program p and returns information about the execution:
 // output: process output
 // info: per-call info
-// failed: true if executor has detected a kernel bug
 // hanged: program hanged and was killed
-// err0: failed to start process, or executor has detected a logical error
-func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInfo, failed, hanged bool, err0 error) {
+// err0: failed to start the process or bug in executor itself
+func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInfo, hanged bool, err0 error) {
 	// Copy-in serialized program.
 	progSize, err := p.SerializeForExec(env.in)
 	if err != nil {
@@ -275,14 +270,17 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
 			// starting them too frequently leads to timeouts.
 			<-rateLimit.C
 		}
+		tmpDirPath := "./"
+		if p.Target.OS == "fuchsia" {
+			tmpDirPath = "/data/"
+		}
 		atomic.AddUint64(&env.StatRestarts, 1)
-		env.cmd, err0 = makeCommand(env.pid, env.bin, env.config, env.inFile, env.outFile, env.out)
+		env.cmd, err0 = makeCommand(env.pid, env.bin, env.config, env.inFile, env.outFile, env.out, tmpDirPath)
 		if err0 != nil {
 			return
 		}
 	}
-	var restart bool
-	output, failed, hanged, restart, err0 = env.cmd.exec(opts, progData)
+	output, hanged, err0 = env.cmd.exec(opts, progData)
 	if err0 != nil {
 		env.cmd.close()
 		env.cmd = nil
@@ -293,7 +291,7 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
 	if info != nil && env.config.Flags&FlagSignal == 0 {
 		addFallbackSignal(p, info)
 	}
-	if restart {
+	if env.config.Flags&FlagUseForkServer == 0 {
 		env.cmd.close()
 		env.cmd = nil
 	}
@@ -526,9 +524,9 @@ type callReply struct {
 	// signal/cover/comps follow
 }
 
-func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File, outmem []byte) (
-	*command, error) {
-	dir, err := ioutil.TempDir("./", "syzkaller-testdir")
+func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File, outmem []byte,
+	tmpDirPath string) (*command, error) {
+	dir, err := ioutil.TempDir(tmpDirPath, "syzkaller-testdir")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %v", err)
 	}
@@ -697,12 +695,6 @@ func (c *command) handshakeError(err error) error {
 	output := <-c.readDone
 	err = fmt.Errorf("executor %v: %v\n%s", c.pid, err, output)
 	c.wait()
-	if c.cmd.ProcessState != nil {
-		// Magic values returned by executor.
-		if osutil.ProcessExitStatus(c.cmd.ProcessState) == statusFail {
-			err = ExecutorFailure(err.Error())
-		}
-	}
 	return err
 }
 
@@ -717,8 +709,7 @@ func (c *command) wait() error {
 	return err
 }
 
-func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, hanged,
-	restart bool, err0 error) {
+func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged bool, err0 error) {
 	req := &executeReq{
 		magic:     inMagic,
 		envFlags:  uint64(c.config.Flags),
@@ -756,7 +747,6 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 			hang <- false
 		}
 	}()
-	restart = c.config.Flags&FlagUseForkServer == 0
 	exitStatus := -1
 	completedCalls := (*uint32)(unsafe.Pointer(&c.outmem[0]))
 	outmem := c.outmem[4:]
@@ -804,27 +794,12 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 	}
 	if exitStatus == -1 {
 		exitStatus = osutil.ProcessExitStatus(c.cmd.ProcessState)
-		if exitStatus == 0 {
-			exitStatus = statusRetry // fuchsia always returns wrong exit status 0
-		}
 	}
-	// Handle magic values returned by executor.
-	switch exitStatus {
-	case statusFail:
-		err0 = ExecutorFailure(fmt.Sprintf("executor %v: failed: %s", c.pid, output))
-	case statusError:
-		err0 = fmt.Errorf("executor %v: detected kernel bug", c.pid)
-		failed = true
-	case statusRetry:
-		// This is a temporal error (ENOMEM) or an unfortunate
-		// program that messes with testing setup (e.g. kills executor
-		// loop process). Pretend that nothing happened.
-		// It's better than a false crash report.
-		err0 = nil
-		hanged = false
-		restart = true
-	default:
-		err0 = fmt.Errorf("executor %v: exit status %d", c.pid, exitStatus)
+	// Ignore all other errors.
+	// Without fork server executor can legitimately exit (program contains exit_group),
+	// with fork server the top process can exit with statusFail if it wants special handling.
+	if exitStatus == statusFail {
+		err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
 	}
 	return
 }

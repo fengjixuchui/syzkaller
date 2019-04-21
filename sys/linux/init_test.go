@@ -64,11 +64,11 @@ func TestSanitize(t *testing.T) {
 		},
 		{
 			`fanotify_mark(0x1, 0x2, 0x407fe029, 0x3, 0x0)`,
-			`fanotify_mark(0x1, 0x2, 0x407ce029, 0x3, 0x0)`,
+			`fanotify_mark(0x1, 0x2, 0x4078e029, 0x3, 0x0)`,
 		},
 		{
-			`fanotify_mark(0xffffffffffffffff, 0xffffffffffffffff, 0xfffffffffffcffff, 0xffffffffffffffff, 0x0)`,
-			`fanotify_mark(0xffffffffffffffff, 0xffffffffffffffff, 0xfffffffffffcffff, 0xffffffffffffffff, 0x0)`,
+			`fanotify_mark(0xffffffffffffffff, 0xffffffffffffffff, 0xfffffffffff8ffff, 0xffffffffffffffff, 0x0)`,
+			`fanotify_mark(0xffffffffffffffff, 0xffffffffffffffff, 0xfffffffffff8ffff, 0xffffffffffffffff, 0x0)`,
 		},
 		{
 			`syz_init_net_socket$bt_hci(0x1, 0x0, 0x0)`,
@@ -121,10 +121,10 @@ mknod(0x0, 0x6000, 0x700)
 exit(0x3)
 exit(0x43)
 exit(0xc3)
-exit(0xc4)
+exit(0xc3)
 exit_group(0x5a)
-exit_group(0x44)
-exit_group(0x444)
+exit_group(0x43)
+exit_group(0x443)
 `,
 			`
 exit(0x3)
@@ -135,6 +135,22 @@ exit_group(0x5a)
 exit_group(0x1)
 exit_group(0x1)
 `,
+		},
+		{
+			`
+syz_open_procfs(0x0, &(0x7f0000000000)='io')
+syz_open_procfs(0x0, &(0x7f0000000000)='exe')
+syz_open_procfs(0x0, &(0x7f0000000000)='exe\x00')
+syz_open_procfs(0x0, &(0x7f0000000000)='/exe')
+syz_open_procfs(0x0, &(0x7f0000000000)='./exe\x00')
+`,
+			`
+syz_open_procfs(0x0, &(0x7f0000000000)='io')
+syz_open_procfs(0x0, &(0x7f0000000000)='net\x00')
+syz_open_procfs(0x0, &(0x7f0000000000)='net\x00')
+syz_open_procfs(0x0, &(0x7f0000000000)='net\x00')
+syz_open_procfs(0x0, &(0x7f0000000000)='net\x00')
+			`,
 		},
 	}
 	for i, test := range tests {

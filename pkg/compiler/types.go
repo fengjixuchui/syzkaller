@@ -440,25 +440,6 @@ func genTextType(t *ast.Type) prog.TextKind {
 	}
 }
 
-var typeBuffer = &typeDesc{
-	Names:       []string{"buffer"},
-	CanBeArgRet: canBeArg,
-	Args:        []namedArg{{Name: "direction", Type: typeArgDir}},
-	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
-		base.TypeSize = comp.ptrSize
-		common := genCommon("", "", 0, genDir(args[0]), false)
-		// BufferBlobRand is always varlen.
-		common.IsVarlen = true
-		return &prog.PtrType{
-			TypeCommon: base.TypeCommon,
-			Type: &prog.BufferType{
-				TypeCommon: common,
-				Kind:       prog.BufferBlobRand,
-			},
-		}
-	},
-}
-
 const (
 	stringnoz = "stringnoz"
 )
@@ -702,7 +683,7 @@ func init() {
 		canBeArg := true
 		for _, fld := range s.Fields {
 			desc := comp.getTypeDesc(fld.Type)
-			if desc == nil || desc.CanBeArgRet == nil {
+			if desc == nil || desc == typeStruct || desc.CanBeArgRet == nil {
 				return false, false
 			}
 			canBeArg1, _ := desc.CanBeArgRet(comp, fld.Type)
@@ -862,6 +843,8 @@ type boolptr intptr[0:1]
 type filename string[filename]
 filename = "", "."
 
+type buffer[DIR] ptr[DIR, array[int8]]
+
 type optional[T] [
 	val	T
 	void	void
@@ -882,7 +865,6 @@ func init() {
 		typeCsum,
 		typeProc,
 		typeText,
-		typeBuffer,
 		typeString,
 		typeFmt,
 	}

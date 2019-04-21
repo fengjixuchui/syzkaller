@@ -2,9 +2,41 @@
 
 Most latest bugs are reported by [syzbot](/docs/syzbot.md) to
 [syzkaller-openbsd-bugs](https://groups.google.com/forum/#!forum/syzkaller-openbsd-bugs)
-mailing list and are listed on the [dashboard](https://syzkaller.appspot.com/#openbsd).
+mailing list and are listed on the [dashboard](https://syzkaller.appspot.com/openbsd).
 
 Newer bugs comes first.
+
+- [bpf(4): negative input accepted in `bpfioctl()`](https://marc.info/?l=openbsd-cvs&m=155430843501793&w=2)
+
+- [sendto: lenient `rtm_hdrlen` validation](https://marc.info/?l=openbsd-cvs&m=155404645328879&w=2)
+
+- [wsmux(4): restrict the number of allowed devices](https://marc.info/?l=openbsd-cvs&m=155393308902921&w=2)
+
+- [rtable(4): out-of-bounds read in `rtable_satoplen()`](https://marc.info/?l=openbsd-cvs&m=155181289205879&w=2)
+
+- [wsmux(4): wrong lock flags](https://marc.info/?l=openbsd-cvs&m=155068528608010&w=2)
+
+- [ioctl: negative input accepted in `spkrioctl()`](https://marc.info/?l=openbsd-cvs&m=155064605025992&w=2)
+
+- [wsmux(4): missing locking](https://marc.info/?l=openbsd-cvs&m=155051156715959&w=2)
+
+- [recvmsg: double free of mbuf](https://marc.info/?l=openbsd-cvs&m=154931648202074&w=2)
+
+- [semop: use-after-free](https://marc.info/?l=openbsd-cvs&m=154926389815162&w=2)
+
+- [kernel: missing lock acquisition during page fault](https://marc.info/?l=openbsd-cvs&m=154917205425885&w=2)
+
+- [ioctl: use-after-free in `wsmux_do_ioctl()`](https://marc.info/?l=openbsd-cvs&m=154900458511494&w=2)
+
+- [ioctl: out of bounds access in `wsmux_do_ioctl()`](https://marc.info/?l=openbsd-cvs&m=154859038916770&w=2)
+
+- [unveil: NULL pointer dereference](https://marc.info/?l=openbsd-cvs&m=154818960525456&w=2)
+
+- [fcntl: use-after-free in `lf_findoverlap()`](https://marc.info/?l=openbsd-cvs&m=154809417426357&w=2)
+
+- [setsockopt: incorrect mbuf padding](https://marc.info/?l=openbsd-cvs&m=154784437622409&w=2)
+
+- [read: missing locking](https://marc.info/?l=openbsd-cvs&m=154715201702848&w=2)
 
 - [write: lenient IP packet validation](https://marc.info/?l=openbsd-cvs&m=154684768026869&w=2)
 

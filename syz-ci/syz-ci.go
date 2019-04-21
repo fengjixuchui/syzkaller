@@ -31,7 +31,6 @@ package main
 //
 // Directory/file structure:
 // syz-ci			: current executable
-// syz-ci.tag			: tag of the current executable (syzkaller git hash)
 // syzkaller/
 //	latest/			: latest good syzkaller build
 //	current/		: syzkaller build currently in use
@@ -61,6 +60,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"github.com/google/syzkaller/pkg/config"
@@ -69,7 +69,11 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
-var flagConfig = flag.String("config", "", "config file")
+var (
+	flagConfig     = flag.String("config", "", "config file")
+	flagAutoUpdate = flag.Bool("autoupdate", true, "auto-update the binary (for testing)")
+	flagManagers   = flag.Bool("managers", true, "start managers (for testing)")
+)
 
 type Config struct {
 	Name string `json:"name"`
@@ -89,8 +93,9 @@ type Config struct {
 	// GCS path to upload coverage reports from managers (optional).
 	CoverUploadPath string `json:"cover_upload_path"`
 	// Enable patch testing jobs.
-	EnableJobs bool             `json:"enable_jobs"`
-	Managers   []*ManagerConfig `json:"managers"`
+	EnableJobs   bool             `json:"enable_jobs"`
+	BisectBinDir string           `json:"bisect_bin_dir"`
+	Managers     []*ManagerConfig `json:"managers"`
 }
 
 type ManagerConfig struct {
@@ -107,7 +112,10 @@ type ManagerConfig struct {
 	// File with kernel cmdline values (optional).
 	KernelCmdline string `json:"kernel_cmdline"`
 	// File with sysctl values (e.g. output of sysctl -a, optional).
-	KernelSysctl  string          `json:"kernel_sysctl"`
+	KernelSysctl string `json:"kernel_sysctl"`
+	PollCommits  bool   `json:"poll_commits"`
+	Bisect       bool   `json:"bisect"`
+
 	ManagerConfig json.RawMessage `json:"manager_config"`
 	managercfg    *mgrconfig.Config
 }
@@ -125,13 +133,22 @@ func main() {
 
 	serveHTTP(cfg)
 
-	updater := NewSyzUpdater(cfg)
-	updater.UpdateOnStart(shutdownPending)
+	os.Unsetenv("GOPATH")
+	if cfg.Goroot != "" {
+		os.Setenv("GOROOT", cfg.Goroot)
+		os.Setenv("PATH", filepath.Join(cfg.Goroot, "bin")+
+			string(filepath.ListSeparator)+os.Getenv("PATH"))
+	}
+
 	updatePending := make(chan struct{})
-	go func() {
-		updater.WaitForUpdate()
-		close(updatePending)
-	}()
+	updater := NewSyzUpdater(cfg)
+	updater.UpdateOnStart(*flagAutoUpdate, shutdownPending)
+	if *flagAutoUpdate {
+		go func() {
+			updater.WaitForUpdate()
+			close(updatePending)
+		}()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -146,26 +163,35 @@ func main() {
 		wg.Done()
 	}()
 
-	managers := make([]*Manager, len(cfg.Managers))
-	for i, mgrcfg := range cfg.Managers {
-		managers[i] = createManager(cfg, mgrcfg, stop)
+	var managers []*Manager
+	for _, mgrcfg := range cfg.Managers {
+		mgr, err := createManager(cfg, mgrcfg, stop)
+		if err != nil {
+			log.Logf(0, "failed to create manager %v: %v", mgrcfg.Name, err)
+			continue
+		}
+		managers = append(managers, mgr)
 	}
-	for _, mgr := range managers {
-		mgr := mgr
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			mgr.loop()
-		}()
+	if len(managers) == 0 {
+		log.Fatalf("failed to create all managers")
 	}
-	if cfg.EnableJobs {
-		jp := newJobProcessor(cfg, managers, stop)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			jp.loop()
-		}()
+	if *flagManagers {
+		for _, mgr := range managers {
+			mgr := mgr
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mgr.loop()
+			}()
+		}
 	}
+
+	jp := newJobProcessor(cfg, managers, stop, shutdownPending)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		jp.loop()
+	}()
 
 	// For testing. Racy. Use with care.
 	http.HandleFunc("/upload_cover", func(w http.ResponseWriter, r *http.Request) {
@@ -218,9 +244,17 @@ func loadConfig(filename string) (*Config, error) {
 	if len(cfg.Managers) == 0 {
 		return nil, fmt.Errorf("no managers specified")
 	}
+	if cfg.EnableJobs && (cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
+		return nil, fmt.Errorf("enabled_jobs is set but no dashboard info")
+	}
+	if cfg.EnableJobs && cfg.BisectBinDir == "" {
+		return nil, fmt.Errorf("enabled_jobs is set but no bisect_bin_dir")
+	}
+	// Manager name must not contain dots because it is used as GCE image name prefix.
+	managerNameRe := regexp.MustCompile("^[a-zA-Z0-9-_]{4,64}$")
 	for i, mgr := range cfg.Managers {
-		if mgr.Name == "" {
-			return nil, fmt.Errorf("param 'managers[%v].name' is empty", i)
+		if !managerNameRe.MatchString(mgr.Name) {
+			return nil, fmt.Errorf("param 'managers[%v].name' has bad value: %q", i, mgr.Name)
 		}
 		if mgr.Branch == "" {
 			mgr.Branch = "master"
@@ -228,6 +262,9 @@ func loadConfig(filename string) (*Config, error) {
 		managercfg, err := mgrconfig.LoadPartialData(mgr.ManagerConfig)
 		if err != nil {
 			return nil, fmt.Errorf("manager %v: %v", mgr.Name, err)
+		}
+		if mgr.PollCommits && (cfg.DashboardAddr == "" || mgr.DashboardClient == "") {
+			return nil, fmt.Errorf("manager %v: commit_poll is set but no dashboard info", mgr.Name)
 		}
 		mgr.managercfg = managercfg
 		managercfg.Name = cfg.Name + "-" + mgr.Name

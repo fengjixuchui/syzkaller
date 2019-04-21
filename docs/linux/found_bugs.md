@@ -1,9 +1,12 @@
 # Found bugs
 
-Most latest bugs are reported by [syzbot](/docs/syzbot.md) and are listed [here](https://groups.google.com/forum/#!forum/syzkaller-bugs) and on the [dashboard](https://syzkaller.appspot.com/#upstream).
+Most latest bugs are reported by [syzbot](/docs/syzbot.md) and are listed [here](https://groups.google.com/forum/#!forum/syzkaller-bugs) and on the [dashboard](https://syzkaller.appspot.com/upstream).
 Additional USB bugs are [here](/docs/linux/found_bugs_usb.md).
 
 _newer first_
+* [bpf: BPF_PROG_TEST_RUN leads to unkillable process](https://groups.google.com/d/msg/syzkaller/EmqpzlOL164/loUGe070FwAJ)
+* [timer_settime leads to unkillable process](https://groups.google.com/d/msg/syzkaller/Q6t7TCcN630/ep3J4BT1FwAJ)
+* [UBSAN: Undefined behaviour in drivers/scsi/sr_ioctl.c](https://groups.google.com/d/msg/syzkaller/lfupcWLvlmI/ts9ut9LyEwAJ)
 * [KASAN: use-after-free Read in ata_scsi_mode_select_xlat](https://groups.google.com/d/msg/syzkaller/PSlmJbCdKF0/tasiCXl4AgAJ)
 * [UBSAN: Undefined behaviour in fs/f2fs/extent_cache.c](https://groups.google.com/d/msg/syzkaller/oAhUsPAO4RI/rivMjuUOCgAJ)
 * [UBSAN: Undefined behaviour in drivers/input/misc/uinput.c](https://groups.google.com/d/msg/syzkaller/i64-4xzd-Cs/wJRiNri8CQAJ)
@@ -280,7 +283,6 @@ _newer first_
 * [net/sctp: use-after-free in __sctp_connect](https://groups.google.com/forum/#!topic/syzkaller/W0swoIe25Eg)
 * [fs: WARNING in locks_unlink_lock_ctx (not holding proper lock)](https://groups.google.com/d/msg/syzkaller/9DFicr6njUw/aaX3dVtNBQAJ)
 * [kernel BUG in dio_get_page](https://groups.google.com/d/msg/syzkaller/rCCyOHJHflI/Ik7IhXWzBAAJ)
-* [bpf related use-after-free](http://seclists.org/oss-sec/2016/q2/332) CVE-2016-4794
 * [drm: GPF in drm_getcap](https://groups.google.com/d/msg/syzkaller/dxVHCovRzhg/7QPBBqi4BwAJ)
 * [fs: GPF in bd_mount](https://groups.google.com/d/msg/syzkaller/Z7OCclqCuq0/--YUa8QrBgAJ)
 * [tty, fbcon: use-after-free in fbcon_invert_region](https://groups.google.com/d/msg/syzkaller/1DU69JpJwJg/n-6V4Wr5BQAJ)

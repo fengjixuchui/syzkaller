@@ -21,17 +21,22 @@ func (fu fuchsia) build(targetArch, vmType, kernelDir, outputDir, compiler, user
 		return fmt.Errorf("unsupported fuchsia arch %v", targetArch)
 	}
 	arch := sysTarget.KernelHeaderArch
-	if _, err := osutil.RunCmd(time.Hour, kernelDir, "scripts/fx", "clean-build", arch,
+	product := fmt.Sprintf("%s.%s", "core", arch)
+	if _, err := osutil.RunCmd(time.Hour, kernelDir, "scripts/fx", "set", product,
 		"--args", `extra_authorized_keys_file="//.ssh/authorized_keys"`,
-		"--packages", "garnet/packages/products/sshd", "--product", "garnet/products/default.gni"); err != nil {
+		"--with-base", "//bundles:tools",
+		"--build-dir", "out/"+arch); err != nil {
+		return err
+	}
+	if _, err := osutil.RunCmd(time.Hour, kernelDir, "scripts/fx", "clean-build"); err != nil {
 		return err
 	}
 	for src, dst := range map[string]string{
 		"out/" + arch + "/obj/build/images/fvm.blk": "image",
-		".ssh/pkey":                                 "key",
-		"out/build-zircon/build-" + arch + "/zircon.elf":    "obj/zircon.elf",
-		"out/build-zircon/build-" + arch + "/multiboot.bin": "kernel",
-		"out/" + arch + "/fuchsia.zbi":                      "initrd",
+		".ssh/pkey": "key",
+		"out/build-zircon/kernel-" + arch + "-gcc/obj/kernel/zircon.elf": "obj/zircon.elf",
+		"out/build-zircon/multiboot.bin":                                 "kernel",
+		"out/" + arch + "/fuchsia.zbi":                                   "initrd",
 	} {
 		fullSrc := filepath.Join(kernelDir, filepath.FromSlash(src))
 		fullDst := filepath.Join(outputDir, filepath.FromSlash(dst))
@@ -42,7 +47,7 @@ func (fu fuchsia) build(targetArch, vmType, kernelDir, outputDir, compiler, user
 	return nil
 }
 
-func (fu fuchsia) clean(kernelDir string) error {
+func (fu fuchsia) clean(kernelDir, targetArch string) error {
 	// We always do clean build because incremental build is frequently broken.
 	// So no need to clean separately.
 	return nil

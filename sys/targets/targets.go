@@ -60,7 +60,7 @@ func Get(OS, arch string) *Target {
 		return nil
 	}
 	target.init.Do(func() {
-		checkStaticBuild(target)
+		checkOptionalFlags(target)
 	})
 	return target
 }
@@ -155,8 +155,8 @@ var List = map[string]map[string]*Target{
 			PtrSize:          4,
 			PageSize:         4 << 10,
 			CFlags:           []string{"-D__LINUX_ARM_ARCH__=6", "-m32", "-D__ARM_EABI__"},
-			CrossCFlags:      []string{"-D__LINUX_ARM_ARCH__=6", "-march=armv6t2", "-static"},
-			CCompilerPrefix:  "arm-linux-gnueabihf-",
+			CrossCFlags:      []string{"-D__LINUX_ARM_ARCH__=6", "-march=armv6", "-static"},
+			CCompilerPrefix:  "arm-linux-gnueabi-",
 			KernelArch:       "arm",
 			KernelHeaderArch: "arm",
 		},
@@ -172,21 +172,22 @@ var List = map[string]map[string]*Target{
 	},
 	"freebsd": {
 		"amd64": {
-			PtrSize:     8,
-			PageSize:    4 << 10,
-			CFlags:      []string{"-m64"},
-			CrossCFlags: []string{"-m64", "-static"},
-			NeedSyscallDefine: func(uint64) bool {
-				return false
-			},
+			PtrSize:           8,
+			PageSize:          4 << 10,
+			CFlags:            []string{"-m64"},
+			CrossCFlags:       []string{"-m64", "-static"},
+			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
 	},
 	"netbsd": {
 		"amd64": {
-			PtrSize:     8,
-			PageSize:    4 << 10,
-			CFlags:      []string{"-m64"},
-			CrossCFlags: []string{"-m64", "-static"},
+			PtrSize:  8,
+			PageSize: 4 << 10,
+			CFlags:   []string{"-m64"},
+			CrossCFlags: []string{"-m64", "-static",
+				"--sysroot", os.ExpandEnv("${SOURCEDIR}/../dest/"),
+			},
+			CCompiler: os.ExpandEnv("${SOURCEDIR}/../tools/bin/x86_64--netbsd-g++"),
 		},
 	},
 	"openbsd": {
@@ -301,15 +302,16 @@ var oses = map[string]osCommon{
 		SyscallPrefix:          "SYS_",
 		ExecutorUsesShmem:      true,
 		ExecutorUsesForkServer: true,
-		KernelObject:           "kernel.debug",
+		KernelObject:           "kernel.full",
 		CPP:                    "g++",
 	},
 	"netbsd": {
+		BuildOS:                "linux",
 		SyscallNumbers:         true,
 		SyscallPrefix:          "SYS_",
 		ExecutorUsesShmem:      true,
 		ExecutorUsesForkServer: true,
-		KernelObject:           "vmlinux",
+		KernelObject:           "netbsd.gdb",
 		CPP:                    "cpp",
 	},
 	"openbsd": {
@@ -352,6 +354,22 @@ var oses = map[string]osCommon{
 	},
 }
 
+var (
+	commonCFlags = []string{
+		"-O2",
+		"-pthread",
+		"-Wall",
+		"-Werror",
+		"-Wparentheses",
+		"-Wunused-const-variable",
+		"-Wframe-larger-than=8192",
+	}
+	optionalCFlags = map[string]bool{
+		"-static":                 true, // some distributions don't have static libraries
+		"-Wunused-const-variable": true, // gcc 5 does not support this flag
+	}
+)
+
 func init() {
 	for OS, archs := range List {
 		for arch, target := range archs {
@@ -365,6 +383,13 @@ func init() {
 	for _, target := range List["test"] {
 		target.CCompiler = List[goos][runtime.GOARCH].CCompiler
 		target.CPP = List[goos][runtime.GOARCH].CPP
+		target.BuildOS = goos
+		if runtime.GOOS == "freebsd" && runtime.GOARCH == "amd64" && target.PtrSize == 4 {
+			// -m32 alone does not work on freebsd with gcc.
+			// TODO(dvyukov): consider switching to clang on freebsd instead.
+			target.CFlags = append(target.CFlags, "-B/usr/lib32")
+			target.CrossCFlags = append(target.CrossCFlags, "-B/usr/lib32")
+		}
 	}
 }
 
@@ -392,31 +417,41 @@ func initTarget(target *Target, OS, arch string) {
 	if target.BuildOS == "" {
 		target.BuildOS = OS
 	}
-	if OS == "test" {
-		target.BuildOS = "linux"
-	}
 	if runtime.GOOS != target.BuildOS {
 		// Spoil native binaries if they are not usable, so that nobody tries to use them later.
 		target.CCompiler = fmt.Sprintf("cant-build-%v-on-%v", target.OS, runtime.GOOS)
 		target.CPP = target.CCompiler
 	}
+	target.CrossCFlags = append(append([]string{}, commonCFlags...), target.CrossCFlags...)
 }
 
-func checkStaticBuild(target *Target) {
-	for i, flag := range target.CrossCFlags {
-		if flag == "-static" {
-			// Some distributions don't have static libraries.
-			if !supportsStatic(target) {
-				copy(target.CrossCFlags[i:], target.CrossCFlags[i+1:])
-				target.CrossCFlags = target.CrossCFlags[:len(target.CrossCFlags)-1]
-			}
-			break
+func checkOptionalFlags(target *Target) {
+	flags := make(map[string]*bool)
+	var wg sync.WaitGroup
+	for _, flag := range target.CrossCFlags {
+		if !optionalCFlags[flag] {
+			continue
+		}
+		res := new(bool)
+		flags[flag] = res
+		wg.Add(1)
+		go func(flag string) {
+			defer wg.Done()
+			*res = checkFlagSupported(target, flag)
+		}(flag)
+	}
+	wg.Wait()
+	for i := 0; i < len(target.CrossCFlags); i++ {
+		if res := flags[target.CrossCFlags[i]]; res != nil && !*res {
+			copy(target.CrossCFlags[i:], target.CrossCFlags[i+1:])
+			target.CrossCFlags = target.CrossCFlags[:len(target.CrossCFlags)-1]
+			i--
 		}
 	}
 }
 
-func supportsStatic(target *Target) bool {
-	cmd := exec.Command(target.CCompiler, "-x", "c", "-", "-o", "/dev/null", "-static")
+func checkFlagSupported(target *Target, flag string) bool {
+	cmd := exec.Command(target.CCompiler, "-x", "c", "-", "-o", "/dev/null", flag)
 	cmd.Stdin = strings.NewReader("int main(){}")
 	return cmd.Run() == nil
 }

@@ -6,6 +6,7 @@
 package instance
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -69,6 +70,11 @@ func (env *Env) BuildSyzkaller(repo, commit string) error {
 		"TARGETOS="+cfg.TargetOS,
 		"TARGETVMARCH="+cfg.TargetVMArch,
 		"TARGETARCH="+cfg.TargetArch,
+		// Since we can be building very old revisions for bisection here,
+		// make the build as permissive as possible.
+		// Newer compilers tend to produce more warnings also kernel headers may be broken, e.g.:
+		// ebtables.h:197:19: error: invalid conversion from ‘void*’ to ‘ebt_entry_target*’
+		"CFLAGS=-fpermissive -w",
 	)
 	if _, err := osutil.Run(time.Hour, cmd); err != nil {
 		return fmt.Errorf("syzkaller build failed: %v", err)
@@ -84,42 +90,36 @@ func (env *Env) BuildKernel(compilerBin, userspaceDir, cmdlineFile, sysctlFile s
 		cmdlineFile, sysctlFile, kernelConfig); err != nil {
 		return err
 	}
-	return SetConfigImage(cfg, imageDir)
+	return SetConfigImage(cfg, imageDir, true)
 }
 
-func SetConfigImage(cfg *mgrconfig.Config, imageDir string) error {
+func SetConfigImage(cfg *mgrconfig.Config, imageDir string, reliable bool) error {
 	cfg.KernelObj = filepath.Join(imageDir, "obj")
 	cfg.Image = filepath.Join(imageDir, "image")
 	if keyFile := filepath.Join(imageDir, "key"); osutil.IsExist(keyFile) {
 		cfg.SSHKey = keyFile
 	}
+	vmConfig := make(map[string]interface{})
+	if err := json.Unmarshal(cfg.VM, &vmConfig); err != nil {
+		return fmt.Errorf("failed to parse VM config: %v", err)
+	}
 	if cfg.Type == "qemu" || cfg.Type == "vmm" {
-		kernel := filepath.Join(imageDir, "kernel")
-		if !osutil.IsExist(kernel) {
-			kernel = ""
+		if kernel := filepath.Join(imageDir, "kernel"); osutil.IsExist(kernel) {
+			vmConfig["kernel"] = kernel
 		}
-		initrd := filepath.Join(imageDir, "initrd")
-		if !osutil.IsExist(initrd) {
-			initrd = ""
-		}
-		if kernel != "" || initrd != "" {
-			vmConfig := make(map[string]interface{})
-			if err := json.Unmarshal(cfg.VM, &vmConfig); err != nil {
-				return fmt.Errorf("failed to parse VM config: %v", err)
-			}
-			if kernel != "" {
-				vmConfig["kernel"] = kernel
-			}
-			if initrd != "" {
-				vmConfig["initrd"] = initrd
-			}
-			vmCfg, err := json.Marshal(vmConfig)
-			if err != nil {
-				return fmt.Errorf("failed to serialize VM config: %v", err)
-			}
-			cfg.VM = vmCfg
+		if initrd := filepath.Join(imageDir, "initrd"); osutil.IsExist(initrd) {
+			vmConfig["initrd"] = initrd
 		}
 	}
+	if cfg.Type == "gce" {
+		// Don't use preemptible VMs for image testing, patch testing and bisection.
+		vmConfig["preemptible"] = !reliable
+	}
+	vmCfg, err := json.Marshal(vmConfig)
+	if err != nil {
+		return fmt.Errorf("failed to serialize VM config: %v", err)
+	}
+	cfg.VM = vmCfg
 	return nil
 }
 
@@ -203,7 +203,11 @@ func (inst *inst) test() error {
 			rep := inst.reporter.Parse(testErr.Output)
 			if rep != nil && rep.Title == report.UnexpectedKernelReboot {
 				// Avoid detecting any boot crash as "unexpected kernel reboot".
-				rep = inst.reporter.Parse(testErr.Output[rep.EndPos:])
+				output := testErr.Output[rep.EndPos:]
+				if pos := bytes.IndexByte(testErr.Output[rep.StartPos:], '\n'); pos != -1 {
+					output = testErr.Output[rep.StartPos+pos:]
+				}
+				rep = inst.reporter.Parse(output)
 			}
 			if rep == nil {
 				rep = &report.Report{
@@ -264,7 +268,7 @@ func (inst *inst) testInstance() error {
 	}
 
 	cmd := FuzzerCmd(fuzzerBin, executorBin, "test", inst.cfg.TargetOS, inst.cfg.TargetArch, fwdAddr,
-		inst.cfg.Sandbox, 0, 0, false, false, true, false)
+		inst.cfg.Sandbox, 0, 0, inst.cfg.Cover, false, true, false)
 	outc, errc, err := inst.vm.Run(10*time.Minute, nil, cmd)
 	if err != nil {
 		return fmt.Errorf("failed to run binary in VM: %v", err)
@@ -332,10 +336,11 @@ func (inst *inst) testRepro() error {
 	if err != nil {
 		return err
 	}
-	bin, err := csource.Build(target, inst.reproC)
+	bin, err := csource.BuildNoWarn(target, inst.reproC)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(bin)
 	vmBin, err := inst.vm.Copy(bin)
 	if err != nil {
 		return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
@@ -399,7 +404,7 @@ func ExecprogCmd(execprog, executor, OS, arch, sandbox string, repeat, threaded,
 }
 
 var MakeBin = func() string {
-	if runtime.GOOS == "openbsd" {
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "openbsd" {
 		return "gmake"
 	}
 	return "make"

@@ -175,7 +175,7 @@ func main() {
 			log.Fatalf("%v", r.CheckResult.Error)
 		}
 	}
-	log.Logf(0, "syscalls: %v", len(r.CheckResult.EnabledCalls))
+	log.Logf(0, "syscalls: %v", len(r.CheckResult.EnabledCalls[sandbox]))
 	for _, feat := range r.CheckResult.Features {
 		log.Logf(0, "%v: %v", feat.Name, feat.Reason)
 	}
@@ -190,15 +190,19 @@ func main() {
 	if r.CheckResult.Features[host.FeatureExtraCoverage].Enabled {
 		config.Flags |= ipc.FlagExtraCover
 	}
+	if r.CheckResult.Features[host.FeatureFaultInjection].Enabled {
+		config.Flags |= ipc.FlagEnableFault
+	}
 	if r.CheckResult.Features[host.FeatureNetworkInjection].Enabled {
 		config.Flags |= ipc.FlagEnableTun
 	}
 	if r.CheckResult.Features[host.FeatureNetworkDevices].Enabled {
 		config.Flags |= ipc.FlagEnableNetDev
 	}
-	if r.CheckResult.Features[host.FeatureFaultInjection].Enabled {
-		config.Flags |= ipc.FlagEnableFault
-	}
+	config.Flags |= ipc.FlagEnableNetReset
+	config.Flags |= ipc.FlagEnableCgroups
+	config.Flags |= ipc.FlagEnableBinfmtMisc
+	config.Flags |= ipc.FlagEnableCloseFds
 
 	if *flagRunTest {
 		runTest(target, manager, *flagName, config.Executor)

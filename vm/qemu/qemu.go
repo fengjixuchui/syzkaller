@@ -37,6 +37,7 @@ type Config struct {
 	ImageDevice string `json:"image_device"` // qemu image device (hda by default)
 	CPU         int    `json:"cpu"`          // number of VM CPUs
 	Mem         int    `json:"mem"`          // amount of VM memory in MBs
+	Snapshot    bool   `json:"snapshot"`     // For building kernels without -snapshot (for pkg/build)
 }
 
 type Pool struct {
@@ -85,6 +86,8 @@ var archConfigs = map[string]*archConfig{
 		// But other arches don't use e1000e, e.g. arm64 uses virtio by default.
 		NicModel: ",model=e1000",
 		CmdLine: append(linuxCmdline,
+			"root=/dev/sda",
+			"console=ttyS0",
 			"kvm-intel.nested=1",
 			"kvm-intel.unrestricted_guest=1",
 			"kvm-intel.vmm_exclusive=1",
@@ -103,18 +106,27 @@ var archConfigs = map[string]*archConfig{
 		Qemu:      "qemu-system-i386",
 		TargetDir: "/",
 		NicModel:  ",model=e1000",
-		CmdLine:   linuxCmdline,
+		CmdLine: append(linuxCmdline,
+			"root=/dev/sda",
+			"console=ttyS0",
+		),
 	},
 	"linux/arm64": {
 		Qemu:      "qemu-system-aarch64",
-		QemuArgs:  "-machine virt -cpu cortex-a57",
+		QemuArgs:  "-machine virt,virtualization=on -cpu cortex-a57",
 		TargetDir: "/",
-		CmdLine:   linuxCmdline,
+		CmdLine: append(linuxCmdline,
+			"root=/dev/vda",
+			"console=ttyAMA0",
+		),
 	},
 	"linux/arm": {
 		Qemu:      "qemu-system-arm",
 		TargetDir: "/",
-		CmdLine:   linuxCmdline,
+		CmdLine: append(linuxCmdline,
+			"root=/dev/vda",
+			"console=ttyAMA0",
+		),
 	},
 	"linux/ppc64le": {
 		Qemu:      "qemu-system-ppc64",
@@ -154,12 +166,11 @@ var archConfigs = map[string]*archConfig{
 }
 
 var linuxCmdline = []string{
-	"console=ttyS0",
 	"earlyprintk=serial",
 	"oops=panic",
 	"nmi_watchdog=panic",
 	"panic_on_warn=1",
-	"panic=86400",
+	"panic=1",
 	"ftrace_dump_on_oops=orig_cpu",
 	"rodata=n",
 	"vsyscall=native",
@@ -171,9 +182,11 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	archConfig := archConfigs[env.OS+"/"+env.Arch]
 	cfg := &Config{
 		Count:       1,
+		CPU:         1,
 		ImageDevice: "hda",
 		Qemu:        archConfig.Qemu,
 		QemuArgs:    archConfig.QemuArgs,
+		Snapshot:    true,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse qemu vm config: %v", err)
@@ -280,7 +293,7 @@ func (pool *Pool) ctor(workdir, sshkey, sshuser string, index int) (vmimpl.Insta
 		return nil, err
 	}
 
-	if err := inst.Boot(); err != nil {
+	if err := inst.boot(); err != nil {
 		return nil, err
 	}
 
@@ -304,7 +317,7 @@ func (inst *instance) Close() {
 	}
 }
 
-func (inst *instance) Boot() error {
+func (inst *instance) boot() error {
 	inst.port = vmimpl.UnusedTCPPort()
 	args := []string{
 		"-m", strconv.Itoa(inst.cfg.Mem),
@@ -326,8 +339,10 @@ func (inst *instance) Boot() error {
 	} else if inst.image != "" {
 		args = append(args,
 			"-"+inst.cfg.ImageDevice, inst.image,
-			"-snapshot",
 		)
+		if inst.cfg.Snapshot {
+			args = append(args, "-snapshot")
+		}
 	}
 	if inst.cfg.Initrd != "" {
 		args = append(args,
@@ -343,8 +358,6 @@ func (inst *instance) Boot() error {
 				"rootflags=trans=virtio,version=9p2000.L,cache=loose",
 				"init="+filepath.Join(inst.workdir, "init.sh"),
 			)
-		} else {
-			cmdline = append(cmdline, "root=/dev/sda")
 		}
 		cmdline = append(cmdline, inst.cfg.Cmdline)
 		args = append(args,
@@ -389,10 +402,10 @@ func (inst *instance) Boot() error {
 		}
 	}()
 	if err := vmimpl.WaitForSSH(inst.debug, 10*time.Minute, "localhost",
-		inst.sshkey, inst.sshuser, inst.os, inst.port); err != nil {
+		inst.sshkey, inst.sshuser, inst.os, inst.port, inst.merger.Err); err != nil {
 		bootOutputStop <- true
 		<-bootOutputStop
-		return vmimpl.BootError{Title: err.Error(), Output: bootOutput}
+		return vmimpl.MakeBootError(err, bootOutput)
 	}
 	bootOutputStop <- true
 	return nil

@@ -25,7 +25,12 @@ type openbsd struct {
 }
 
 var (
-	openbsdSymbolizeRe = regexp.MustCompile(` at ([A-Za-z0-9_]+)\+0x([0-9a-f]+)`)
+	openbsdSymbolizeRe = []*regexp.Regexp{
+		// stack
+		regexp.MustCompile(` at ([A-Za-z0-9_]+)\+0x([0-9a-f]+)`),
+		// witness
+		regexp.MustCompile(`#[0-9]+ +([A-Za-z0-9_]+)\+0x([0-9a-f]+)`),
+	}
 )
 
 func ctorOpenbsd(target *targets.Target, kernelSrc, kernelObj string,
@@ -65,9 +70,6 @@ func (ctx *openbsd) Parse(output []byte) *Report {
 		return nil
 	}
 	rep.Output = output
-	if report := ctx.shortenReport(rep.Report); len(report) != 0 {
-		rep.Report = report
-	}
 	return rep
 }
 
@@ -93,7 +95,13 @@ func (ctx *openbsd) Symbolize(rep *Report) error {
 
 func (ctx *openbsd) symbolizeLine(symbFunc func(bin string, pc uint64) ([]symbolizer.Frame, error),
 	line []byte) []byte {
-	match := openbsdSymbolizeRe.FindSubmatchIndex(line)
+	var match []int
+	for _, re := range openbsdSymbolizeRe {
+		match = re.FindSubmatchIndex(line)
+		if match != nil {
+			break
+		}
+	}
 	if match == nil {
 		return line
 	}
@@ -131,19 +139,6 @@ func (ctx *openbsd) symbolizeLine(symbFunc func(bin string, pc uint64) ([]symbol
 	return symbolized
 }
 
-func (ctx *openbsd) shortenReport(report []byte) []byte {
-	out := new(bytes.Buffer)
-	for s := bufio.NewScanner(bytes.NewReader(report)); s.Scan(); {
-		line := s.Bytes()
-		out.Write(line)
-		// Kernel splits lines at 79 column.
-		if len(line) != 79 {
-			out.WriteByte('\n')
-		}
-	}
-	return out.Bytes()
-}
-
 var openbsdOopses = []*oops{
 	{
 		[]byte("cleaned vnode"),
@@ -170,6 +165,34 @@ var openbsdOopses = []*oops{
 				title: compile("panic: pool_do_get: ([^:]+) free list modified"),
 				fmt:   "pool: free list modified: %[1]v",
 			},
+			{
+				title: compile("panic: timeout_add: to_ticks \\(.+\\) < 0"),
+				fmt:   "panic: timeout_add: to_ticks < 0",
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
+		[]byte("lock order reversal:"),
+		[]oopsFormat{
+			{
+				title: compile("lock order reversal:\\n+.*1st {{ADDR}} ([^\\ ]+).*\\n.*2nd {{ADDR}} ([^\\ ]+)"),
+				fmt:   "witness: reversal: %[1]v %[2]v",
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
+		[]byte("witness:"),
+		[]oopsFormat{
+			{
+				title: compile("witness: thread {{ADDR}} exiting with the following locks held:"),
+				fmt:   "witness: thread exiting with locks held",
+			},
+			{
+				title: compile("(witness: .*)"),
+				fmt:   "%[1]v",
+			},
 		},
 		[]*regexp.Regexp{},
 	},
@@ -185,7 +208,12 @@ var openbsdOopses = []*oops{
 	},
 	{
 		[]byte("kernel:"),
-		[]oopsFormat{},
+		[]oopsFormat{
+			{
+				title: compile("kernel: page fault trap, code=0.*\\nStopped at[ ]+([^\\+]+)"),
+				fmt:   "uvm_fault: %[1]v",
+			},
+		},
 		[]*regexp.Regexp{
 			compile("reorder_kernel"),
 		},

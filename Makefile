@@ -46,7 +46,7 @@ TARGETGOARCH := $(TARGETVMARCH)
 
 ifeq ("$(TARGETOS)", "fuchsia")
 	# SOURCEDIR should point to fuchsia checkout.
-	GO = "$(SOURCEDIR)/scripts/devshell/go"
+	GO = "$(SOURCEDIR)/tools/devshell/contrib/go"
 endif
 
 GITREV=$(shell git rev-parse HEAD)
@@ -55,12 +55,14 @@ ifeq ("$(shell git diff --shortstat)", "")
 else
 	REV=$(GITREV)+
 endif
+GITREVDATE=$(shell git log -n 1 --format="%ad")
 
 # Don't generate symbol table and DWARF debug info.
 # Reduces build time and binary sizes considerably.
 # That's only needed if you use gdb or nm.
 # If you need that, build manually without these flags.
-GOFLAGS := "-ldflags=-s -w -X github.com/google/syzkaller/sys.GitRevision=$(REV)"
+GOFLAGS := "-ldflags=-s -w -X github.com/google/syzkaller/sys.GitRevision=$(REV) -X 'github.com/google/syzkaller/sys.gitRevisionDate=$(GITREVDATE)'"
+
 GOHOSTFLAGS := $(GOFLAGS)
 GOTARGETFLAGS := $(GOFLAGS)
 ifneq ("$(GOTAGS)", "")
@@ -110,15 +112,21 @@ target:
 
 # executor uses stacks of limited size, so no jumbo frames.
 executor:
-ifeq ($(BUILDOS),$(NATIVEBUILDOS))
-	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
-	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
-		-pthread -Wall -Wframe-larger-than=8192 -Wparentheses -Werror -O2 $(ADDCFLAGS) $(CFLAGS) \
-		-DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1  -DGIT_REVISION=\"$(REV)\"
-else
+ifneq ("$(BUILDOS)", "$(NATIVEBUILDOS)")
 	$(info ************************************************************************************)
 	$(info Building executor for ${TARGETOS} is not supported on ${BUILDOS}. Executor will not be built.)
 	$(info ************************************************************************************)
+else
+ifneq ("$(NO_CROSS_COMPILER)", "")
+	$(info ************************************************************************************)
+	$(info Native cross-compiler $(CC) is missing. Executor will not be built.)
+	$(info ************************************************************************************)
+else
+	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
+	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
+		$(ADDCFLAGS) $(CFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
+endif
 endif
 
 manager:
@@ -159,6 +167,9 @@ upgrade:
 
 trace2syz:
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-trace2syz github.com/google/syzkaller/tools/syz-trace2syz
+
+usbgen:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-usbgen github.com/google/syzkaller/tools/syz-usbgen
 
 # `extract` extracts const files from various kernel sources, and may only
 # re-generate parts of files.
@@ -213,7 +224,9 @@ bin/syz-fmt:
 
 tidy:
 	# A single check is enabled for now. But it's always fixable and proved to be useful.
-	clang-tidy -quiet -header-filter=.* -checks=-*,misc-definitions-in-headers -warnings-as-errors=* executor/*.cc
+	clang-tidy -quiet -header-filter=.* -checks=-*,misc-definitions-in-headers -warnings-as-errors=* \
+		-extra-arg=-DGOOS_$(TARGETOS)=1 -extra-arg=-DGOARCH_$(TARGETARCH)=1 \
+		executor/*.cc
 	# Just check for compiler warnings.
 	$(CC) executor/test_executor.cc -c -o /dev/null -Wparentheses -Wno-unused -Wall
 
@@ -302,9 +315,8 @@ presubmit:
 presubmit_parallel: test test_race arch check_links
 
 test:
-ifeq ("$(TRAVIS)$(shell go version | grep 1.9)", "true")
-	# Collect coverage report for codecov.io when running on travis (uploaded in .travis.yml).
-	# Note: Go 1.9 does not support -coverprofile when testing multiple packages.
+ifeq ("$(TRAVIS)$(shell go version | grep 1.11)", "true")
+	# Collect coverage report for codecov.io when testing Go 1.12 on travis (uploaded in .travis.yml).
 	env CGO_ENABLED=1 $(GO) test -short -coverprofile=coverage.txt ./...
 else
 	# Executor tests use cgo.
@@ -326,10 +338,10 @@ install_prerequisites:
 	uname -a
 	sudo apt-get update
 	sudo apt-get install -y -q libc6-dev-i386 linux-libc-dev \
-		gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-powerpc64le-linux-gnu || true
+		gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi gcc-powerpc64le-linux-gnu || true
 	sudo apt-get install -y -q g++-aarch64-linux-gnu || true
 	sudo apt-get install -y -q g++-powerpc64le-linux-gnu || true
-	sudo apt-get install -y -q g++-arm-linux-gnueabihf || true
+	sudo apt-get install -y -q g++-arm-linux-gnueabi || true
 	sudo apt-get install -y -q ragel
 	go get -u golang.org/x/tools/cmd/goyacc
 	go get -u gopkg.in/alecthomas/gometalinter.v2

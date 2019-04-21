@@ -157,6 +157,36 @@ func TestErrors2(t *testing.T) {
 	}
 }
 
+func TestWarnings(t *testing.T) {
+	t.Parallel()
+	consts := map[string]uint64{
+		"SYS_foo": 1,
+	}
+	for _, arch := range []string{"32_shmem", "64"} {
+		target := targets.List["test"][arch]
+		t.Run(arch, func(t *testing.T) {
+			t.Parallel()
+			em := ast.NewErrorMatcher(t, filepath.Join("testdata", "warnings.txt"))
+			desc := ast.Parse(em.Data, "warnings.txt", em.ErrorHandler)
+			if desc == nil {
+				em.DumpErrors(t)
+				t.Fatalf("parsing failed")
+			}
+			info := ExtractConsts(desc, target, em.ErrorHandler)
+			if info == nil {
+				em.DumpErrors(t)
+				t.Fatalf("const extraction failed")
+			}
+			p := Compile(desc, consts, target, em.ErrorHandler)
+			if p == nil {
+				em.DumpErrors(t)
+				t.Fatalf("compilation failed")
+			}
+			em.Check(t)
+		})
+	}
+}
+
 func TestFuzz(t *testing.T) {
 	t.Parallel()
 	inputs := []string{
@@ -164,8 +194,13 @@ func TestFuzz(t *testing.T) {
 		"da[",
 		"define\x98define(define\x98define\x98define\x98define\x98define)define\tdefin",
 		"resource g[g]",
+		`t[
+l	t
+]`,
+		`t()D[0]
+type D[e]l`,
 	}
-	consts := map[string]uint64{"A": 1, "B": 2, "C": 3, "SYS_C": 4}
+	consts := map[string]uint64{"A": 1, "B": 2, "C": 3, "SYS_A": 4, "SYS_B": 5, "SYS_C": 6}
 	eh := func(pos ast.Pos, msg string) {
 		t.Logf("%v: %v", pos, msg)
 	}

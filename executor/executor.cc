@@ -58,15 +58,10 @@ const int kOutPipeFd = kMaxFd - 2; // remapped from stdout
 const int kCoverFd = kOutPipeFd - kMaxThreads;
 const int kMaxArgs = 9;
 const int kCoverSize = 256 << 10;
-const int kExtraCoverSize = 256 << 10;
 const int kFailStatus = 67;
-const int kRetryStatus = 69;
-const int kErrorStatus = 68;
 
 // Logical error (e.g. invalid input program), use as an assert() alternative.
 static NORETURN PRINTF(1, 2) void fail(const char* msg, ...);
-// Kernel error (e.g. wrong syscall return value).
-NORETURN PRINTF(1, 2) void error(const char* msg, ...);
 // Just exit (e.g. due to temporal ENOMEM error).
 static NORETURN PRINTF(1, 2) void exitf(const char* msg, ...);
 static NORETURN void doexit(int status);
@@ -117,10 +112,14 @@ uint64 start_time_ms = 0;
 static bool flag_debug;
 static bool flag_cover;
 static sandbox_type flag_sandbox;
+static bool flag_extra_cover;
+static bool flag_enable_fault_injection;
 static bool flag_enable_tun;
 static bool flag_enable_net_dev;
-static bool flag_enable_fault_injection;
-static bool flag_extra_cover;
+static bool flag_enable_net_reset;
+static bool flag_enable_cgroups;
+static bool flag_enable_binfmt_misc;
+static bool flag_enable_close_fds;
 
 static bool flag_collect_cover;
 static bool flag_dedup_cover;
@@ -404,24 +403,17 @@ int main(int argc, char** argv)
 		fail("unknown sandbox type");
 	}
 #if SYZ_EXECUTOR_USES_FORK_SERVER
-	// Other statuses happen when fuzzer processes manages to kill loop.
-	if (status != kFailStatus && status != kErrorStatus)
-		status = kRetryStatus;
+	fprintf(stderr, "loop exited with status %d\n", status);
+	// Other statuses happen when fuzzer processes manages to kill loop, e.g. with:
+	// ptrace(PTRACE_SEIZE, 1, 0, 0x100040)
+	if (status != kFailStatus)
+		status = 0;
 	// If an external sandbox process wraps executor, the out pipe will be closed
 	// before the sandbox process exits this will make ipc package kill the sandbox.
 	// As the result sandbox process will exit with exit status 9 instead of the executor
-	// exit status (notably kRetryStatus). Consequently, ipc will treat it as hard
-	// failure rather than a temporal failure. So we duplicate the exit status on the pipe.
+	// exit status (notably kFailStatus). So we duplicate the exit status on the pipe.
 	reply_execute(status);
-	errno = 0;
-	if (status == kFailStatus)
-		fail("loop failed");
-	if (status == kErrorStatus)
-		error("loop errored");
-	// Loop can be killed by a test process with e.g.:
-	// ptrace(PTRACE_SEIZE, 1, 0, 0x100040)
-	// This is unfortunate, but I don't have a better solution than ignoring it for now.
-	exitf("loop exited with status %d", status);
+	doexit(status);
 	// Unreachable.
 	return 1;
 #else
@@ -456,10 +448,14 @@ void parse_env_flags(uint64 flags)
 		flag_sandbox = sandbox_namespace;
 	else if (flags & (1 << 4))
 		flag_sandbox = sandbox_android_untrusted_app;
-	flag_enable_tun = flags & (1 << 5);
-	flag_enable_net_dev = flags & (1 << 6);
-	flag_enable_fault_injection = flags & (1 << 7);
-	flag_extra_cover = flags & (1 << 8);
+	flag_extra_cover = flags & (1 << 5);
+	flag_enable_fault_injection = flags & (1 << 6);
+	flag_enable_tun = flags & (1 << 7);
+	flag_enable_net_dev = flags & (1 << 8);
+	flag_enable_net_reset = flags & (1 << 9);
+	flag_enable_cgroups = flags & (1 << 10);
+	flag_enable_binfmt_misc = flags & (1 << 11);
+	flag_enable_close_fds = flags & (1 << 12);
 }
 
 #if SYZ_EXECUTOR_USES_FORK_SERVER
@@ -576,10 +572,16 @@ retry:
 	}
 
 	int call_index = 0;
+	bool usb_prog = false;
 	for (;;) {
 		uint64 call_num = read_input(&input_pos);
 		if (call_num == instr_eof)
 			break;
+		bool usb_call = false;
+		if (strcmp(syscalls[call_num].name, "syz_usb_connect") == 0) {
+			usb_prog = true;
+			usb_call = true;
+		}
 		if (call_num == instr_copyin) {
 			char* addr = (char*)read_input(&input_pos);
 			uint64 typ = read_input(&input_pos);
@@ -688,7 +690,7 @@ retry:
 		} else if (flag_threaded) {
 			// Wait for call completion.
 			// Note: sys knows about this 25ms timeout when it generates timespec/timeval values.
-			const uint64 timeout_ms = flag_debug ? 1000 : 45;
+			const uint64 timeout_ms = usb_call ? 2000 : (flag_debug ? 1000 : 45);
 			if (event_timedwait(&th->done, timeout_ms))
 				handle_completion(th);
 			// Check if any of previous calls have completed.
@@ -716,6 +718,8 @@ retry:
 		uint64 wait_end = wait_start + wait;
 		if (wait_end < start + 800)
 			wait_end = start + 800;
+		if (usb_prog)
+			wait_end += 2000;
 		while (running > 0 && current_time_ms() <= wait_end) {
 			sleep_ms(1);
 			for (int i = 0; i < kMaxThreads; i++) {
@@ -736,6 +740,15 @@ retry:
 			}
 			write_extra_output();
 		}
+	}
+
+#if SYZ_HAVE_CLOSE_FDS
+	close_fds();
+#endif
+
+	if (!colliding && !collide && usb_prog) {
+		sleep_ms(500);
+		write_extra_output();
 	}
 
 	if (flag_collide && !flag_inject_fault && !colliding && !collide) {
@@ -875,12 +888,11 @@ void copyout_call_results(thread_t* th)
 void write_call_output(thread_t* th, bool finished)
 {
 	uint32 reserrno = 999;
-	uint32 call_flags = call_flag_executed;
 	const bool blocked = th != last_scheduled;
+	uint32 call_flags = call_flag_executed | (blocked ? call_flag_blocked : 0);
 	if (finished) {
 		reserrno = th->res != -1 ? 0 : th->reserrno;
 		call_flags |= call_flag_finished |
-			      (blocked ? call_flag_blocked : 0) |
 			      (th->fault_injected ? call_flag_fault_injected : 0);
 	}
 #if SYZ_EXECUTOR_USES_SHMEM
@@ -1349,19 +1361,7 @@ void fail(const char* msg, ...)
 	vfprintf(stderr, msg, args);
 	va_end(args);
 	fprintf(stderr, " (errno %d)\n", e);
-	// ENOMEM/EAGAIN is frequent cause of failures in fuzzing context,
-	// so handle it here as non-fatal error.
-	doexit((e == ENOMEM || e == EAGAIN) ? kRetryStatus : kFailStatus);
-}
-
-void error(const char* msg, ...)
-{
-	va_list args;
-	va_start(args, msg);
-	vfprintf(stderr, msg, args);
-	va_end(args);
-	fprintf(stderr, "\n");
-	doexit(kErrorStatus);
+	doexit(kFailStatus);
 }
 
 void exitf(const char* msg, ...)
@@ -1372,7 +1372,7 @@ void exitf(const char* msg, ...)
 	vfprintf(stderr, msg, args);
 	va_end(args);
 	fprintf(stderr, " (errno %d)\n", e);
-	doexit(kRetryStatus);
+	doexit(0);
 }
 
 void debug(const char* msg, ...)

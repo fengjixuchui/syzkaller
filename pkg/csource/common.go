@@ -8,6 +8,7 @@ package csource
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -17,7 +18,9 @@ import (
 )
 
 const (
-	linux = "linux"
+	linux   = "linux"
+	freebsd = "freebsd"
+	openbsd = "openbsd"
 
 	sandboxNone                = "none"
 	sandboxSetuid              = "setuid"
@@ -47,7 +50,7 @@ func createCommonHeader(p, mmapProg *prog.Prog, replacements map[string]string, 
 	}
 
 	for from, to := range replacements {
-		src = bytes.Replace(src, []byte("[["+from+"]]"), []byte(to), -1)
+		src = bytes.Replace(src, []byte("/*"+from+"*/"), []byte(to), -1)
 	}
 
 	for from, to := range map[string]string{
@@ -68,6 +71,7 @@ func defineList(p, mmapProg *prog.Prog, opts Options) (defines []string) {
 	enabled := map[string]bool{
 		"GOOS_" + p.Target.OS:               true,
 		"GOARCH_" + p.Target.Arch:           true,
+		"HOSTGOOS_" + runtime.GOOS:          true,
 		"SYZ_USE_BITMASKS":                  bitmasks,
 		"SYZ_USE_CHECKSUMS":                 csums,
 		"SYZ_SANDBOX_NONE":                  opts.Sandbox == sandboxNone,
@@ -82,8 +86,10 @@ func defineList(p, mmapProg *prog.Prog, opts Options) (defines []string) {
 		"SYZ_FAULT_INJECTION":               opts.Fault,
 		"SYZ_TUN_ENABLE":                    opts.EnableTun,
 		"SYZ_ENABLE_CGROUPS":                opts.EnableCgroups,
-		"SYZ_ENABLE_NETDEV":                 opts.EnableNetdev,
-		"SYZ_RESET_NET_NAMESPACE":           opts.ResetNet,
+		"SYZ_ENABLE_NETDEV":                 opts.EnableNetDev,
+		"SYZ_RESET_NET_NAMESPACE":           opts.EnableNetReset,
+		"SYZ_ENABLE_BINFMT_MISC":            opts.EnableBinfmtMisc,
+		"SYZ_ENABLE_CLOSE_FDS":              opts.EnableCloseFds,
 		"SYZ_USE_TMP_DIR":                   opts.UseTmpDir,
 		"SYZ_HANDLE_SEGV":                   opts.HandleSegv,
 		"SYZ_REPRO":                         opts.Repro,
