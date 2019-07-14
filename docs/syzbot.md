@@ -25,9 +25,8 @@ crashes create a new bug).
 ## Communication with syzbot
 
 If you fix a bug reported by `syzbot`, please add the provided `Reported-by`
-tag to the commit (`Reported-and-tested-by` and `Tested-by` tags with the
-`syzbot+HASH` address are recognized as well). You can also communicate with
-`syzbot` by replying to its emails. The commands are:
+tag to the commit. You can also communicate with `syzbot` by replying
+to its emails. The commands are:
 
 - to attach a fixing commit to the bug (if you forgot to add `Reported-by` tag):
 ```
@@ -89,6 +88,35 @@ to some mailing lists (e.g. netdev, netfilter-devel) will trigger patchwork.
 Note: see [below](#kmsan-bugs) for `KMSAN` bugs testing.
 
 Note: see [below](#usb-bugs) for `USB` bugs testing.
+
+<div id="amend"/>
+<div id="linux-next"/>
+
+## Rebuilt trees/amended patches
+
+There are several additional aspects if the tree is rebuilt/rebased or contains
+amended/folded patches (namely, `linux-next`).
+
+First, adding `Reported-by` tags to amended commits may be misleading.
+A `Reported-by` tag suggests that the commit fixes a bug in some previous
+commit, but here it's not the case (it only fixes a bug in a previous version
+of itself which is not in the tree). In such case it's recommended to include
+a `Tested-by` or a `Reviewed-by` tag with the hash instead. Technically,
+`syzbot` accepts any tag, so `With-inputs-from` would work too.
+
+Then, if the guilty commit is completely dropped (actually removed from the
+tree during rebuild), then there is effectively no fixing commit. There is no
+good way to handle such cases at the moment. One possibility is to mark them
+with `#syz invalid`. However this needs to be done only when `syzbot` picks up
+the new tree in all builds (current kernel commits can be seen on dashboard).
+Otherwise, the occurrences of the crash that are still happening in the current
+build will immediately create a new bug report. Another possibility is to mark
+it as fixed with some unrelated later commit using
+`#syz fix: some-later-commit`. This way `syzbot` will wait until the commit
+propagates to all tested trees automatically.
+
+In any case the relation between the report and the fix can later be fixed up
+using `#syz fix: commit-title` commands.
 
 <div id="bisection"/>
 
@@ -278,6 +306,28 @@ email to `syzbot+HASH` address containing the following line:
 ```
 and attach/inline your test patch in the same email.
 
+## Memory leaks
+
+`syzbot` uses `KMEMLEAK` to find memory leaks in the Linux kernel.
+`KMEMLEAK` kernel config is stored [here](/dashboard/config/upstream-leak.config).
+See `KMEMLEAK` [docs](https://www.kernel.org/doc/html/latest/dev-tools/kmemleak.html)
+for general info, algorithm overview and usage instructions.
+
+Memory leaks may be tricky to debug because we have only the allocation stack,
+but we don't see where kernel code forgot to free the object or drop a reference.
+`KMEMLEAK` can have some false positives on tricky kernel code that hides
+pointers to live objects and due to memory scanning non-atomicity.
+But don't write off everything to false positives right away, the rate of
+false positives is observed to be very low. In particular, `KMEMLEAK` is
+[not confused](https://elixir.bootlin.com/linux/v5.2-rc1/source/mm/kmemleak.c#L1426)
+by pointers stored in a middle of another object; and it's
+[not confused](https://elixir.bootlin.com/linux/v5.2-rc1/source/mm/kmemleak.c#L440)
+if several pointer low bits are used as flags because a pointer into
+a middle of an object also marks the target as reachable.
+
+A useful litmus test is to remove `KMEMLEAK` code from the reproducer
+and run it for longer and/or multiple times. If memory consumption and number
+of live objects in `/proc/slabinfo` steadily grow, most likely the leak is real.
 
 ## No custom patches
 

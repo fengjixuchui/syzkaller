@@ -61,7 +61,7 @@ func (rg *ReportGenerator) Do(w io.Writer, pcs []uint64) error {
 	for i, pc := range pcs {
 		pcs[i] = PreviousInstructionPC(rg.arch, pc)
 	}
-	covered, _, err := rg.symbolize(pcs)
+	covered, prefix, err := rg.symbolize(pcs)
 	if err != nil {
 		return err
 	}
@@ -69,9 +69,12 @@ func (rg *ReportGenerator) Do(w io.Writer, pcs []uint64) error {
 		return fmt.Errorf("'%s' does not have debug info (set CONFIG_DEBUG_INFO=y)", rg.vmlinux)
 	}
 	uncoveredPCs := rg.uncoveredPcsInFuncs(pcs)
-	uncovered, prefix, err := rg.symbolize(uncoveredPCs)
+	uncovered, prefix2, err := rg.symbolize(uncoveredPCs)
 	if err != nil {
 		return err
+	}
+	if len(uncoveredPCs) != 0 {
+		prefix = combinePrefix(prefix, prefix2)
 	}
 	return rg.generate(w, prefix, covered, uncovered)
 }
@@ -232,17 +235,23 @@ func (rg *ReportGenerator) symbolize(pcs []uint64) ([]symbolizer.Frame, string, 
 		if prefix == "" {
 			prefix = frame.File
 		} else {
-			i := 0
-			for ; i < len(prefix) && i < len(frame.File); i++ {
-				if prefix[i] != frame.File[i] {
-					break
-				}
+			prefix = combinePrefix(prefix, frame.File)
+			if prefix == "" {
+				break
 			}
-			prefix = prefix[:i]
 		}
-
 	}
 	return frames, prefix, nil
+}
+
+func combinePrefix(prefix, prefix2 string) string {
+	i := 0
+	for ; i < len(prefix) && i < len(prefix2); i++ {
+		if prefix[i] != prefix2[i] {
+			break
+		}
+	}
+	return prefix[:i]
 }
 
 func parseFile(fn string) ([][]byte, error) {

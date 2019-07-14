@@ -161,9 +161,13 @@ var List = map[string]map[string]*Target{
 			KernelHeaderArch: "arm",
 		},
 		"ppc64le": {
-			PtrSize:          8,
-			PageSize:         4 << 10,
-			CFlags:           []string{"-D__powerpc64__"},
+			PtrSize:  8,
+			PageSize: 4 << 10,
+			CFlags: []string{
+				"-D__powerpc64__",
+				"-D__LITTLE_ENDIAN__=1",
+				"-D__BYTE_ORDER__=__ORDER_LITTLE_ENDIAN__",
+			},
 			CrossCFlags:      []string{"-D__powerpc64__", "-static"},
 			CCompilerPrefix:  "powerpc64le-linux-gnu-",
 			KernelArch:       "powerpc",
@@ -176,6 +180,16 @@ var List = map[string]map[string]*Target{
 			PageSize:          4 << 10,
 			CFlags:            []string{"-m64"},
 			CrossCFlags:       []string{"-m64", "-static"},
+			NeedSyscallDefine: dontNeedSyscallDefine,
+		},
+		"386": {
+			VMArch:   "amd64",
+			PtrSize:  4,
+			PageSize: 4 << 10,
+			CFlags:   []string{"-m32"},
+			// The story behind -B/usr/lib32 is not completely clear, but it helps in some cases.
+			// For context see discussion in https://github.com/google/syzkaller/pull/1202
+			CrossCFlags:       []string{"-m32", "-static", "-B/usr/lib32"},
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
 	},
