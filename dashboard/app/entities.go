@@ -21,7 +21,6 @@ const (
 	maxTextLen   = 200
 	MaxStringLen = 1024
 
-	maxCrashes        = 40
 	maxBugHistoryDays = 365 * 5
 )
 
@@ -180,6 +179,7 @@ type Crash struct {
 	BuildID         string
 	Time            time.Time
 	Reported        time.Time // set if this crash was ever reported
+	References      []CrashReference
 	Maintainers     []string  `datastore:",noindex"`
 	Log             int64     // reference to CrashLog text entity
 	Flags           int64     // properties of the Crash
@@ -196,6 +196,70 @@ type Crash struct {
 	ReportLen       int64
 	Assets          []Asset   // crash-related assets
 	AssetsLastCheck time.Time // the last time we checked the assets for deprecation
+}
+
+type CrashReferenceType string
+
+const (
+	CrashReferenceReporting = "reporting"
+	CrashReferenceJob       = "job"
+	// This one is needed for backward compatibility.
+	crashReferenceUnknown = "unknown"
+)
+
+type CrashReference struct {
+	Type CrashReferenceType
+	// For CrashReferenceReporting, it refers to Reporting.Name
+	// For CrashReferenceJob, it refers to extJobID(jobKey)
+	Key  string
+	Time time.Time
+}
+
+func (crash *Crash) AddReference(newRef CrashReference) {
+	crash.Reported = newRef.Time
+	for i, ref := range crash.References {
+		if ref.Type != newRef.Type || ref.Key != newRef.Key {
+			continue
+		}
+		crash.References[i].Time = newRef.Time
+		return
+	}
+	crash.References = append(crash.References, newRef)
+}
+
+func (crash *Crash) ClearReference(t CrashReferenceType, key string) {
+	newRefs := []CrashReference{}
+	crash.Reported = time.Time{}
+	for _, ref := range crash.References {
+		if ref.Type == t && ref.Key == key {
+			continue
+		}
+		if ref.Time.After(crash.Reported) {
+			crash.Reported = ref.Time
+		}
+		newRefs = append(newRefs, ref)
+	}
+	crash.References = newRefs
+}
+
+func (crash *Crash) Load(ps []db.Property) error {
+	if err := db.LoadStruct(crash, ps); err != nil {
+		return err
+	}
+	// Earlier we only relied on Reported, which does not let us reliably unreport a crash.
+	// We need some means of ref counting, so let's create a dummy reference to keep the
+	// crash from being purged.
+	if !crash.Reported.IsZero() && len(crash.References) == 0 {
+		crash.References = append(crash.References, CrashReference{
+			Type: crashReferenceUnknown,
+			Time: crash.Reported,
+		})
+	}
+	return nil
+}
+
+func (crash *Crash) Save() ([]db.Property, error) {
+	return db.SaveStruct(crash)
 }
 
 // ReportingState holds dynamic info associated with reporting.
@@ -558,6 +622,32 @@ func bugKeyHash(ns, title string, seq int64) string {
 	return hash.String([]byte(fmt.Sprintf("%v-%v-%v-%v", config.Namespaces[ns].Key, ns, title, seq)))
 }
 
+func loadSimilarBugs(c context.Context, bug *Bug) ([]*Bug, error) {
+	domain := config.Namespaces[bug.Namespace].SimilarityDomain
+	dedup := make(map[string]bool)
+	dedup[bug.keyHash()] = true
+
+	ret := []*Bug{}
+	for _, title := range bug.AltTitles {
+		var similar []*Bug
+		_, err := db.NewQuery("Bug").
+			Filter("AltTitles=", title).
+			GetAll(c, &similar)
+		if err != nil {
+			return nil, err
+		}
+		for _, bug := range similar {
+			if config.Namespaces[bug.Namespace].SimilarityDomain != domain ||
+				dedup[bug.keyHash()] {
+				continue
+			}
+			dedup[bug.keyHash()] = true
+			ret = append(ret, bug)
+		}
+	}
+	return ret, nil
+}
+
 // Since these IDs appear in Reported-by tags in commit, we slightly limit their size.
 const reportingHashLen = 20
 
@@ -616,13 +706,44 @@ func (bug *Bug) dailyStatsTail(from time.Time) []BugDailyStats {
 	return bug.DailyStats[startPos:]
 }
 
-func markCrashReported(c context.Context, crashID int64, bugKey *db.Key, now time.Time) error {
+func (bug *Bug) dashapiStatus() (dashapi.BugStatus, error) {
+	var status dashapi.BugStatus
+	switch bug.Status {
+	case BugStatusOpen:
+		status = dashapi.BugStatusOpen
+	case BugStatusFixed:
+		status = dashapi.BugStatusFixed
+	case BugStatusInvalid:
+		status = dashapi.BugStatusInvalid
+	case BugStatusDup:
+		status = dashapi.BugStatusDup
+	default:
+		return status, fmt.Errorf("unknown bugs status %v", bug.Status)
+	}
+	return status, nil
+}
+
+func addCrashReference(c context.Context, crashID int64, bugKey *db.Key, ref CrashReference) error {
 	crash := new(Crash)
 	crashKey := db.NewKey(c, "Crash", "", crashID, bugKey)
 	if err := db.Get(c, crashKey, crash); err != nil {
 		return fmt.Errorf("failed to get reported crash %v: %v", crashID, err)
 	}
-	crash.Reported = now
+	crash.AddReference(ref)
+	if _, err := db.Put(c, crashKey, crash); err != nil {
+		return fmt.Errorf("failed to put reported crash %v: %v", crashID, err)
+	}
+	return nil
+}
+
+func removeCrashReference(c context.Context, crashID int64, bugKey *db.Key,
+	t CrashReferenceType, key string) error {
+	crash := new(Crash)
+	crashKey := db.NewKey(c, "Crash", "", crashID, bugKey)
+	if err := db.Get(c, crashKey, crash); err != nil {
+		return fmt.Errorf("failed to get reported crash %v: %v", crashID, err)
+	}
+	crash.ClearReference(t, key)
 	if _, err := db.Put(c, crashKey, crash); err != nil {
 		return fmt.Errorf("failed to put reported crash %v: %v", crashID, err)
 	}

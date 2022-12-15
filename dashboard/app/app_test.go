@@ -58,6 +58,7 @@ var testConfig = &GlobalConfig{
 			AccessLevel:           AccessAdmin,
 			Key:                   "test1keytest1keytest1key",
 			FixBisectionAutoClose: true,
+			SimilarityDomain:      testDomain,
 			Clients: map[string]string{
 				client1: password1,
 				"oauth": auth.OauthMagic + "111111122222222",
@@ -106,8 +107,9 @@ var testConfig = &GlobalConfig{
 			},
 		},
 		"test2": {
-			AccessLevel: AccessAdmin,
-			Key:         "test2keytest2keytest2key",
+			AccessLevel:      AccessAdmin,
+			Key:              "test2keytest2keytest2key",
+			SimilarityDomain: testDomain,
 			Clients: map[string]string{
 				client2: password2,
 			},
@@ -132,10 +134,6 @@ var testConfig = &GlobalConfig{
 				},
 			},
 			Managers: map[string]ConfigManager{
-				restrictedManager: {
-					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
-					RestrictedTestingReason: "you should test only on restricted.git",
-				},
 				noFixBisectionManager: {
 					FixBisectionDisabled: true,
 				},
@@ -267,6 +265,12 @@ var testConfig = &GlobalConfig{
 			Clients: map[string]string{
 				clientPublicEmail: keyPublicEmail,
 			},
+			Managers: map[string]ConfigManager{
+				restrictedManager: {
+					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
+					RestrictedTestingReason: "you should test only on restricted.git",
+				},
+			},
 			Repos: []KernelRepo{
 				{
 					URL:    "git://syzkaller.org/access-public-email.git",
@@ -282,6 +286,33 @@ var testConfig = &GlobalConfig{
 					Config: &EmailConfig{
 						Email:            "test@syzkaller.com",
 						HandleListEmails: true,
+						SubjectPrefix:    "[syzbot]",
+					},
+				},
+			},
+		},
+		// The second namespace reporting to the same mailing list.
+		"access-public-email-2": {
+			AccessLevel: AccessPublic,
+			Key:         "publickeypublickeypublickey",
+			Clients: map[string]string{
+				clientPublicEmail2: keyPublicEmail2,
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-public-email2.git",
+					Branch: "access-public-email2",
+					Alias:  "access-public-email2",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessPublic,
+					Name:        "access-public-email2-reporting1",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:            "test@syzkaller.com",
+						HandleListEmails: true,
 					},
 				},
 			},
@@ -290,22 +321,26 @@ var testConfig = &GlobalConfig{
 }
 
 const (
-	client1           = "client1"
-	client2           = "client2"
-	password1         = "client1keyclient1keyclient1key"
-	password2         = "client2keyclient2keyclient2key"
-	clientAdmin       = "client-admin"
-	keyAdmin          = "clientadminkeyclientadminkey"
-	clientUser        = "client-user"
-	keyUser           = "clientuserkeyclientuserkey"
-	clientPublic      = "client-public"
-	keyPublic         = "clientpublickeyclientpublickey"
-	clientPublicEmail = "client-public-email"
-	keyPublicEmail    = "clientpublicemailkeyclientpublicemailkey"
+	client1            = "client1"
+	client2            = "client2"
+	password1          = "client1keyclient1keyclient1key"
+	password2          = "client2keyclient2keyclient2key"
+	clientAdmin        = "client-admin"
+	keyAdmin           = "clientadminkeyclientadminkey"
+	clientUser         = "client-user"
+	keyUser            = "clientuserkeyclientuserkey"
+	clientPublic       = "client-public"
+	keyPublic          = "clientpublickeyclientpublickey"
+	clientPublicEmail  = "client-public-email"
+	keyPublicEmail     = "clientpublicemailkeyclientpublicemailkey"
+	clientPublicEmail2 = "client-public-email2"
+	keyPublicEmail2    = "clientpublicemailkeyclientpublicemailkey2"
 
 	restrictedManager     = "restricted-manager"
 	noFixBisectionManager = "no-fix-bisection-manager"
 	specialCCManager      = "special-cc-manager"
+
+	testDomain = "test"
 )
 
 func skipWithRepro(bug *Bug) FilterResult {
@@ -561,7 +596,7 @@ func TestPurgeOldCrashes(t *testing.T) {
 	c.client.pollBug()
 
 	// Now report lots of bugs with/without repros. Some of the older ones should be purged.
-	const totalReported = 3 * maxCrashes
+	var totalReported = 3 * maxCrashes()
 	for i := 0; i < totalReported; i++ {
 		c.advanceTime(2 * time.Hour) // This ensures that crashes are saved.
 		crash.ReproSyz = nil
@@ -590,10 +625,10 @@ func TestPurgeOldCrashes(t *testing.T) {
 		}
 	}
 	c.t.Logf("got reported=%v, norepro=%v, repro=%v, maxCrashes=%v",
-		reported, norepro, repro, maxCrashes)
+		reported, norepro, repro, maxCrashes())
 	if reported != 3 ||
-		norepro < maxCrashes || norepro > maxCrashes+10 ||
-		repro < maxCrashes || repro > maxCrashes+10 {
+		norepro < maxCrashes() || norepro > maxCrashes()+10 ||
+		repro < maxCrashes() || repro > maxCrashes()+10 {
 		c.t.Fatalf("bad purged crashes")
 	}
 	// Then, check that latest crashes were preserved.
@@ -610,6 +645,45 @@ func TestPurgeOldCrashes(t *testing.T) {
 		if idx < totalReported-count {
 			c.t.Errorf("preserved bad crash repro=%v: %v", crash.ReproC != 0, idx)
 		}
+	}
+
+	firstCrashExists := func() bool {
+		_, crashKeys, err := queryCrashesForBug(c.ctx, bug.key(c.ctx), 10*totalReported)
+		c.expectOK(err)
+		for _, key := range crashKeys {
+			if key.IntID() == rep.CrashID {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A sanity check for the test itself.
+	if !firstCrashExists() {
+		t.Fatalf("The first reported crash should be present")
+	}
+
+	// Unreport the first crash.
+	reply, _ := c.client.ReportingUpdate(&dashapi.BugUpdate{
+		ID:               rep.ID,
+		Status:           dashapi.BugStatusUpdate,
+		ReproLevel:       dashapi.ReproLevelC,
+		UnreportCrashIDs: []int64{rep.CrashID},
+	})
+	c.expectEQ(reply.OK, true)
+
+	// Trigger more purge events.
+	var moreIterations = maxCrashes()
+	for i := 0; i < moreIterations; i++ {
+		c.advanceTime(2 * time.Hour) // This ensures that crashes are saved.
+		crash.ReproSyz = nil
+		crash.ReproC = nil
+		crash.ReproOpts = []byte(fmt.Sprintf("%v", i))
+		c.client.ReportCrash(crash)
+	}
+	// Check that the unreported crash was purged.
+	if firstCrashExists() {
+		t.Fatalf("The unreported crash should have been purged.")
 	}
 }
 
@@ -726,6 +800,7 @@ kernel BUG at fs/ext4/inode.c:2753!
 pkg/sentry/fsimpl/fuse/fusefs.go:278 +0x384
  kvm_vcpu_release+0x4d/0x70 arch/x86/kvm/../../../virt/kvm/kvm_main.c:3713
 	arch/x86/entry/entry_64.S:298
+[<81751700>] (show_stack) from [<8176d3e0>] (dump_stack_lvl+0x48/0x54 lib/dump_stack.c:106)
 `
 	// nolint: lll
 	output := `
@@ -735,6 +810,7 @@ kernel BUG at <a href='https://github.com/google/syzkaller/blob/111222/fs/ext4/i
 <a href='https://github.com/google/syzkaller/blob/111222/pkg/sentry/fsimpl/fuse/fusefs.go#L278'>pkg/sentry/fsimpl/fuse/fusefs.go:278</a> +0x384
  kvm_vcpu_release+0x4d/0x70 <a href='https://github.com/google/syzkaller/blob/111222/arch/x86/kvm/../../../virt/kvm/kvm_main.c#L3713'>arch/x86/kvm/../../../virt/kvm/kvm_main.c:3713</a>
 	<a href='https://github.com/google/syzkaller/blob/111222/arch/x86/entry/entry_64.S#L298'>arch/x86/entry/entry_64.S:298</a>
+[&lt;81751700&gt;] (show_stack) from [&lt;8176d3e0&gt;] (dump_stack_lvl+0x48/0x54 <a href='https://github.com/google/syzkaller/blob/111222/lib/dump_stack.c#L106'>lib/dump_stack.c:106</a>)
 `
 	got := linkifyReport([]byte(input), "https://github.com/google/syzkaller", "111222")
 	if diff := cmp.Diff(output, string(got)); diff != "" {

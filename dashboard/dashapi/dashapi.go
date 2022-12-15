@@ -444,7 +444,13 @@ type BugUpdate struct {
 	ResetFixCommits bool     // Remove all commits (empty FixCommits means leave intact).
 	FixCommits      []string // Titles of commits that fix this bug.
 	CC              []string // Additional emails to add to CC list in future emails.
-	CrashID         int64
+
+	CrashID int64 // This is a deprecated field, left here for backward compatibility.
+
+	// The new interface that allows to report and unreport several crashes at the same time.
+	// This is not relevant for emails, but may be important for external reportings.
+	ReportCrashIDs   []int64
+	UnreportCrashIDs []int64
 }
 
 type BugUpdateReply struct {
@@ -498,6 +504,19 @@ type PollClosedResponse struct {
 	IDs []string
 }
 
+type TestPatchRequest struct {
+	BugID  string
+	Link   string
+	User   string
+	Repo   string
+	Branch string
+	Patch  []byte
+}
+
+type TestPatchReply struct {
+	ErrorText string
+}
+
 func (dash *Dashboard) ReportingPollBugs(typ string) (*PollBugsResponse, error) {
 	req := &PollBugsRequest{
 		Type: typ,
@@ -534,6 +553,14 @@ func (dash *Dashboard) ReportingPollClosed(ids []string) ([]string, error) {
 func (dash *Dashboard) ReportingUpdate(upd *BugUpdate) (*BugUpdateReply, error) {
 	resp := new(BugUpdateReply)
 	if err := dash.Query("reporting_update", upd, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (dash *Dashboard) NewTestJob(upd *TestPatchRequest) (*TestPatchReply, error) {
+	resp := new(TestPatchReply)
+	if err := dash.Query("new_test_job", upd, resp); err != nil {
 		return nil, err
 	}
 	return resp, nil
@@ -608,6 +635,31 @@ func (dash *Dashboard) LoadBug(id string) (*BugReport, error) {
 	req := LoadBugReq{id}
 	resp := new(BugReport)
 	err := dash.Query("load_bug", req, resp)
+	return resp, err
+}
+
+type LoadFullBugReq struct {
+	BugID string
+}
+
+type FullBugInfo struct {
+	SimilarBugs []*SimilarBugInfo
+	BisectCause *BugReport
+	BisectFix   *BugReport
+	Crashes     []*BugReport
+}
+
+type SimilarBugInfo struct {
+	Title     string
+	Status    BugStatus
+	Namespace string
+	Link      string
+	Closed    time.Time
+}
+
+func (dash *Dashboard) LoadFullBug(req *LoadFullBugReq) (*FullBugInfo, error) {
+	resp := new(FullBugInfo)
+	err := dash.Query("load_full_bug", req, resp)
 	return resp, err
 }
 

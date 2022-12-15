@@ -16,8 +16,8 @@ import (
 //  2. Select random indices according to the probability distribution:
 //     `idx := hm.ChooseLocation(r)`.
 type Heatmap interface {
-	ChooseLocation(r *rand.Rand) int
-	Size() int
+	NumMutations() int
+	ChooseLocation() int
 }
 
 // Generic heatmaps model a probability distribution based on sparse data,
@@ -25,27 +25,40 @@ type Heatmap interface {
 // views data as a series of chunks of length `granularity`, ignoring chunks
 // which are a single repeated byte. Indices are chosen uniformly amongst the
 // remaining "interesting" segments.
-func MakeGenericHeatmap(data []byte) Heatmap {
+func MakeGenericHeatmap(data []byte, r *rand.Rand) Heatmap {
 	if len(data) == 0 {
 		panic("cannot create a GenericHeatmap with no data")
 	}
-	var hm GenericHeatmap
+	hm := &GenericHeatmap{
+		r: r,
+	}
 	hm.length, hm.segments = calculateLengthAndSegments(data, granularity)
-	return &hm
+	return hm
 }
 
-func (hm *GenericHeatmap) ChooseLocation(r *rand.Rand) int {
+func (hm *GenericHeatmap) NumMutations() int {
+	// At least one mutation.
+	n := 1
+	// + up to about one mutation every 4 KB of heatmap size.
+	n += hm.r.Intn(hm.length/(4<<10) + 1)
+	// + up to 4 mutations at random so that even small images can get more than one.
+	n += hm.r.Intn(5)
+	// But don't do too many as it will most likely corrupt the image.
+	if max := 10; n > max {
+		n = max
+	}
+	return n
+}
+
+func (hm *GenericHeatmap) ChooseLocation() int {
 	// Uniformly choose an index within one of the segments.
-	heatmapIdx := r.Intn(hm.length)
+	heatmapIdx := hm.r.Intn(hm.length)
 	rawIdx := translateIdx(heatmapIdx, hm.segments)
 	return rawIdx
 }
 
-func (hm *GenericHeatmap) Size() int {
-	return hm.length
-}
-
 type GenericHeatmap struct {
+	r        *rand.Rand
 	segments []segment // "Interesting" parts of the data.
 	length   int       // Sum of all segment lengths.
 }

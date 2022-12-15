@@ -34,14 +34,14 @@ import (
 )
 
 type Ctx struct {
-	t                 *testing.T
-	inst              aetest.Instance
-	ctx               context.Context
-	mockedTime        time.Time
-	emailSink         chan *aemail.Message
-	client            *apiClient
-	client2           *apiClient
-	clientPublicEmail *apiClient
+	t            *testing.T
+	inst         aetest.Instance
+	ctx          context.Context
+	mockedTime   time.Time
+	emailSink    chan *aemail.Message
+	client       *apiClient
+	client2      *apiClient
+	publicClient *apiClient
 }
 
 var skipDevAppserverTests = func() bool {
@@ -76,7 +76,7 @@ func NewCtx(t *testing.T) *Ctx {
 	}
 	c.client = c.makeClient(client1, password1, true)
 	c.client2 = c.makeClient(client2, password2, true)
-	c.clientPublicEmail = c.makeClient(clientPublicEmail, keyPublicEmail, true)
+	c.publicClient = c.makeClient(clientPublicEmail, keyPublicEmail, true)
 	registerContext(r, c)
 	return c
 }
@@ -524,6 +524,11 @@ func initMocks() {
 	sendEmail = func(c context.Context, msg *aemail.Message) error {
 		getRequestContext(c).emailSink <- msg
 		return nil
+	}
+	maxCrashes = func() int {
+		// dev_appserver is very slow, so let's make tests smaller.
+		const maxCrashesDuringTest = 20
+		return maxCrashesDuringTest
 	}
 }
 

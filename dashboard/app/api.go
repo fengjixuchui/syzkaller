@@ -42,7 +42,9 @@ var apiHandlers = map[string]APIHandler{
 	"reporting_poll_notifs": apiReportingPollNotifications,
 	"reporting_poll_closed": apiReportingPollClosed,
 	"reporting_update":      apiReportingUpdate,
+	"new_test_job":          apiNewTestJob,
 	"needed_assets":         apiNeededAssetsList,
+	"load_full_bug":         apiLoadFullBug,
 }
 
 var apiNamespaceHandlers = map[string]APINamespaceHandler{
@@ -80,6 +82,11 @@ var timeNow = func(c context.Context) time.Time {
 
 func timeSince(c context.Context, t time.Time) time.Duration {
 	return timeNow(c).Sub(t)
+}
+
+var maxCrashes = func() int {
+	const maxCrashesPerBug = 40
+	return maxCrashesPerBug
 }
 
 func handleJSON(fn JSONHandler) http.Handler {
@@ -730,7 +737,7 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 		reproLevel = ReproLevelSyz
 	}
 	save := reproLevel != ReproLevelNone ||
-		bug.NumCrashes < maxCrashes ||
+		bug.NumCrashes < int64(maxCrashes()) ||
 		now.Sub(bug.LastSavedCrash) > time.Hour ||
 		bug.NumCrashes%20 == 0 ||
 		!stringInList(bug.MergedTitles, req.Title)
@@ -854,7 +861,7 @@ func saveCrash(c context.Context, ns string, req *dashapi.Crash, bug *Bug, bugKe
 
 func purgeOldCrashes(c context.Context, bug *Bug, bugKey *db.Key) {
 	const purgeEvery = 10
-	if bug.NumCrashes <= 2*maxCrashes || (bug.NumCrashes-1)%purgeEvery != 0 {
+	if bug.NumCrashes <= int64(2*maxCrashes()) || (bug.NumCrashes-1)%purgeEvery != 0 {
 		return
 	}
 	var crashes []*Crash
@@ -898,7 +905,7 @@ func purgeOldCrashes(c context.Context, bug *Bug, bugKey *db.Key) {
 		if crash.ReproSyz != 0 || crash.ReproC != 0 {
 			count = &reproCount
 		}
-		if *count < maxCrashes {
+		if *count < maxCrashes() {
 			*count++
 			continue
 		}
@@ -1080,6 +1087,22 @@ func apiLoadBug(c context.Context, ns string, r *http.Request, payload []byte) (
 		return nil, nil
 	}
 	return loadBugReport(c, bug)
+}
+
+func apiLoadFullBug(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
+	req := new(dashapi.LoadFullBugReq)
+	if err := json.Unmarshal(payload, req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
+	}
+	bug, bugKey, err := findBugByReportingID(c, req.BugID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find the bug: %w", err)
+	}
+	bugReporting, _ := bugReportingByID(bug, req.BugID)
+	if bugReporting == nil {
+		return nil, fmt.Errorf("failed to find the bug reporting: %w", err)
+	}
+	return loadFullBugInfo(c, bug, bugKey, bugReporting)
 }
 
 func loadBugReport(c context.Context, bug *Bug) (*dashapi.BugReport, error) {

@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 type Email struct {
@@ -130,13 +131,13 @@ func Parse(r io.Reader, ownEmails []string, goodLists []string) (*Email, error) 
 	patch, cmdStr, cmdArgs := "", "", ""
 	if !fromMe {
 		for _, a := range attachments {
-			_, patch, _ = ParsePatch(string(a))
+			patch = ParsePatch(a)
 			if patch != "" {
 				break
 			}
 		}
 		if patch == "" {
-			_, patch, _ = ParsePatch(bodyStr)
+			patch = ParsePatch(body)
 		}
 		cmd, cmdStr, cmdArgs = extractCommand(subject + "\n" + bodyStr)
 	}
@@ -251,7 +252,7 @@ func extractCommand(body string) (cmd Command, str, args string) {
 		return
 	}
 	cmdPos += len(commandPrefix) + 1
-	for cmdPos < len(body) && (body[cmdPos] == ' ' || body[cmdPos] == '\t') {
+	for cmdPos < len(body) && unicode.IsSpace(rune(body[cmdPos])) {
 		cmdPos++
 	}
 	cmdEnd := strings.IndexByte(body[cmdPos:], '\n')

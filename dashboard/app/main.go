@@ -81,7 +81,9 @@ type uiAdminPage struct {
 	Header        *uiHeader
 	Log           []byte
 	Managers      []*uiManager
-	Jobs          *uiJobList
+	RecentJobs    *uiJobList
+	PendingJobs   *uiJobList
+	RunningJobs   *uiJobList
 	MemcacheStats *memcache.Statistics
 }
 
@@ -156,6 +158,7 @@ type uiBugGroup struct {
 }
 
 type uiJobList struct {
+	Title  string
 	PerBug bool
 	Jobs   []*uiJob
 }
@@ -344,7 +347,15 @@ func handleAdmin(c context.Context, w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	jobs, err := loadRecentJobs(c)
+	recentJobs, err := loadRecentJobs(c)
+	if err != nil {
+		return err
+	}
+	pendingJobs, err := loadPendingJobs(c)
+	if err != nil {
+		return err
+	}
+	runningJobs, err := loadRunningJobs(c)
 	if err != nil {
 		return err
 	}
@@ -352,7 +363,9 @@ func handleAdmin(c context.Context, w http.ResponseWriter, r *http.Request) erro
 		Header:        hdr,
 		Log:           errorLog,
 		Managers:      managers,
-		Jobs:          &uiJobList{Jobs: jobs},
+		RecentJobs:    &uiJobList{Title: "Recent jobs:", Jobs: recentJobs},
+		RunningJobs:   &uiJobList{Title: "Running jobs:", Jobs: runningJobs},
+		PendingJobs:   &uiJobList{Title: "Pending jobs:", Jobs: pendingJobs},
 		MemcacheStats: memcacheStats,
 	}
 	return serveTemplate(w, "admin.html", data)
@@ -407,7 +420,7 @@ func handleBug(c context.Context, w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	similar, err := loadSimilarBugs(c, r, bug, state)
+	similar, err := loadSimilarBugsUI(c, r, bug, state)
 	if err != nil {
 		return err
 	}
@@ -441,6 +454,7 @@ func handleBug(c context.Context, w http.ResponseWriter, r *http.Request) error 
 		SampleReport: sampleReport,
 		Crashes:      crashesTable,
 		TestPatchJobs: &uiJobList{
+			Title:  "Patch testing requests:",
 			PerBug: true,
 			Jobs:   testPatchJobs,
 		},
@@ -815,37 +829,26 @@ func loadDupsForBug(c context.Context, r *http.Request, bug *Bug, state *Reporti
 	return group, nil
 }
 
-func loadSimilarBugs(c context.Context, r *http.Request, bug *Bug, state *ReportingState) (*uiBugGroup, error) {
+func loadSimilarBugsUI(c context.Context, r *http.Request, bug *Bug, state *ReportingState) (*uiBugGroup, error) {
 	managers := make(map[string][]string)
-	var results []*uiBug
 	accessLevel := accessLevel(c, r)
-	domain := config.Namespaces[bug.Namespace].SimilarityDomain
-	dedup := make(map[string]bool)
-	dedup[bug.keyHash()] = true
-	for _, title := range bug.AltTitles {
-		var similar []*Bug
-		_, err := db.NewQuery("Bug").
-			Filter("AltTitles=", title).
-			GetAll(c, &similar)
-		if err != nil {
-			return nil, err
+	similarBugs, err := loadSimilarBugs(c, bug)
+	if err != nil {
+		return nil, err
+	}
+	var results []*uiBug
+	for _, similar := range similarBugs {
+		if accessLevel < similar.sanitizeAccess(accessLevel) {
+			continue
 		}
-		for _, similar := range similar {
-			if accessLevel < similar.sanitizeAccess(accessLevel) ||
-				config.Namespaces[similar.Namespace].SimilarityDomain != domain ||
-				dedup[similar.keyHash()] {
-				continue
+		if managers[similar.Namespace] == nil {
+			mgrs, err := managerList(c, similar.Namespace)
+			if err != nil {
+				return nil, err
 			}
-			dedup[similar.keyHash()] = true
-			if managers[similar.Namespace] == nil {
-				mgrs, err := managerList(c, similar.Namespace)
-				if err != nil {
-					return nil, err
-				}
-				managers[similar.Namespace] = mgrs
-			}
-			results = append(results, createUIBug(c, similar, state, managers[similar.Namespace]))
+			managers[similar.Namespace] = mgrs
 		}
+		results = append(results, createUIBug(c, similar, state, managers[similar.Namespace]))
 	}
 	group := &uiBugGroup{
 		Now:           timeNow(c),
@@ -997,7 +1000,7 @@ func updateBugBadness(c context.Context, bug *uiBug) {
 func loadCrashesForBug(c context.Context, bug *Bug) ([]*uiCrash, template.HTML, error) {
 	bugKey := bug.key(c)
 	// We can have more than maxCrashes crashes, if we have lots of reproducers.
-	crashes, _, err := queryCrashesForBug(c, bugKey, 2*maxCrashes+200)
+	crashes, _, err := queryCrashesForBug(c, bugKey, 2*maxCrashes()+200)
 	if err != nil || len(crashes) == 0 {
 		return nil, "", err
 	}
@@ -1033,7 +1036,7 @@ func linkifyReport(report []byte, repo, commit string) template.HTML {
 	}))
 }
 
-var sourceFileRe = regexp.MustCompile("( |\t|\n)([a-zA-Z0-9/_.-]+\\.(?:h|c|cc|cpp|s|S|go|rs)):([0-9]+)( |!|\t|\n)")
+var sourceFileRe = regexp.MustCompile("( |\t|\n)([a-zA-Z0-9/_.-]+\\.(?:h|c|cc|cpp|s|S|go|rs)):([0-9]+)( |!|\\)|\t|\n)")
 
 func loadFixBisectionsForBug(c context.Context, bug *Bug) ([]*uiCrash, error) {
 	bugKey := bug.key(c)
@@ -1226,11 +1229,41 @@ func loadRecentJobs(c context.Context) ([]*uiJob, error) {
 	if err != nil {
 		return nil, err
 	}
+	return getUIJobs(keys, jobs), nil
+}
+
+func loadPendingJobs(c context.Context) ([]*uiJob, error) {
+	var jobs []*Job
+	keys, err := db.NewQuery("Job").
+		Filter("Started=", time.Time{}).
+		Limit(50).
+		GetAll(c, &jobs)
+	if err != nil {
+		return nil, err
+	}
+	return getUIJobs(keys, jobs), nil
+}
+
+func loadRunningJobs(c context.Context) ([]*uiJob, error) {
+	var jobs []*Job
+	keys, err := db.NewQuery("Job").
+		Filter("Finished=", time.Time{}).
+		Filter("Started>", time.Time{}).
+		Order("-Started").
+		Limit(50).
+		GetAll(c, &jobs)
+	if err != nil {
+		return nil, err
+	}
+	return getUIJobs(keys, jobs), nil
+}
+
+func getUIJobs(keys []*db.Key, jobs []*Job) []*uiJob {
 	var results []*uiJob
 	for i, job := range jobs {
 		results = append(results, makeUIJob(job, keys[i], nil, nil, nil))
 	}
-	return results, nil
+	return results
 }
 
 func loadTestPatchJobs(c context.Context, bug *Bug) ([]*uiJob, error) {

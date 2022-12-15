@@ -388,10 +388,6 @@ func reproStr(level dashapi.ReproLevel) string {
 // nolint: gocyclo
 func createBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 	bugReporting *BugReporting, reporting *Reporting) (*dashapi.BugReport, error) {
-	reportingConfig, err := json.Marshal(reporting.Config)
-	if err != nil {
-		return nil, err
-	}
 	var job *Job
 	if bug.BisectCause == BisectYes || bug.BisectCause == BisectInconclusive || bug.BisectCause == BisectHorizont {
 		// If we have bisection results, report the crash/repro used for bisection.
@@ -410,6 +406,25 @@ func createBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key
 				crash, crashKey = crash1, crashKey1
 			}
 		}
+	}
+	rep, err := crashBugReport(c, bug, crash, crashKey, bugReporting, reporting)
+	if err != nil {
+		return nil, err
+	}
+	if job != nil {
+		cause, emails := bisectFromJob(c, job)
+		rep.BisectCause = cause
+		rep.Maintainers = append(rep.Maintainers, emails...)
+	}
+	return rep, nil
+}
+
+// crashBugReport fills in crash and build related fields into *dashapi.BugReport.
+func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
+	bugReporting *BugReporting, reporting *Reporting) (*dashapi.BugReport, error) {
+	reportingConfig, err := json.Marshal(reporting.Config)
+	if err != nil {
+		return nil, err
 	}
 	crashLog, _, err := getText(c, textCrashLog, crash.Log)
 	if err != nil {
@@ -499,9 +514,6 @@ func createBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key
 			rep.Maintainers = append(rep.Maintainers, mgr.CC.BuildMaintainers...)
 		}
 	}
-	if job != nil {
-		rep.BisectCause = bisectFromJob(c, rep, job)
-	}
 	if err := fillBugReport(c, rep, bug, bugReporting, build); err != nil {
 		return nil, err
 	}
@@ -553,17 +565,9 @@ func fillBugReport(c context.Context, rep *dashapi.BugReport, bug *Bug, bugRepor
 	if err != nil {
 		return err
 	}
-	switch bug.Status {
-	case BugStatusOpen:
-		rep.BugStatus = dashapi.BugStatusOpen
-	case BugStatusFixed:
-		rep.BugStatus = dashapi.BugStatusFixed
-	case BugStatusInvalid:
-		rep.BugStatus = dashapi.BugStatusInvalid
-	case BugStatusDup:
-		rep.BugStatus = dashapi.BugStatusDup
-	default:
-		return fmt.Errorf("unknown bugs status %v", bug.Status)
+	rep.BugStatus, err = bug.dashapiStatus()
+	if err != nil {
+		return err
 	}
 	rep.Namespace = bug.Namespace
 	rep.ID = bugReporting.ID
@@ -927,12 +931,23 @@ func incomingCommandUpdate(c context.Context, now time.Time, cmd *dashapi.BugUpd
 			bug.updateCommits(cmd.FixCommits, now)
 		}
 	}
+	toReport := append([]int64{}, cmd.ReportCrashIDs...)
 	if cmd.CrashID != 0 {
-		// Rememeber that we've reported this crash.
-		if err := markCrashReported(c, cmd.CrashID, bugKey, now); err != nil {
+		bugReporting.CrashID = cmd.CrashID
+		toReport = append(toReport, cmd.CrashID)
+	}
+	newRef := CrashReference{CrashReferenceReporting, bugReporting.Name, now}
+	for _, crashID := range toReport {
+		err := addCrashReference(c, crashID, bugKey, newRef)
+		if err != nil {
 			return false, internalError, err
 		}
-		bugReporting.CrashID = cmd.CrashID
+	}
+	for _, crashID := range cmd.UnreportCrashIDs {
+		err := removeCrashReference(c, crashID, bugKey, CrashReferenceReporting, bugReporting.Name)
+		if err != nil {
+			return false, internalError, err
+		}
 	}
 	if bugReporting.ExtID == "" {
 		bugReporting.ExtID = cmd.ExtID
@@ -1296,6 +1311,143 @@ func (state *ReportingState) getEntry(now time.Time, namespace, name string) *Re
 		Sent:      0,
 	})
 	return &state.Entries[len(state.Entries)-1]
+}
+
+func loadFullBugInfo(c context.Context, bug *Bug, bugKey *db.Key,
+	bugReporting *BugReporting) (*dashapi.FullBugInfo, error) {
+	reporting := config.Namespaces[bug.Namespace].ReportingByName(bugReporting.Name)
+	if reporting == nil {
+		return nil, fmt.Errorf("failed to find the reporting object")
+	}
+	ret := &dashapi.FullBugInfo{}
+	// Query bisections.
+	var err error
+	if bug.BisectCause > BisectPending {
+		ret.BisectCause, err = prepareBisectionReport(c, bug, JobBisectCause, reporting)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if bug.BisectFix > BisectPending {
+		ret.BisectFix, err = prepareBisectionReport(c, bug, JobBisectFix, reporting)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Query similar bugs.
+	similar, err := loadSimilarBugs(c, bug)
+	if err != nil {
+		return nil, err
+	}
+	for _, similarBug := range similar {
+		_, bugReporting, _, _, _ := currentReporting(c, similarBug)
+		if bugReporting == nil {
+			continue
+		}
+		status, err := similarBug.dashapiStatus()
+		if err != nil {
+			return nil, err
+		}
+		ret.SimilarBugs = append(ret.SimilarBugs, &dashapi.SimilarBugInfo{
+			Title:     similarBug.displayTitle(),
+			Status:    status,
+			Namespace: similarBug.Namespace,
+			Link:      fmt.Sprintf("%v/bug?extid=%v", appURL(c), bugReporting.ID),
+			Closed:    similarBug.Closed,
+		})
+	}
+	// Query crashes.
+	crashes, err := representativeCrashes(c, bugKey)
+	if err != nil {
+		return nil, err
+	}
+	for _, crash := range crashes {
+		rep, err := crashBugReport(c, bug, crash.crash, crash.key, bugReporting, reporting)
+		if err != nil {
+			return nil, fmt.Errorf("crash %d: %e", crash.key.IntID(), err)
+		}
+		ret.Crashes = append(ret.Crashes, rep)
+	}
+	return ret, nil
+}
+
+func prepareBisectionReport(c context.Context, bug *Bug, jobType JobType,
+	reporting *Reporting) (*dashapi.BugReport, error) {
+	job, _, jobKey, _, err := loadBisectJob(c, bug, jobType)
+	if err != nil {
+		return nil, err
+	}
+	if job.Reporting != "" {
+		ret, err := createBugReportForJob(c, job, jobKey, reporting.Config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create the job bug report: %w", err)
+		}
+		return ret, nil
+	}
+	return nil, nil
+}
+
+type crashWithKey struct {
+	crash *Crash
+	key   *db.Key
+}
+
+func representativeCrashes(c context.Context, bugKey *db.Key) ([]*crashWithKey, error) {
+	// There should generally be no need to query lots of crashes.
+	const fetchCrashes = 50
+	allCrashes, allCrashKeys, err := queryCrashesForBug(c, bugKey, fetchCrashes)
+	if err != nil {
+		return nil, err
+	}
+	// Let's consider a crash fresh if it happened within the last week.
+	const recentDuration = time.Hour * 24 * 7
+	now := timeNow(c)
+
+	var bestCrash, recentCrash, straceCrash *crashWithKey
+	for id, crash := range allCrashes {
+		key := allCrashKeys[id]
+		if bestCrash == nil {
+			bestCrash = &crashWithKey{crash, key}
+		}
+		if now.Sub(crash.Time) < recentDuration && recentCrash == nil {
+			recentCrash = &crashWithKey{crash, key}
+		}
+		if dashapi.CrashFlags(crash.Flags)&dashapi.CrashUnderStrace > 0 &&
+			straceCrash == nil {
+			straceCrash = &crashWithKey{crash, key}
+		}
+	}
+	// It's possible that there are so many crashes with reproducers that
+	// we do not get to see the recent crashes without them.
+	// Give it one more try.
+	if recentCrash == nil {
+		var crashes []*Crash
+		keys, err := db.NewQuery("Crash").
+			Ancestor(bugKey).
+			Order("-Time").
+			Limit(1).
+			GetAll(c, &crashes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch the latest crash: %v", err)
+		}
+		if len(crashes) > 0 {
+			recentCrash = &crashWithKey{crashes[0], keys[0]}
+		}
+	}
+	dedup := map[int64]bool{}
+	crashes := []*crashWithKey{}
+	for _, item := range []*crashWithKey{recentCrash, bestCrash, straceCrash} {
+		if item == nil || dedup[item.key.IntID()] {
+			continue
+		}
+		crashes = append(crashes, item)
+		dedup[item.key.IntID()] = true
+	}
+	// Sort by Time in desc order.
+	sort.Slice(crashes, func(i, j int) bool {
+		return crashes[i].crash.Time.After(crashes[j].crash.Time)
+	})
+	return crashes, nil
 }
 
 // bugReportSorter sorts bugs by priority we want to report them.
