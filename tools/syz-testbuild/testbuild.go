@@ -125,7 +125,7 @@ func main() {
 }
 
 func test(repo vcs.Repo, bisecter vcs.Bisecter, kernelConfig []byte, env instance.Env, com *vcs.Commit) {
-	compiler, compilerType := "gcc", "gcc"
+	compiler, compilerType, linker, ccache := "gcc", "gcc", "ld", ""
 	bisectEnv, err := bisecter.EnvForCommit(compiler, compilerType, *flagBisectBin, com.Hash, kernelConfig)
 	if err != nil {
 		tool.Fail(err)
@@ -134,8 +134,15 @@ func test(repo vcs.Repo, bisecter vcs.Bisecter, kernelConfig []byte, env instanc
 	if err := build.Clean(*flagOS, *flagArch, vmType, *flagKernelSrc); err != nil {
 		tool.Fail(err)
 	}
-	_, _, err = env.BuildKernel(bisectEnv.Compiler, "", *flagUserspace,
-		*flagKernelCmdline, *flagKernelSysctl, bisectEnv.KernelConfig)
+	_, _, err = env.BuildKernel(&instance.BuildKernelConfig{
+		CompilerBin:  bisectEnv.Compiler,
+		LinkerBin:    linker,
+		CcacheBin:    ccache,
+		UserspaceDir: *flagUserspace,
+		CmdlineFile:  *flagKernelCmdline,
+		SysctlFile:   *flagKernelSysctl,
+		KernelConfig: bisectEnv.KernelConfig,
+	})
 	if err != nil {
 		if verr, ok := err.(*osutil.VerboseError); ok {
 			log.Printf("BUILD BROKEN: %v", verr.Title)

@@ -114,6 +114,28 @@ type Bug struct {
 	// bit 1 - don't want to publish it (syzkaller build/test errors)
 	KcidbStatus int64
 	DailyStats  []BugDailyStats
+	Tags        BugTags
+}
+
+type BugTags struct {
+	Subsystems []BugSubsystem
+}
+
+type BugSubsystem struct {
+	// For now, let's keep the bare minimum number of fields.
+	// The subsystem names we use now are not stable and should not be relied upon.
+	// Once the subsystem management functionality is fully implemented, we'll
+	// override everything stored here.
+	Name string
+}
+
+func (bug *Bug) addSubsystem(subsystem BugSubsystem) {
+	for _, item := range bug.Tags.Subsystems {
+		if item.Name == subsystem.Name {
+			return
+		}
+	}
+	bug.Tags.Subsystems = append(bug.Tags.Subsystems, subsystem)
 }
 
 func (bug *Bug) Load(ps []db.Property) error {
@@ -180,22 +202,27 @@ type Crash struct {
 	Time            time.Time
 	Reported        time.Time // set if this crash was ever reported
 	References      []CrashReference
-	Maintainers     []string  `datastore:",noindex"`
-	Log             int64     // reference to CrashLog text entity
-	Flags           int64     // properties of the Crash
-	Report          int64     // reference to CrashReport text entity
-	ReproOpts       []byte    `datastore:",noindex"`
-	ReproSyz        int64     // reference to ReproSyz text entity
-	ReproC          int64     // reference to ReproC text entity
-	ReproIsRevoked  bool      // the repro no longer triggers the bug on HEAD
-	LastReproRetest time.Time // the last time when the repro was re-checked
-	MachineInfo     int64     // Reference to MachineInfo text entity.
+	Maintainers     []string            `datastore:",noindex"`
+	Log             int64               // reference to CrashLog text entity
+	Flags           int64               // properties of the Crash
+	Report          int64               // reference to CrashReport text entity
+	ReportElements  CrashReportElements // parsed parts of the crash report
+	ReproOpts       []byte              `datastore:",noindex"`
+	ReproSyz        int64               // reference to ReproSyz text entity
+	ReproC          int64               // reference to ReproC text entity
+	ReproIsRevoked  bool                // the repro no longer triggers the bug on HEAD
+	LastReproRetest time.Time           // the last time when the repro was re-checked
+	MachineInfo     int64               // Reference to MachineInfo text entity.
 	// Custom crash priority for reporting (greater values are higher priority).
 	// For example, a crash in mainline kernel has higher priority than a crash in a side branch.
 	// For historical reasons this is called ReportLen.
 	ReportLen       int64
 	Assets          []Asset   // crash-related assets
 	AssetsLastCheck time.Time // the last time we checked the assets for deprecation
+}
+
+type CrashReportElements struct {
+	GuiltyFiles []string // guilty files as determined during the crash report parsing
 }
 
 type CrashReferenceType string

@@ -29,13 +29,23 @@ import (
 
 type Env interface {
 	BuildSyzkaller(string, string) (string, error)
-	BuildKernel(string, string, string, string, string, []byte) (string, build.ImageDetails, error)
+	BuildKernel(*BuildKernelConfig) (string, build.ImageDetails, error)
 	Test(numVMs int, reproSyz, reproOpts, reproC []byte) ([]EnvTestResult, error)
 }
 
 type env struct {
 	cfg           *mgrconfig.Config
 	optionalFlags bool
+}
+
+type BuildKernelConfig struct {
+	CompilerBin  string
+	LinkerBin    string
+	CcacheBin    string
+	UserspaceDir string
+	CmdlineFile  string
+	SysctlFile   string
+	KernelConfig []byte
 }
 
 func NewEnv(cfg *mgrconfig.Config) (Env, error) {
@@ -114,7 +124,7 @@ func (env *env) BuildSyzkaller(repoURL, commit string) (string, error) {
 	return buildLog, nil
 }
 
-func (env *env) BuildKernel(compilerBin, ccacheBin, userspaceDir, cmdlineFile, sysctlFile string, kernelConfig []byte) (
+func (env *env) BuildKernel(buildCfg *BuildKernelConfig) (
 	string, build.ImageDetails, error) {
 	imageDir := filepath.Join(env.cfg.Workdir, "image")
 	params := build.Params{
@@ -123,12 +133,13 @@ func (env *env) BuildKernel(compilerBin, ccacheBin, userspaceDir, cmdlineFile, s
 		VMType:       env.cfg.Type,
 		KernelDir:    env.cfg.KernelSrc,
 		OutputDir:    imageDir,
-		Compiler:     compilerBin,
-		Ccache:       ccacheBin,
-		UserspaceDir: userspaceDir,
-		CmdlineFile:  cmdlineFile,
-		SysctlFile:   sysctlFile,
-		Config:       kernelConfig,
+		Compiler:     buildCfg.CompilerBin,
+		Linker:       buildCfg.LinkerBin,
+		Ccache:       buildCfg.CcacheBin,
+		UserspaceDir: buildCfg.UserspaceDir,
+		CmdlineFile:  buildCfg.CmdlineFile,
+		SysctlFile:   buildCfg.SysctlFile,
+		Config:       buildCfg.KernelConfig,
 	}
 	details, err := build.Image(params)
 	if err != nil {

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
-	"github.com/google/syzkaller/pkg/asset"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/html"
 	"github.com/google/syzkaller/sys/targets"
@@ -322,6 +321,7 @@ func createNotification(c context.Context, typ dashapi.BugNotif, public bool, te
 		Title:     bug.displayTitle(),
 		Text:      text,
 		Public:    public,
+		Link:      fmt.Sprintf("%v/bug?extid=%v", appURL(c), bugReporting.ID),
 		CC:        kernelRepo.CC.Always,
 	}
 	if public {
@@ -457,23 +457,7 @@ func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 	if !bugReporting.Reported.IsZero() {
 		typ = dashapi.ReportRepro
 	}
-	assetList := []dashapi.Asset{}
-	for _, reportAsset := range append(build.Assets, crash.Assets...) {
-		typeDescr := asset.GetTypeDescription(reportAsset.Type)
-		if typeDescr == nil || typeDescr.NoReporting {
-			continue
-		}
-		assetList = append(assetList, dashapi.Asset{
-			Title:       typeDescr.GetTitle(targets.Get(build.OS, build.Arch)),
-			DownloadURL: reportAsset.DownloadURL,
-			Type:        reportAsset.Type,
-		})
-	}
-	sort.SliceStable(assetList, func(i, j int) bool {
-		return asset.GetTypeDescription(assetList[i].Type).ReportingPrio <
-			asset.GetTypeDescription(assetList[j].Type).ReportingPrio
-	})
-	handleDupAssetTitles(assetList)
+	assetList := createAssetList(build, crash)
 	kernelRepo := kernelRepoInfo(build)
 	rep := &dashapi.BugReport{
 		Type:            typ,
@@ -518,26 +502,6 @@ func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 		return nil, err
 	}
 	return rep, nil
-}
-
-// Convert asset lists like {"Mounted image", "Mounted image"} to {"Mounted image #1", "Mounted image #2"}.
-func handleDupAssetTitles(assetList []dashapi.Asset) {
-	duplicates := map[string]bool{}
-	for _, asset := range assetList {
-		if _, ok := duplicates[asset.Title]; ok {
-			duplicates[asset.Title] = true
-		} else {
-			duplicates[asset.Title] = false
-		}
-	}
-	counts := map[string]int{}
-	for i, asset := range assetList {
-		if !duplicates[asset.Title] {
-			continue
-		}
-		counts[asset.Title]++
-		assetList[i].Title = fmt.Sprintf("%s #%d", asset.Title, counts[asset.Title])
-	}
 }
 
 func loadReproSyz(c context.Context, crash *Crash) ([]byte, error) {
@@ -591,6 +555,11 @@ func fillBugReport(c context.Context, rep *dashapi.BugReport, bug *Bug, bugRepor
 	rep.KernelConfigLink = externalLink(c, textKernelConfig, build.KernelConfig)
 	rep.SyzkallerCommit = build.SyzkallerCommit
 	rep.NoRepro = build.Type == BuildFailed
+	for _, item := range bug.Tags.Subsystems {
+		rep.Subsystems = append(rep.Subsystems, dashapi.BugSubsystem{Name: item.Name})
+		rep.Maintainers = email.MergeEmailLists(rep.Maintainers,
+			subsystemMaintainers(rep.Namespace, item.Name))
+	}
 	for _, addr := range bug.UNCC {
 		rep.CC = email.RemoveFromEmailList(rep.CC, addr)
 		rep.Maintainers = email.RemoveFromEmailList(rep.Maintainers, addr)
@@ -728,7 +697,8 @@ func reportingPollClosed(c context.Context, ids []string) ([]string, error) {
 				log.Errorf(c, "%v", err)
 				break
 			}
-			if bug.Status >= BugStatusFixed || !bugReporting.Closed.IsZero() {
+			if bug.Status >= BugStatusFixed || !bugReporting.Closed.IsZero() ||
+				config.Namespaces[bug.Namespace].Decommissioned {
 				closed = append(closed, bugReporting.ID)
 			}
 			break

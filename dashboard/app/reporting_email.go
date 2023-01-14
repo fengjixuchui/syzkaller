@@ -173,14 +173,11 @@ func emailSendBugNotif(c context.Context, notif *dashapi.BugNotification) error 
 		body = "Sending this report upstream."
 		status = dashapi.BugStatusUpstream
 	case dashapi.BugNotifBadCommit:
-		days := int(notifyAboutBadCommitPeriod / time.Hour / 24)
-		body = fmt.Sprintf("This bug is marked as fixed by commit:\n%v\n"+
-			"But I can't find it in any tested tree for more than %v days.\n"+
-			"Is it a correct commit? Please update it by replying:\n"+
-			"#syz fix: exact-commit-title\n"+
-			"Until then the bug is still considered open and\n"+
-			"new crashes with the same signature are ignored.\n",
-			notif.Text, days)
+		var err error
+		body, err = buildBadCommitMessage(c, notif)
+		if err != nil {
+			return err
+		}
 	case dashapi.BugNotifObsoleted:
 		body = "Auto-closing this bug as obsolete.\n"
 		statusReason = dashapi.BugStatusReason(notif.Text)
@@ -221,6 +218,46 @@ func emailSendBugNotif(c context.Context, notif *dashapi.BugNotification) error 
 		return fmt.Errorf("notif update failed: ok=%v reason=%v err=%v", ok, reason, err)
 	}
 	return nil
+}
+
+func buildBadCommitMessage(c context.Context, notif *dashapi.BugNotification) (string, error) {
+	var sb strings.Builder
+	days := int(notifyAboutBadCommitPeriod / time.Hour / 24)
+	nsConfig := config.Namespaces[notif.Namespace]
+	fmt.Fprintf(&sb, `This bug is marked as fixed by commit:
+%v
+
+But I can't find it in the tested trees[1] for more than %v days.
+Is it a correct commit? Please update it by replying:
+
+#syz fix: exact-commit-title
+
+Until then the bug is still considered open and new crashes with
+the same signature are ignored.
+
+Kernel: %s
+Dashboard link: %s
+
+---
+[1] I expect the commit to be present in:
+`, notif.Text, days, nsConfig.DisplayTitle, notif.Link)
+
+	repos, err := loadRepos(c, AccessPublic, notif.Namespace)
+	if err != nil {
+		return "", err
+	}
+	const maxShow = 4
+	for i, repo := range repos {
+		if i >= maxShow {
+			break
+		}
+		fmt.Fprintf(&sb, "\n%d. %s branch of\n%s\n", i+1, repo.Branch, repo.URL)
+	}
+	if len(repos) > maxShow {
+		fmt.Fprintf(&sb, "\nThe full list of %d trees can be found at\n%s\n",
+			len(repos), fmt.Sprintf("%v/%v/repos", appURL(c), notif.Namespace))
+	}
+	return sb.String(), nil
 }
 
 func emailPollJobs(c context.Context) error {
@@ -271,8 +308,17 @@ func emailReport(c context.Context, rep *dashapi.BugReport) error {
 	if err := mailTemplates.ExecuteTemplate(body, templ, rep); err != nil {
 		return fmt.Errorf("failed to execute %v template: %v", templ, err)
 	}
-	log.Infof(c, "sending email %q to %q", rep.Title, to)
-	return sendMailText(c, cfg, rep.Title, from, to, rep.ExtID, body.String())
+	title := generateEmailBugTitle(rep, cfg)
+	log.Infof(c, "sending email %q to %q", title, to)
+	return sendMailText(c, cfg, title, from, to, rep.ExtID, body.String())
+}
+
+func generateEmailBugTitle(rep *dashapi.BugReport, emailConfig *EmailConfig) string {
+	title := ""
+	for i := len(rep.Subsystems) - 1; i >= 0; i-- {
+		title = fmt.Sprintf("[%s?] %s", rep.Subsystems[i].Name, title)
+	}
+	return title + rep.Title
 }
 
 // handleIncomingMail is the entry point for incoming emails.
@@ -626,7 +672,7 @@ func (p *subjectTitleParser) prepareRegexps() {
 			}
 		}
 		rePrefixes := `^(?:(?:` + strings.Join(stripPrefixes, "|") + `)\s*)*`
-		p.pattern = regexp.MustCompile(rePrefixes + `(.*?)(?:\s\((\d+)\))?$`)
+		p.pattern = regexp.MustCompile(rePrefixes + `(?:\[[^\]]+\]\s*)*(.*?)(?:\s\((\d+)\))?$`)
 	})
 }
 

@@ -1,7 +1,7 @@
 // Copyright 2022 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-package prog
+package image
 
 import (
 	"bytes"
@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"io/ioutil"
 )
 
 func Compress(rawData []byte) []byte {
@@ -28,14 +29,22 @@ func Compress(rawData []byte) []byte {
 	return buffer.Bytes()
 }
 
-func Decompress(compressedData []byte) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	err := DecompressWriter(buf, compressedData)
-	return buf.Bytes(), err
+func MustDecompress(compressed []byte) (data []byte, dtor func()) {
+	if len(compressed) == 0 {
+		return nil, func() {}
+	}
+	return mustDecompress(compressed)
 }
 
-func DecompressWriter(w io.Writer, compressedData []byte) error {
-	zlibReader, err := zlib.NewReader(bytes.NewReader(compressedData))
+func DecompressCheck(compressed []byte) error {
+	return decompressWriter(ioutil.Discard, compressed)
+}
+
+func decompressWriter(w io.Writer, compressed []byte) error {
+	if len(compressed) == 0 {
+		return nil
+	}
+	zlibReader, err := zlib.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		return fmt.Errorf("could not initialise zlib: %v", err)
 	}

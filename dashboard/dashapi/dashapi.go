@@ -285,6 +285,7 @@ type Crash struct {
 	Report      []byte
 	MachineInfo []byte
 	Assets      []NewAsset
+	GuiltyFiles []string
 	// The following is optional and is filled only after repro.
 	ReproOpts []byte
 	ReproSyz  []byte
@@ -400,6 +401,11 @@ type BugReport struct {
 	BisectCause    *BisectResult
 	BisectFix      *BisectResult
 	Assets         []Asset
+	Subsystems     []BugSubsystem
+}
+
+type BugSubsystem struct {
+	Name string
 }
 
 type Asset struct {
@@ -480,6 +486,7 @@ type BugNotification struct {
 	Text        string   // meaning depends on Type
 	CC          []string // deprecated in favor of Recipients
 	Maintainers []string // deprecated in favor of Recipients
+	Link        string
 	Recipients  Recipients
 	// Public is what we want all involved people to see (e.g. if we notify about a wrong commit title,
 	// people need to see it and provide the right title). Not public is what we want to send only

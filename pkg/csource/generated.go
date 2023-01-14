@@ -6640,13 +6640,10 @@ static int puff(
 
 static int puff_zlib_to_file(const unsigned char* source, unsigned long sourcelen, int dest_fd)
 {
-	if (sourcelen < ZLIB_HEADER_WIDTH) {
-		errno = EMSGSIZE;
-		return -1;
-	}
+	if (sourcelen < ZLIB_HEADER_WIDTH)
+		return 0;
 	source += ZLIB_HEADER_WIDTH;
 	sourcelen -= ZLIB_HEADER_WIDTH;
-
 	const unsigned long max_destlen = 132 << 20;
 	void* ret = mmap(0, max_destlen, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (ret == MAP_FAILED)
@@ -6802,7 +6799,14 @@ static long syz_mount_image(
 	if (strcmp(fs, "iso9660") == 0) {
 		flags |= MS_RDONLY;
 	} else if (strncmp(fs, "ext", 3) == 0) {
-		if (strstr(opts, "errors=panic") || strstr(opts, "errors=remount-ro") == 0)
+		bool has_remount_ro = false;
+		char* remount_ro_start = strstr(opts, "errors=remount-ro");
+		if (remount_ro_start != NULL) {
+			char after = *(remount_ro_start + strlen("errors=remount-ro"));
+			char before = remount_ro_start == opts ? '\0' : *(remount_ro_start - 1);
+			has_remount_ro = ((before == '\0' || before == ',') && (after == '\0' || after == ','));
+		}
+		if (strstr(opts, "errors=panic") || !has_remount_ro)
 			strcat(opts, ",errors=continue");
 	} else if (strcmp(fs, "xfs") == 0) {
 		strcat(opts, ",nouuid");
@@ -11783,13 +11787,10 @@ static int puff(
 
 static int puff_zlib_to_file(const unsigned char* source, unsigned long sourcelen, int dest_fd)
 {
-	if (sourcelen < ZLIB_HEADER_WIDTH) {
-		errno = EMSGSIZE;
-		return -1;
-	}
+	if (sourcelen < ZLIB_HEADER_WIDTH)
+		return 0;
 	source += ZLIB_HEADER_WIDTH;
 	sourcelen -= ZLIB_HEADER_WIDTH;
-
 	const unsigned long max_destlen = 132 << 20;
 	void* ret = mmap(0, max_destlen, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (ret == MAP_FAILED)

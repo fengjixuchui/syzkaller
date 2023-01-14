@@ -186,7 +186,8 @@ func addTestJob(c context.Context, args *testJobArgs, now time.Time) error {
 func checkTestJob(c context.Context, bug *Bug, bugReporting *BugReporting, crash *Crash,
 	repo, branch string) string {
 	needRepro := !strings.Contains(crash.Title, "boot error:") &&
-		!strings.Contains(crash.Title, "test error:")
+		!strings.Contains(crash.Title, "test error:") &&
+		!strings.Contains(crash.Title, "build error")
 	switch {
 	case needRepro && crash.ReproC == 0 && crash.ReproSyz == 0:
 		return "This crash does not have a reproducer. I cannot test it."
@@ -308,6 +309,10 @@ func handleRetestForBug(c context.Context, now time.Time, bug *Bug, bugKey *db.K
 			continue
 		}
 		if now.Sub(crash.LastReproRetest) < config.Obsoleting.ReproRetestPeriod {
+			continue
+		}
+		if crash.ReproIsRevoked {
+			// No sense in retesting the already revoked repro.
 			continue
 		}
 		// TODO: check if the manager can do such jobs.

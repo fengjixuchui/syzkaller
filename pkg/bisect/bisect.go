@@ -23,6 +23,7 @@ type Config struct {
 	Fix             bool
 	DefaultCompiler string
 	CompilerType    string
+	Linker          string
 	BinDir          string
 	Ccache          string
 	Timeout         time.Duration
@@ -478,8 +479,15 @@ func (env *env) build() (*vcs.Commit, string, error) {
 		return current, "", fmt.Errorf("kernel clean failed: %v", err)
 	}
 	kern := &env.cfg.Kernel
-	_, imageDetails, err := env.inst.BuildKernel(bisectEnv.Compiler, env.cfg.Ccache, kern.Userspace,
-		kern.Cmdline, kern.Sysctl, bisectEnv.KernelConfig)
+	_, imageDetails, err := env.inst.BuildKernel(&instance.BuildKernelConfig{
+		CompilerBin:  bisectEnv.Compiler,
+		LinkerBin:    env.cfg.Linker,
+		CcacheBin:    env.cfg.Ccache,
+		UserspaceDir: kern.Userspace,
+		CmdlineFile:  kern.Cmdline,
+		SysctlFile:   kern.Sysctl,
+		KernelConfig: bisectEnv.KernelConfig,
+	})
 	if imageDetails.CompilerID != "" {
 		env.log("compiler: %v", imageDetails.CompilerID)
 	}
