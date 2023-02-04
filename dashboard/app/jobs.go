@@ -95,17 +95,10 @@ func addTestJob(c context.Context, args *testJobArgs, now time.Time) error {
 		args.repo, args.branch); reason != "" {
 		return &BadTestRequestError{reason}
 	}
-	manager := args.crash.Manager
-	for _, ns := range config.Namespaces {
-		if mgr, ok := ns.Managers[manager]; ok {
-			if mgr.RestrictedTestingRepo != "" && args.repo != mgr.RestrictedTestingRepo {
-				return &BadTestRequestError{mgr.RestrictedTestingReason}
-			}
-			if mgr.Decommissioned {
-				manager = mgr.DelegatedTo
-			}
-			break
-		}
+	manager, mgrConfig := activeManager(args.crash.Manager, args.bug.Namespace)
+	if mgrConfig != nil && mgrConfig.RestrictedTestingRepo != "" &&
+		args.repo != mgrConfig.RestrictedTestingRepo {
+		return &BadTestRequestError{mgrConfig.RestrictedTestingReason}
 	}
 	patchID, err := putText(c, args.bug.Namespace, textPatch, args.patch, false)
 	if err != nil {
@@ -319,9 +312,14 @@ func handleRetestForBug(c context.Context, now time.Time, bug *Bug, bugKey *db.K
 		if managerHasJob[crash.Manager] {
 			continue
 		}
+		// We could have decommissioned the original manager since then.
+		manager, _ := activeManager(crash.Manager, bug.Namespace)
+		if manager == "" {
+			continue
+		}
 		// Take the last successful build -- the build on which this crash happened
 		// might contain already obsolete repro and branch values.
-		build, err := lastManagerBuild(c, bug.Namespace, crash.Manager)
+		build, err := lastManagerBuild(c, bug.Namespace, manager)
 		if err != nil {
 			return err
 		}
@@ -548,7 +546,8 @@ func createJobResp(c context.Context, job *Job, jobKey *db.Key) (*dashapi.JobPol
 			return nil
 		}
 		job.Attempts++
-		job.Started = now
+		job.IsRunning = true
+		job.LastStarted = now
 		if _, err := db.Put(c, jobKey, job); err != nil {
 			return fmt.Errorf("job %v: failed to put: %v", jobID, err)
 		}
@@ -666,6 +665,48 @@ func gatherCrashTitles(req *dashapi.JobDoneReq) []string {
 	return ret
 }
 
+// resetJobs is called to indicate that, for the specified managers, all started jobs are no longer
+// in progress.
+func resetJobs(c context.Context, req *dashapi.JobResetReq) error {
+	var jobs []*Job
+	keys, err := db.NewQuery("Job").
+		Filter("Finished=", time.Time{}).
+		Filter("IsRunning=", true).
+		GetAll(c, &jobs)
+	if err != nil {
+		return err
+	}
+	managerMap := map[string]bool{}
+	for _, name := range req.Managers {
+		managerMap[name] = true
+	}
+	for idx, job := range jobs {
+		if !managerMap[job.Manager] {
+			continue
+		}
+		jobKey := keys[idx]
+		tx := func(c context.Context) error {
+			job = new(Job)
+			if err := db.Get(c, jobKey, job); err != nil {
+				return fmt.Errorf("job %v: failed to get in tx: %v", jobKey, err)
+			}
+			if job.IsFinished() {
+				// Just in case.
+				return nil
+			}
+			job.IsRunning = false
+			if _, err := db.Put(c, jobKey, job); err != nil {
+				return fmt.Errorf("job %v: failed to put: %v", jobKey, err)
+			}
+			return nil
+		}
+		if err := db.RunInTransaction(c, tx, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // doneJob is called by syz-ci to mark completion of a job.
 func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 	jobID := req.ID
@@ -734,6 +775,7 @@ func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 		job.BuildID = req.Build.ID
 		job.CrashTitle = req.CrashTitle
 		job.Finished = now
+		job.IsRunning = false
 		job.Flags = JobFlags(req.Flags)
 		if job.Type == JobBisectCause || job.Type == JobBisectFix {
 			// Update bug.BisectCause/Fix status and also remember current bug reporting to send results.
@@ -1066,6 +1108,7 @@ func loadPendingJob(c context.Context, managers map[string]dashapi.ManagerJobs) 
 	var jobs []*Job
 	keys, err := db.NewQuery("Job").
 		Filter("Finished=", time.Time{}).
+		Filter("IsRunning=", false).
 		Order("Attempts").
 		Order("Created").
 		GetAll(c, &jobs)
@@ -1089,7 +1132,7 @@ func loadPendingJob(c context.Context, managers map[string]dashapi.ManagerJobs) 
 			// and protects from bisection job crashing syz-ci.
 			const bisectRepeat = 3 * 24 * time.Hour
 			if timeSince(c, job.Created) < bisectRepeat ||
-				timeSince(c, job.Started) < bisectRepeat {
+				timeSince(c, job.LastStarted) < bisectRepeat {
 				continue
 			}
 		default:
@@ -1098,6 +1141,22 @@ func loadPendingJob(c context.Context, managers map[string]dashapi.ManagerJobs) 
 		return job, keys[i], nil
 	}
 	return nil, nil, nil
+}
+
+// activeManager determines the manager currently responsible for all bugs found by
+// the specified manager.
+func activeManager(manager, ns string) (string, *ConfigManager) {
+	nsConfig := config.Namespaces[ns]
+	if mgr, ok := nsConfig.Managers[manager]; ok {
+		if mgr.Decommissioned {
+			newMgr := nsConfig.Managers[mgr.DelegatedTo]
+			return mgr.DelegatedTo, &newMgr
+		}
+		return manager, &mgr
+	}
+	// This manager is not mentioned in the configuration, therefore it was
+	// definitely not decommissioned.
+	return manager, nil
 }
 
 func extJobID(jobKey *db.Key) string {

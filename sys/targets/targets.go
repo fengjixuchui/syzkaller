@@ -576,15 +576,19 @@ var (
 		"-Wno-stringop-overflow",
 		"-Wno-array-bounds",
 		"-Wno-format-overflow",
+		"-Wno-unused-but-set-variable",
+		"-Wno-unused-command-line-argument",
 	}
 	optionalCFlags = map[string]bool{
-		"-static":                 true, // some distributions don't have static libraries
-		"-static-pie":             true, // this flag is also not supported everywhere
-		"-Wunused-const-variable": true, // gcc 5 does not support this flag
-		"-fsanitize=address":      true, // some OSes don't have ASAN
-		"-Wno-stringop-overflow":  true,
-		"-Wno-array-bounds":       true,
-		"-Wno-format-overflow":    true,
+		"-static":                           true, // some distributions don't have static libraries
+		"-static-pie":                       true, // this flag is also not supported everywhere
+		"-Wunused-const-variable":           true, // gcc 5 does not support this flag
+		"-fsanitize=address":                true, // some OSes don't have ASAN
+		"-Wno-stringop-overflow":            true,
+		"-Wno-array-bounds":                 true,
+		"-Wno-format-overflow":              true,
+		"-Wno-unused-but-set-variable":      true,
+		"-Wno-unused-command-line-argument": true,
 	}
 	fallbackCFlags = map[string]string{
 		"-static-pie": "-static", // if an ASLR static binary is impossible, build just a static one
@@ -672,10 +676,7 @@ func initTarget(target *Target, OS, arch string) {
 		target.DataOffset = 512 << 20
 	}
 	target.NumPages = (16 << 20) / target.PageSize
-	sourceDir := os.Getenv("SOURCEDIR_" + strings.ToUpper(OS))
-	if sourceDir == "" {
-		sourceDir = os.Getenv("SOURCEDIR")
-	}
+	sourceDir := getSourceDir(target)
 	for sourceDir != "" && sourceDir[len(sourceDir)-1] == '/' {
 		sourceDir = sourceDir[:len(sourceDir)-1]
 	}
@@ -725,6 +726,12 @@ func initTarget(target *Target, OS, arch string) {
 		target.HostEndian = binary.LittleEndian
 	} else {
 		target.HostEndian = binary.BigEndian
+	}
+	// Temporal hack.
+	if OS == Linux && os.Getenv("SYZ_STARNIX_HACK") != "" {
+		target.ExecutorUsesShmem = false
+		target.ExecutorUsesForkServer = false
+		target.HostFuzzer = true
 	}
 }
 
@@ -816,7 +823,7 @@ func (target *Target) lazyInit() {
 	// Only fail on CI for native build.
 	// On CI we want to fail loudly if cross-compilation breaks.
 	// Also fail if SOURCEDIR_GOOS is set b/c in that case user probably assumes it will work.
-	if (target.OS != runtime.GOOS || !runningOnCI) && os.Getenv("SOURCEDIR_"+strings.ToUpper(target.OS)) == "" {
+	if (target.OS != runtime.GOOS || !runningOnCI) && getSourceDir(target) == "" {
 		if _, err := exec.LookPath(target.CCompiler); err != nil {
 			target.BrokenCompiler = fmt.Sprintf("%v is missing (%v)", target.CCompiler, err)
 			return
@@ -829,11 +836,17 @@ func (target *Target) lazyInit() {
 	}
 
 	flags := make(map[string]*bool)
+	commonCFlags := []string{}
+	uncommonCFlags := []string{}
 	var wg sync.WaitGroup
 	for _, flag := range flagsToCheck {
 		if !optionalCFlags[flag] {
+			commonCFlags = append(commonCFlags, flag)
 			continue
 		}
+		uncommonCFlags = append(uncommonCFlags, flag)
+	}
+	for _, flag := range uncommonCFlags {
 		_, exists := flags[flag]
 		if exists {
 			continue
@@ -843,7 +856,7 @@ func (target *Target) lazyInit() {
 		wg.Add(1)
 		go func(flag string) {
 			defer wg.Done()
-			*res = checkFlagSupported(target, flag)
+			*res = checkFlagSupported(target, commonCFlags, flag)
 		}(flag)
 	}
 	wg.Wait()
@@ -868,7 +881,7 @@ func (target *Target) lazyInit() {
 	//	fatal error: asm/unistd.h: No such file or directory
 	//	fatal error: asm/errno.h: No such file or directory
 	//	collect2: error: ld terminated with signal 11 [Segmentation fault]
-	if runningOnCI || os.Getenv("SOURCEDIR_"+strings.ToUpper(target.OS)) != "" {
+	if runningOnCI || getSourceDir(target) != "" {
 		return // On CI all compilers are expected to work, so we don't do the following check.
 	}
 	args := []string{"-x", "c++", "-", "-o", "/dev/null"}
@@ -881,8 +894,10 @@ func (target *Target) lazyInit() {
 	}
 }
 
-func checkFlagSupported(target *Target, flag string) bool {
-	cmd := exec.Command(target.CCompiler, "-x", "c++", "-", "-o", "/dev/null", "-Werror", flag)
+func checkFlagSupported(target *Target, targetCFlags []string, flag string) bool {
+	args := []string{"-x", "c++", "-", "-o", "/dev/null", "-Werror", flag}
+	args = append(args, targetCFlags...)
+	cmd := exec.Command(target.CCompiler, args...)
 	cmd.Stdin = strings.NewReader(simpleProg)
 	return cmd.Run() == nil
 }
@@ -947,6 +962,23 @@ func processMergedFlags(flags []string) []string {
 		dup[s] = true
 	}
 	return newFlags
+}
+
+func getSourceDir(target *Target) string {
+	// First try the most granular env option.
+	name := fmt.Sprintf("SOURCEDIR_%s_%s_%s_%s",
+		strings.ToUpper(target.OS), strings.ToUpper(target.Arch),
+		strings.ToUpper(runtime.GOOS), strings.ToUpper(runtime.GOARCH),
+	)
+	if ret := os.Getenv(name); ret != "" {
+		return ret
+	}
+	// .. then the older one.
+	name = fmt.Sprintf("SOURCEDIR_%s", strings.ToUpper(target.OS))
+	if ret := os.Getenv(name); ret != "" {
+		return ret
+	}
+	return os.Getenv("SOURCEDIR")
 }
 
 func needSyscallDefine(nr uint64) bool     { return true }

@@ -234,6 +234,12 @@ type uiBug struct {
 	MissingOn      []string
 	NumManagers    int
 	LastActivity   time.Time
+	Subsystems     []*uiBugSubsystem
+}
+
+type uiBugSubsystem struct {
+	Name string
+	Link string
 }
 
 type uiCrash struct {
@@ -308,7 +314,10 @@ func handleMain(c context.Context, w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
-	groups, err := fetchNamespaceBugs(c, accessLevel, hdr.Namespace, manager, onlyManager != "")
+	groups, err := fetchNamespaceBugs(c, accessLevel, hdr.Namespace,
+		manager, onlyManager != "",
+		r.FormValue("subsystem"),
+	)
 	if err != nil {
 		return err
 	}
@@ -366,6 +375,7 @@ type TerminalBug struct {
 	ShowStats   bool
 	Manager     string
 	OneManager  bool
+	Subsystem   string
 }
 
 func handleTerminalBugList(c context.Context, w http.ResponseWriter, r *http.Request, typ *TerminalBug) error {
@@ -382,6 +392,7 @@ func handleTerminalBugList(c context.Context, w http.ResponseWriter, r *http.Req
 	} else {
 		typ.Manager = r.FormValue("manager")
 	}
+	typ.Subsystem = r.FormValue("subsystem")
 	extraBugs := []*Bug{}
 	if typ.Status == BugStatusFixed {
 		// Mix in bugs that have pending fixes.
@@ -543,7 +554,7 @@ func handleBug(c context.Context, w http.ResponseWriter, r *http.Request) error 
 		SampleReport: sampleReport,
 		Crashes:      crashesTable,
 		TestPatchJobs: &uiJobList{
-			Title:  "Patch testing requests:",
+			Title:  "Last patch testing requests:",
 			PerBug: true,
 			Jobs:   testPatchJobs,
 		},
@@ -809,7 +820,7 @@ func fetchFixPendingBugs(c context.Context, ns, manager string) ([]*Bug, error) 
 }
 
 func fetchNamespaceBugs(c context.Context, accessLevel AccessLevel, ns,
-	manager string, oneManager bool) ([]*uiBugGroup, error) {
+	manager string, oneManager bool, subsystem string) ([]*uiBugGroup, error) {
 	bugs, err := loadVisibleBugs(c, accessLevel, ns, manager)
 	if err != nil {
 		return nil, err
@@ -834,6 +845,9 @@ func fetchNamespaceBugs(c context.Context, accessLevel AccessLevel, ns,
 			continue
 		}
 		if oneManager && len(bug.HappenedOn) > 1 {
+			continue
+		}
+		if subsystem != "" && !bug.hasSubsystem(subsystem) {
 			continue
 		}
 		uiBug := createUIBug(c, bug, state, managers)
@@ -972,6 +986,9 @@ func fetchTerminalBugs(c context.Context, accessLevel AccessLevel,
 			continue
 		}
 		if typ.OneManager && len(bug.HappenedOn) > 1 {
+			continue
+		}
+		if typ.Subsystem != "" && !bug.hasSubsystem(typ.Subsystem) {
 			continue
 		}
 		uiBug := createUIBug(c, bug, state, managers)
@@ -1119,6 +1136,12 @@ func createUIBug(c context.Context, bug *Bug, state *ReportingState, managers []
 		CreditEmail:    creditEmail,
 		NumManagers:    len(managers),
 		LastActivity:   bug.LastActivity,
+	}
+	for _, entry := range bug.Tags.Subsystems {
+		uiBug.Subsystems = append(uiBug.Subsystems, &uiBugSubsystem{
+			Name: entry.Name,
+			Link: html.AmendURL(getCurrentURL(c), "subsystem", entry.Name),
+		})
 	}
 	updateBugBadness(c, uiBug)
 	if len(bug.Commits) != 0 {
@@ -1478,9 +1501,7 @@ func loadPendingJobs(c context.Context) ([]*uiJob, error) {
 func loadRunningJobs(c context.Context) ([]*uiJob, error) {
 	var jobs []*Job
 	keys, err := db.NewQuery("Job").
-		Filter("Finished=", time.Time{}).
-		Filter("Started>", time.Time{}).
-		Order("-Started").
+		Filter("IsRunning=", true).
 		Limit(50).
 		GetAll(c, &jobs)
 	if err != nil {
@@ -1499,6 +1520,7 @@ func getUIJobs(keys []*db.Key, jobs []*Job) []*uiJob {
 
 func loadTestPatchJobs(c context.Context, bug *Bug) ([]*uiJob, error) {
 	bugKey := bug.key(c)
+
 	var jobs []*Job
 	keys, err := db.NewQuery("Job").
 		Ancestor(bugKey).
@@ -1509,8 +1531,16 @@ func loadTestPatchJobs(c context.Context, bug *Bug) ([]*uiJob, error) {
 	if err != nil {
 		return nil, err
 	}
+	const maxAutomaticJobs = 10
+	autoJobsLeft := maxAutomaticJobs
 	var results []*uiJob
 	for i, job := range jobs {
+		if job.User == "" {
+			if autoJobsLeft == 0 {
+				continue
+			}
+			autoJobsLeft--
+		}
 		var build *Build
 		if job.BuildID != "" {
 			if build, err = loadBuild(c, bug.Namespace, job.BuildID); err != nil {
@@ -1542,7 +1572,7 @@ func makeUIJob(job *Job, jobKey *db.Key, bug *Bug, crash *Crash, build *Build) *
 		KernelCommitLink: vcs.CommitLink(kernelRepo, kernelCommit),
 		PatchLink:        textLink(textPatch, job.Patch),
 		Attempts:         job.Attempts,
-		Started:          job.Started,
+		Started:          job.LastStarted,
 		Finished:         job.Finished,
 		CrashTitle:       job.CrashTitle,
 		CrashLogLink:     textLink(textCrashLog, job.CrashLog),
@@ -1552,7 +1582,7 @@ func makeUIJob(job *Job, jobKey *db.Key, bug *Bug, crash *Crash, build *Build) *
 		Reported:         job.Reported,
 	}
 	if !job.Finished.IsZero() {
-		ui.Duration = job.Finished.Sub(job.Started)
+		ui.Duration = job.Finished.Sub(job.LastStarted)
 	}
 	if job.Type == JobBisectCause || job.Type == JobBisectFix {
 		// We don't report these yet (or at all), see pollCompletedJobs.

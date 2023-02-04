@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/sys/targets"
@@ -84,6 +85,7 @@ func TestReportBug(t *testing.T) {
 		NumCrashes:        1,
 		HappenedOn:        []string{"repo1 branch1"},
 		Assets:            []dashapi.Asset{},
+		ReportElements:    &dashapi.ReportElements{},
 	}
 	c.expectEQ(want, rep)
 
@@ -247,6 +249,7 @@ func TestInvalidBug(t *testing.T) {
 		NumCrashes:        1,
 		HappenedOn:        []string{"repo1 branch1"},
 		Assets:            []dashapi.Asset{},
+		ReportElements:    &dashapi.ReportElements{},
 	}
 	c.expectEQ(want, rep)
 	c.client.ReportFailedRepro(testCrashID(crash1))
@@ -1006,25 +1009,68 @@ func TestFullBugInfo(t *testing.T) {
 	}
 }
 
-func TestReportDecommissionedBugs(t *testing.T) {
+func TestUpdateReportApi(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
 	build := testBuild(1)
 	c.client.UploadBuild(build)
 
-	crash := testCrash(build, 1)
-	c.client.ReportCrash(crash)
-	rep := c.client.pollBug()
+	// Report a crash.
+	c.client.ReportCrash(testCrashWithRepro(build, 1))
+	c.client.pollBug()
 
-	closed, _ := c.client.ReportingPollClosed([]string{rep.ID})
+	listResp, err := c.client.BugList()
+	c.expectOK(err)
+	c.expectEQ(len(listResp.List), 1)
+
+	// Load the bug info.
+	bugID := listResp.List[0]
+	rep, err := c.client.LoadBug(bugID)
+	c.expectOK(err)
+
+	// Now update the crash.
+	setGuiltyFiles := []string{"fs/a.c", "net/b.c"}
+	err = c.client.UpdateReport(&dashapi.UpdateReportReq{
+		BugID:       bugID,
+		CrashID:     rep.CrashID,
+		GuiltyFiles: &setGuiltyFiles,
+	})
+	c.expectOK(err)
+
+	// And make sure it's been updated.
+	ret, err := c.client.LoadBug(bugID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ret.ReportElements == nil {
+		t.Fatalf("ReportElements is nil")
+	}
+	if diff := cmp.Diff(ret.ReportElements.GuiltyFiles, setGuiltyFiles); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestReportDecommissionedBugs(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.makeClient(clientTestDecomm, keyTestDecomm, true)
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	crash := testCrash(build, 1)
+	client.ReportCrash(crash)
+	rep := client.pollBug()
+
+	closed, _ := client.ReportingPollClosed([]string{rep.ID})
 	c.expectEQ(len(closed), 0)
 
 	// And now let's decommission the namespace.
 	config.Namespaces[rep.Namespace].Decommissioned = true
 	defer func() { config.Namespaces[rep.Namespace].Decommissioned = false }()
 
-	closed, _ = c.client.ReportingPollClosed([]string{rep.ID})
+	closed, _ = client.ReportingPollClosed([]string{rep.ID})
 	c.expectEQ(len(closed), 1)
 	c.expectEQ(closed[0], rep.ID)
 }

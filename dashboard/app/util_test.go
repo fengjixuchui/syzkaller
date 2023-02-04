@@ -25,7 +25,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"golang.org/x/net/context"
-	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/aetest"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
@@ -39,6 +38,7 @@ type Ctx struct {
 	ctx          context.Context
 	mockedTime   time.Time
 	emailSink    chan *aemail.Message
+	contextVars  map[interface{}]interface{}
 	client       *apiClient
 	client2      *apiClient
 	publicClient *apiClient
@@ -68,23 +68,24 @@ func NewCtx(t *testing.T) *Ctx {
 		t.Fatal(err)
 	}
 	c := &Ctx{
-		t:          t,
-		inst:       inst,
-		ctx:        appengine.NewContext(r),
-		mockedTime: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
-		emailSink:  make(chan *aemail.Message, 100),
+		t:           t,
+		inst:        inst,
+		mockedTime:  time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+		contextVars: make(map[interface{}]interface{}),
+		emailSink:   make(chan *aemail.Message, 100),
 	}
 	c.client = c.makeClient(client1, password1, true)
 	c.client2 = c.makeClient(client2, password2, true)
 	c.publicClient = c.makeClient(clientPublicEmail, keyPublicEmail, true)
-	registerContext(r, c)
+	c.ctx = registerRequest(r, c).Context()
+
 	return c
 }
 
 func (c *Ctx) expectOK(err error) {
 	if err != nil {
 		c.t.Helper()
-		c.t.Fatal(err)
+		c.t.Fatalf("expected OK, got error: %v", err)
 	}
 }
 
@@ -230,7 +231,14 @@ func (c *Ctx) POST(url, body string) ([]byte, error) {
 // ContentType returns the response Content-Type header value.
 func (c *Ctx) ContentType(url string) (string, error) {
 	w, err := c.httpRequest("HEAD", url, "", AccessAdmin)
-	return (w.Header()["Content-Type"][0]), err
+	if err != nil {
+		return "", err
+	}
+	values := w.Header()["Content-Type"]
+	if len(values) == 0 {
+		return "", fmt.Errorf("no Content-Type")
+	}
+	return values[0], nil
 }
 
 func (c *Ctx) httpRequest(method, url, body string, access AccessLevel) (*httptest.ResponseRecorder, error) {
@@ -239,7 +247,7 @@ func (c *Ctx) httpRequest(method, url, body string, access AccessLevel) (*httpte
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	registerContext(r, c)
+	r = registerRequest(r, c)
 	if access == AccessAdmin || access == AccessUser {
 		user := &user.User{
 			Email:      "user@syzkaller.com",
@@ -367,7 +375,12 @@ type apiClient struct {
 
 func (c *Ctx) makeClient(client, key string, failOnErrors bool) *apiClient {
 	doer := func(r *http.Request) (*http.Response, error) {
-		registerContext(r, c)
+		r = registerRequest(r, c)
+		newCtx := r.Context()
+		for key, val := range c.contextVars {
+			newCtx = context.WithValue(newCtx, key, val)
+		}
+		r = r.WithContext(newCtx)
 		w := httptest.NewRecorder()
 		http.DefaultServeMux.ServeHTTP(w, r)
 		res := &http.Response{
@@ -542,26 +555,33 @@ func initMocks() {
 
 // Machinery to associate mocked time with requests.
 type RequestMapping struct {
-	c   context.Context
+	id  int
 	ctx *Ctx
 }
 
 var (
 	requestMu       sync.Mutex
+	requestNum      int
 	requestContexts []RequestMapping
 )
 
-func registerContext(r *http.Request, c *Ctx) {
+func registerRequest(r *http.Request, c *Ctx) *http.Request {
 	requestMu.Lock()
 	defer requestMu.Unlock()
-	requestContexts = append(requestContexts, RequestMapping{appengine.NewContext(r), c})
+
+	requestNum++
+	newContext := context.WithValue(r.Context(), requestIDKey, requestNum)
+	newRequest := r.WithContext(newContext)
+	requestContexts = append(requestContexts, RequestMapping{requestNum, c})
+	return newRequest
 }
 
 func getRequestContext(c context.Context) *Ctx {
 	requestMu.Lock()
 	defer requestMu.Unlock()
+	reqID := getRequestID(c)
 	for _, m := range requestContexts {
-		if reflect.DeepEqual(c, m.c) {
+		if m.id == reqID {
 			return m.ctx
 		}
 	}
@@ -580,4 +600,14 @@ func unregisterContext(c *Ctx) {
 		n++
 	}
 	requestContexts = requestContexts[:n]
+}
+
+const requestIDKey = "test_request_id"
+
+func getRequestID(c context.Context) int {
+	val, ok := c.Value(requestIDKey).(int)
+	if !ok {
+		panic("the context did not come from a test")
+	}
+	return val
 }

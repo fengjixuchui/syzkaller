@@ -38,6 +38,7 @@ func initAPIHandlers() {
 var apiHandlers = map[string]APIHandler{
 	"log_error":             apiLogError,
 	"job_poll":              apiJobPoll,
+	"job_reset":             apiJobReset,
 	"job_done":              apiJobDone,
 	"reporting_poll_bugs":   apiReportingPollBugs,
 	"reporting_poll_notifs": apiReportingPollNotifications,
@@ -60,6 +61,7 @@ var apiNamespaceHandlers = map[string]APINamespaceHandler{
 	"upload_commits":      apiUploadCommits,
 	"bug_list":            apiBugList,
 	"load_bug":            apiLoadBug,
+	"update_report":       apiUpdateReport,
 	"add_build_assets":    apiAddBuildAssets,
 }
 
@@ -366,12 +368,23 @@ func apiJobPoll(c context.Context, r *http.Request, payload []byte) (interface{}
 	return pollPendingJobs(c, req.Managers)
 }
 
+// nolint: dupl
 func apiJobDone(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
 	req := new(dashapi.JobDoneReq)
 	if err := json.Unmarshal(payload, req); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
 	}
 	err := doneJob(c, req)
+	return nil, err
+}
+
+// nolint: dupl
+func apiJobReset(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
+	req := new(dashapi.JobResetReq)
+	if err := json.Unmarshal(payload, req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
+	}
+	err := resetJobs(c, req)
 	return nil, err
 }
 
@@ -745,7 +758,7 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 		bug.NumCrashes%20 == 0 ||
 		!stringInList(bug.MergedTitles, req.Title)
 	if save {
-		newSubsystems = detectCrashSubsystems(req, build)
+		newSubsystems = detectCrashSubsystems(c, req, build)
 		log.Infof(c, "determined subsystems: %q", newSubsystems)
 		if err := saveCrash(c, ns, req, bug, bugKey, build, assets); err != nil {
 			return nil, err
@@ -808,7 +821,13 @@ func parseCrashAssets(c context.Context, req *dashapi.Crash) ([]Asset, error) {
 	return assets, nil
 }
 
-func detectCrashSubsystems(req *dashapi.Crash, build *Build) []string {
+const overrideSubsystemsKey = "set_subsystems"
+
+func detectCrashSubsystems(c context.Context, req *dashapi.Crash, build *Build) []string {
+	val, ok := c.Value(overrideSubsystemsKey).([]string)
+	if ok {
+		return val
+	}
 	if build.OS == targets.Linux {
 		extractor := subsystem.MakeLinuxSubsystemExtractor()
 		return extractor.Extract(&subsystem.Crash{
@@ -1096,6 +1115,36 @@ func apiBugList(c context.Context, ns string, r *http.Request, payload []byte) (
 	return resp, nil
 }
 
+func apiUpdateReport(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
+	req := new(dashapi.UpdateReportReq)
+	if err := json.Unmarshal(payload, req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
+	}
+	bug := new(Bug)
+	bugKey := db.NewKey(c, "Bug", req.BugID, 0, nil)
+	if err := db.Get(c, bugKey, bug); err != nil {
+		return nil, fmt.Errorf("failed to get bug: %v", err)
+	}
+	if bug.Namespace != ns {
+		return nil, fmt.Errorf("no such bug")
+	}
+	tx := func(c context.Context) error {
+		crash := new(Crash)
+		crashKey := db.NewKey(c, "Crash", "", req.CrashID, bugKey)
+		if err := db.Get(c, crashKey, crash); err != nil {
+			return fmt.Errorf("failed to query the crash: %v", err)
+		}
+		if req.GuiltyFiles != nil {
+			crash.ReportElements.GuiltyFiles = *req.GuiltyFiles
+		}
+		if _, err := db.Put(c, crashKey, crash); err != nil {
+			return fmt.Errorf("failed to put reported crash: %v", err)
+		}
+		return nil
+	}
+	return nil, db.RunInTransaction(c, tx, &db.TransactionOptions{Attempts: 5})
+}
+
 func apiLoadBug(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
 	req := new(dashapi.LoadBugReq)
 	if err := json.Unmarshal(payload, req); err != nil {
@@ -1108,9 +1157,6 @@ func apiLoadBug(c context.Context, ns string, r *http.Request, payload []byte) (
 	}
 	if bug.Namespace != ns {
 		return nil, fmt.Errorf("no such bug")
-	}
-	if bug.sanitizeAccess(AccessPublic) > AccessPublic {
-		return nil, nil
 	}
 	return loadBugReport(c, bug)
 }

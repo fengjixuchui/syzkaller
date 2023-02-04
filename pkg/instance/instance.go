@@ -36,6 +36,8 @@ type Env interface {
 type env struct {
 	cfg           *mgrconfig.Config
 	optionalFlags bool
+	buildSem      *Semaphore
+	testSem       *Semaphore
 }
 
 type BuildKernelConfig struct {
@@ -48,7 +50,7 @@ type BuildKernelConfig struct {
 	KernelConfig []byte
 }
 
-func NewEnv(cfg *mgrconfig.Config) (Env, error) {
+func NewEnv(cfg *mgrconfig.Config, buildSem, testSem *Semaphore) (Env, error) {
 	if !vm.AllowsOvercommit(cfg.Type) {
 		return nil, fmt.Errorf("test instances are not supported for %v VMs", cfg.Type)
 	}
@@ -67,11 +69,17 @@ func NewEnv(cfg *mgrconfig.Config) (Env, error) {
 	env := &env{
 		cfg:           cfg,
 		optionalFlags: true,
+		buildSem:      buildSem,
+		testSem:       testSem,
 	}
 	return env, nil
 }
 
 func (env *env) BuildSyzkaller(repoURL, commit string) (string, error) {
+	if env.buildSem != nil {
+		env.buildSem.Wait()
+		defer env.buildSem.Signal()
+	}
 	cfg := env.cfg
 	srcIndex := strings.LastIndex(cfg.Syzkaller, "/src/")
 	if srcIndex == -1 {
@@ -126,6 +134,10 @@ func (env *env) BuildSyzkaller(repoURL, commit string) (string, error) {
 
 func (env *env) BuildKernel(buildCfg *BuildKernelConfig) (
 	string, build.ImageDetails, error) {
+	if env.buildSem != nil {
+		env.buildSem.Wait()
+		defer env.buildSem.Signal()
+	}
 	imageDir := filepath.Join(env.cfg.Workdir, "image")
 	params := build.Params{
 		TargetOS:     env.cfg.TargetOS,
@@ -225,6 +237,10 @@ func (err *CrashError) Error() string {
 // TestError is returned if there is a problem with kernel/image (crash, reboot loop, etc).
 // CrashError is returned if the reproducer crashes kernel.
 func (env *env) Test(numVMs int, reproSyz, reproOpts, reproC []byte) ([]EnvTestResult, error) {
+	if env.testSem != nil {
+		env.testSem.Wait()
+		defer env.testSem.Signal()
+	}
 	if err := mgrconfig.Complete(env.cfg); err != nil {
 		return nil, err
 	}
@@ -535,4 +551,38 @@ var MakeBin = func() string {
 func RunnerCmd(prog, fwdAddr, os, arch string, poolIdx, vmIdx int, threaded, newEnv bool) string {
 	return fmt.Sprintf("%s -addr=%s -os=%s -arch=%s -pool=%d -vm=%d "+
 		"-threaded=%t -new-env=%t", prog, fwdAddr, os, arch, poolIdx, vmIdx, threaded, newEnv)
+}
+
+type Semaphore struct {
+	ch chan struct{}
+}
+
+func NewSemaphore(count int) *Semaphore {
+	s := &Semaphore{
+		ch: make(chan struct{}, count),
+	}
+	for i := 0; i < count; i++ {
+		s.Signal()
+	}
+	return s
+}
+
+func (s *Semaphore) Wait() {
+	<-s.ch
+}
+
+func (s *Semaphore) WaitC() <-chan struct{} {
+	return s.ch
+}
+
+func (s *Semaphore) Available() int {
+	return len(s.ch)
+}
+
+func (s *Semaphore) Signal() {
+	if av := s.Available(); av == cap(s.ch) {
+		// Not super reliable, but let it be here just in case.
+		panic(fmt.Sprintf("semaphore capacity (%d) is exceeded (%d)", cap(s.ch), av))
+	}
+	s.ch <- struct{}{}
 }

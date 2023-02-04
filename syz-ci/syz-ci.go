@@ -111,6 +111,9 @@ type Config struct {
 	Managers     []*ManagerConfig `json:"managers"`
 	// Poll period for jobs in seconds (optional, defaults to 10 seconds)
 	JobPollPeriod int `json:"job_poll_period"`
+	// Set up a second (parallel) job processor to speed up processing.
+	// For now, this second job processor only handles patch testing requests.
+	ParallelJobs bool `json:"parallel_jobs"`
 	// Poll period for commits in seconds (optional, defaults to 3600 seconds)
 	CommitPollPeriod int `json:"commit_poll_period"`
 	// Asset Storage config.
@@ -181,6 +184,19 @@ type ManagerJobs struct {
 	BisectFix   bool `json:"bisect_fix"`   // do fix bisection
 }
 
+func (m *ManagerJobs) AnyEnabled() bool {
+	return m.TestPatches || m.PollCommits || m.BisectCause || m.BisectFix
+}
+
+func (m *ManagerJobs) Filter(filter *ManagerJobs) *ManagerJobs {
+	return &ManagerJobs{
+		TestPatches: m.TestPatches && filter.TestPatches,
+		PollCommits: m.PollCommits && filter.PollCommits,
+		BisectCause: m.BisectCause && filter.BisectCause,
+		BisectFix:   m.BisectFix && filter.BisectFix,
+	}
+}
+
 func main() {
 	flag.Parse()
 	log.EnableLogCaching(1000, 1<<20)
@@ -211,19 +227,7 @@ func main() {
 		}()
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
 	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-shutdownPending:
-		case <-updatePending:
-		}
-		kernelBuildSem <- struct{}{} // wait for all current builds
-		close(stop)
-		wg.Done()
-	}()
-
 	var managers []*Manager
 	for _, mgrcfg := range cfg.Managers {
 		mgr, err := createManager(cfg, mgrcfg, stop, *flagDebug)
@@ -236,6 +240,7 @@ func main() {
 	if len(managers) == 0 {
 		log.Fatalf("failed to create all managers")
 	}
+	var wg sync.WaitGroup
 	if *flagManagers {
 		for _, mgr := range managers {
 			mgr := mgr
@@ -246,15 +251,11 @@ func main() {
 			}()
 		}
 	}
-	jp, err := newJobProcessor(cfg, managers, stop, shutdownPending)
+	jp, err := newJobManager(cfg, managers, shutdownPending)
 	if err != nil {
 		log.Fatalf("failed to create dashapi connection %v", err)
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		jp.loop()
-	}()
+	stopJobs := jp.startLoop(&wg)
 
 	// For testing. Racy. Use with care.
 	http.HandleFunc("/upload_cover", func(w http.ResponseWriter, r *http.Request) {
@@ -269,11 +270,18 @@ func main() {
 
 	wg.Add(1)
 	go deprecateAssets(cfg, stop, &wg)
-	wg.Wait()
 
 	select {
 	case <-shutdownPending:
 	case <-updatePending:
+	}
+	stopJobs() // Gracefully wait for the running jobs to finish.
+	close(stop)
+	wg.Wait()
+
+	select {
+	case <-shutdownPending:
+	default:
 		updater.UpdateAndRestart()
 	}
 }
@@ -393,9 +401,7 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	if mgr.Branch == "" {
 		mgr.Branch = "master"
 	}
-	if (mgr.Jobs.TestPatches || mgr.Jobs.PollCommits ||
-		mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) &&
-		(cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
+	if mgr.Jobs.AnyEnabled() && (cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
 		return fmt.Errorf("manager %v: has jobs but no dashboard info", mgr.Name)
 	}
 	if mgr.Jobs.PollCommits && (cfg.DashboardAddr == "" || mgr.DashboardClient == "") {

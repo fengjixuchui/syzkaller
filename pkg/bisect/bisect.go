@@ -31,6 +31,8 @@ type Config struct {
 	Syzkaller       SyzkallerConfig
 	Repro           ReproConfig
 	Manager         *mgrconfig.Config
+	BuildSemaphore  *instance.Semaphore
+	TestSemaphore   *instance.Semaphore
 }
 
 type KernelConfig struct {
@@ -120,7 +122,7 @@ func Run(cfg *Config) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	inst, err := instance.NewEnv(cfg.Manager)
+	inst, err := instance.NewEnv(cfg.Manager, cfg.BuildSemaphore, cfg.TestSemaphore)
 	if err != nil {
 		return nil, err
 	}
