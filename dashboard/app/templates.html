@@ -58,11 +58,15 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<tr>
 				<td class="navigation">
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}'>
-						<span style="color:DeepPink;">🐞</span> Open [{{$.Cached.Open}}]</a>
-					<a class="navigation_tab{{if eq .URLPath (printf "/%v/fixed" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/fixed'>
-						<span style="color:ForestGreen;">🐞</span> Fixed [{{$.Cached.Fixed}}]</a>
+						<span style="color:DeepPink;">🐞</span> Open [{{$.BugCounts.Open}}]</a>
+					{{if .ShowSubsystems}}
+					<a class="navigation_tab{{if eq .URLPath (printf "/%v/subsystems" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/subsystems'>
+						<span style="color:DeepPink;">≡</span> Subsystems</a>
+					{{end}}
+                                        <a class="navigation_tab{{if eq .URLPath (printf "/%v/fixed" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/fixed'>
+						<span style="color:ForestGreen;">🐞</span> Fixed [{{$.BugCounts.Fixed}}]</a>
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/invalid" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/invalid'>
-						<span style="color:RoyalBlue;">🐞</span> Invalid [{{$.Cached.Invalid}}]</a>
+						<span style="color:RoyalBlue;">🐞</span> Invalid [{{$.BugCounts.Invalid}}]</a>
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/bugs" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/bugs'>
 						<span style="color:DarkOrange;">📈</span> Kernel Health</a>
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/lifetimes" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/lifetimes'>
@@ -72,11 +76,37 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/crashes" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/crashes'>
 						<span style="color:DarkOrange;">📈</span> Crashes</a> 
 				</td>
+                                {{if .ContactEmail}}
+				<td class="navigation-right">
+					<a class="navigation_tab" href='mailto:{{.ContactEmail}}'>
+						<span style="color:ForestGreen;">💬</span> Send us feedback</a>
+				</td>
+                                {{end}}
 			</tr>
 		</table>
 		{{end}}
 	</header>
 	<br>
+{{end}}
+
+{{/* List of enabled filters, invoked with *uiBugFilter */}}
+{{define "bug_filter"}}
+{{if .Filter.Any}}
+	<b>Applied filters: </b>
+	{{if .Filter.Manager}}
+		Manager={{.Filter.Manager}} ({{link (call .DropURL "manager") "drop"}})
+	{{end}}
+	{{if .Filter.OnlyManager}}
+		Only Manager={{.Filter.OnlyManager}} ({{link (call .DropURL "only_manager") "drop"}})
+	{{end}}
+	{{if .Filter.Subsystem}}
+		Subsystem={{.Filter.Subsystem}} ({{link (call .DropURL "subsystem") "drop"}})
+	{{end}}
+	{{if .Filter.NoSubsystem}}
+		NoSubsystem={{.Filter.NoSubsystem}} ({{link (call .DropURL "no_subsystem") "drop"}})
+	{{end}}
+	<br>
+{{end}}
 {{end}}
 
 {{/* List of bugs, invoked with *uiBugGroup */}}
@@ -275,7 +305,7 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 		{{else if eq .Type $fixJob}}
 			<b>Fix bisection: failed</b>
 		{{end}}
-		<b>({{link .LogLink "bisect log"}})</b><br>
+		<b>({{link .ErrorLink "error log"}}{{if .LogLink}}, {{link .LogLink "bisect log"}}{{end}})</b><br>
 	{{else if .Commit}}
 		{{if eq .Type $causeJob}}
 			<b>Cause bisection: introduced by</b>

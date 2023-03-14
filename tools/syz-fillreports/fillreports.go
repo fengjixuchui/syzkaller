@@ -37,17 +37,22 @@ func main() {
 	}
 	workItems := loadBugReports(dash, resp.List)
 	for item := range workItems {
-		processReport(dash, item)
+		processReport(dash, item.report, item.bugID)
 	}
 }
 
-func processReport(dash *dashapi.Dashboard, bugReport *dashapi.BugReport) {
+func processReport(dash *dashapi.Dashboard, bugReport *dashapi.BugReport, bugID string) {
 	if bugReport.ReportElements != nil && len(bugReport.ReportElements.GuiltyFiles) > 0 {
 		log.Printf("%v: already has guilty files", bugReport.ID)
 		return
 	}
-	if bugReport.BugStatus != dashapi.BugStatusOpen {
-		log.Printf("%v: status != BugStatusOpen", bugReport.ID)
+	if bugReport.BugStatus != dashapi.BugStatusOpen &&
+		bugReport.BugStatus != dashapi.BugStatusFixed {
+		log.Printf("%v: status is not BugStatusOpen or BugStatusFixed", bugReport.ID)
+		return
+	}
+	if bugReport.OS == "" || bugReport.Arch == "" {
+		log.Printf("%v: OS or Arch is empty", bugReport.ID)
 		return
 	}
 	cfg := &mgrconfig.Config{
@@ -62,32 +67,15 @@ func processReport(dash *dashapi.Dashboard, bugReport *dashapi.BugReport) {
 		log.Fatalf("%v: failed to create a reporter for %s/%s",
 			bugReport.ID, bugReport.OS, bugReport.Arch)
 	}
-	rep := reporter.Parse(bugReport.Log)
-	if rep == nil {
-		log.Printf("%v: no crash is detected", bugReport.ID)
-		return
-	}
-	// In order to extract a guilty path, the report needs to be normally symbolized,
-	// and for symbolization we need the kernel object file (e.g. vmlinux) for the
-	// kernel, on which the crash was triggered.
-	// We do not have it for all our crashes, but we can do a hack here -- we already
-	// have a symbolized report on the dashboard, so we can substitute it into the
-	// partially processed Report object. This is not the most robust solution, as
-	// it relies on the internals of how the `Symbolize` method works, but it's short
-	// and works now, and furthermore we do not really have other options.
-	rep.Report = bugReport.Report
-	err = reporter.Symbolize(rep)
-	if err != nil {
-		log.Printf("%v: symbolize failed: %v", bugReport.ID, err)
-	}
-	if rep.GuiltyFile == "" {
+	guiltyFile := reporter.ReportToGuiltyFile(bugReport.Title, bugReport.Report)
+	if guiltyFile == "" {
 		log.Printf("%v: no guilty files extracted", bugReport.ID)
 		return
 	}
 	err = dash.UpdateReport(&dashapi.UpdateReportReq{
-		BugID:       bugReport.ID,
+		BugID:       bugID,
 		CrashID:     bugReport.CrashID,
-		GuiltyFiles: &[]string{rep.GuiltyFile},
+		GuiltyFiles: &[]string{guiltyFile},
 	})
 	if err != nil {
 		log.Printf("%v: failed to save: %v", bugReport.ID, err)
@@ -95,13 +83,18 @@ func processReport(dash *dashapi.Dashboard, bugReport *dashapi.BugReport) {
 	log.Printf("%v: updated", bugReport.ID)
 }
 
-func loadBugReports(dash *dashapi.Dashboard, IDs []string) <-chan *dashapi.BugReport {
+type workItem struct {
+	report *dashapi.BugReport
+	bugID  string
+}
+
+func loadBugReports(dash *dashapi.Dashboard, IDs []string) <-chan *workItem {
 	const (
 		threads = 8
 		logStep = 100
 	)
 	ids := make(chan string)
-	ret := make(chan *dashapi.BugReport)
+	ret := make(chan *workItem)
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
@@ -116,7 +109,10 @@ func loadBugReports(dash *dashapi.Dashboard, IDs []string) <-chan *dashapi.BugRe
 				if resp.ID == "" {
 					continue
 				}
-				ret <- resp
+				ret <- &workItem{
+					report: resp,
+					bugID:  id,
+				}
 			}
 		}()
 	}

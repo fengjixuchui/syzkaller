@@ -77,6 +77,7 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		regexp.MustCompile(`^arch/.*/mm/fault.c`),
 		regexp.MustCompile(`^arch/.*/mm/physaddr.c`),
 		regexp.MustCompile(`^arch/.*/kernel/stacktrace.c`),
+		regexp.MustCompile(`^arch/.*/kernel/apic/apic.c`),
 		regexp.MustCompile(`^arch/arm64/kernel/entry.*.c`),
 		regexp.MustCompile(`^kernel/locking/.*`),
 		regexp.MustCompile(`^kernel/panic.c`),
@@ -114,8 +115,6 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		[]byte("FAULT_FLAG_ALLOW_RETRY missing"),
 	}
 	suppressions := []string{
-		"fatal error: runtime: out of memory",
-		"fatal error: runtime: cannot allocate memory",
 		"panic: failed to start executor binary",
 		"panic: executor failed: pthread_create failed",
 		"panic: failed to create temp dir",
@@ -691,14 +690,18 @@ func (ctx *linux) decompileOpcodes(text []byte, report *Report) []byte {
 }
 
 func (ctx *linux) extractGuiltyFile(rep *Report) string {
-	report := rep.Report[rep.reportPrefixLen:]
-	if strings.HasPrefix(rep.Title, "INFO: rcu detected stall") {
+	return ctx.extractGuiltyFileRaw(rep.Title, rep.Report[rep.reportPrefixLen:])
+}
+
+func (ctx *linux) extractGuiltyFileRaw(title string, report []byte) string {
+	if strings.HasPrefix(title, "INFO: rcu detected stall") {
 		// Special case for rcu stalls.
 		// There are too many frames that we want to skip before actual guilty frames,
 		// we would need to ignore too many files and that would be fragile.
 		// So instead we try to extract guilty file starting from the known
 		// interrupt entry point first.
-		for _, interruptEnd := range []string{" apic_timer_interrupt+0x", "Exception stack"} {
+		for _, interruptEnd := range []string{"apic_timer_interrupt+0x",
+			"el1h_64_irq+0x", "Exception stack"} {
 			if pos := bytes.Index(report, []byte(interruptEnd)); pos != -1 {
 				if file := ctx.extractGuiltyFileImpl(report[pos:]); file != "" {
 					return file
@@ -730,10 +733,9 @@ func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
 		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(scanner.Bytes()) {
 			continue
 		}
-		guilty = string(file)
+		guilty = filepath.Clean(string(file))
 		break
 	}
-	guilty = filepath.Clean(guilty)
 
 	// Search for deeper filepaths in the stack trace below the first possible guilty file.
 	deepestPath := filepath.Dir(guilty)
@@ -927,6 +929,7 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("sysenter_dispatch"), // syscall entry
 	compile("tracesys_phase2"),   // syscall entry
 	compile("el0_svc_handler"),   // syscall entry
+	compile("invoke_syscall"),    // syscall entry
 	compile("ret_fast_syscall"),  // arm syscall entry
 	compile("netif_receive_skb"), // net receive entry point
 	compile("do_softirq"),
@@ -984,6 +987,7 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("^compat_sock_ioctl"),
 	compile("^nfnetlink_rcv_msg"),
 	compile("^rtnetlink_rcv_msg"),
+	compile("^netlink_dump"),
 	compile("^(sys_)?(socketpair|connect|ioctl)"),
 	// Page fault entry points:
 	compile("__do_fault"),
@@ -1063,10 +1067,7 @@ var linuxStackParams = &stackParams{
 		"warn_bogus",
 		"__warn",
 		"alloc_page",
-		"kmalloc",
-		"kvmalloc",
-		"kcalloc",
-		"kzalloc",
+		"k?v?(?:m|z|c)alloc",
 		"krealloc",
 		"kmem_cache",
 		"allocate_slab",
@@ -1137,6 +1138,10 @@ var linuxStackParams = &stackParams{
 		"strndup",
 		"copy_to_user",
 		"copy_from_user",
+		"copy_to_iter",
+		"copy_from_iter",
+		"^copyin$",
+		"^copyout$",
 		"put_user",
 		"get_user",
 		"might_fault",
@@ -1562,8 +1567,7 @@ var linuxOopses = append([]*oops{
 						compile("backtrace:"),
 						parseStackTrace,
 					},
-					skip: []string{"kmemleak", "kmalloc", "kcalloc", "kzalloc",
-						"vmalloc", "mmap", "kmem", "slab", "alloc", "create_object",
+					skip: []string{"kmemleak", "mmap", "kmem", "slab", "alloc", "create_object",
 						"idr_get", "list_lru_init", "kasprintf", "kvasprintf",
 						"pcpu_create", "strdup", "strndup", "memdup"},
 				},
@@ -1667,13 +1671,12 @@ var linuxOopses = append([]*oops{
 			{
 				title: compile("WARNING: .*mm/.*\\.c.* k?.?malloc"),
 				fmt:   "WARNING: kmalloc bug in %[1]v",
-				stack: warningStackFmt("kmalloc", "kcalloc", "kzalloc", "krealloc",
-					"vmalloc", "slab", "kmem"),
+				stack: warningStackFmt("kmalloc", "krealloc", "slab", "kmem"),
 			},
 			{
 				title: compile("WARNING: .*mm/vmalloc.c.*__vmalloc_node"),
 				fmt:   "WARNING: zero-size vmalloc in %[1]v",
-				stack: warningStackFmt("vmalloc"),
+				stack: warningStackFmt(),
 			},
 			{
 				title: compile("WARNING: .* usb_submit_urb"),
@@ -1742,8 +1745,7 @@ var linuxOopses = append([]*oops{
 						linuxCallTrace,
 						parseStackTrace,
 					},
-					skip: []string{"rcu", "kmem", "slab", "kmalloc",
-						"vmalloc", "kcalloc", "kzalloc"},
+					skip: []string{"rcu", "kmem", "slab"},
 				},
 			},
 			{
@@ -1836,7 +1838,7 @@ var linuxOopses = append([]*oops{
 						parseStackTrace,
 					},
 					parts2: []*regexp.Regexp{
-						compile("(?:apic_timer_interrupt|Exception stack)"),
+						compile("(?:apic_timer_interrupt|Exception stack|el1h_64_irq)"),
 						parseStackTrace,
 					},
 					skip:      []string{"apic_timer_interrupt", "rcu"},
@@ -1863,8 +1865,7 @@ var linuxOopses = append([]*oops{
 						linuxCallTrace,
 						parseStackTrace,
 					},
-					skip: []string{"rcu", "kmem", "slab", "kmalloc",
-						"vmalloc", "kcalloc", "kzalloc"},
+					skip: []string{"rcu", "kmem", "slab"},
 				},
 			},
 			{
@@ -2229,7 +2230,12 @@ var linuxOopses = append([]*oops{
 				noStackTrace: true,
 			},
 		},
-		[]*regexp.Regexp{},
+		[]*regexp.Regexp{
+			// These may appear on the same line when the fuzzer reads from the console the existing
+			// boot message and then pass it as mount option, kernel then prints it back
+			// as an invalid mount option and we detect false reboot.
+			compile("Parsing ELF|Decompressing Linux"),
+		},
 	},
 	{
 		[]byte("unregister_netdevice: waiting for"),

@@ -7,13 +7,14 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -21,41 +22,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/mgrconfig"
-	"github.com/google/syzkaller/sys/targets"
 )
-
-func fixUpPCs(target string, progs []Prog, coverFilter map[uint32]uint32) []Prog {
-	if coverFilter != nil {
-		for i, prog := range progs {
-			var nPCs []uint64
-			for _, pc := range prog.PCs {
-				if coverFilter[uint32(pc)] != 0 {
-					nPCs = append(nPCs, pc)
-				}
-			}
-			progs[i].PCs = nPCs
-		}
-	}
-
-	// On arm64 as PLT is enabled by default, .text section is loaded after .plt section,
-	// so there is 0x18 bytes offset from module load address for .text section
-	// we need to remove the 0x18 bytes offset in order to correct module symbol address
-	if target == targets.ARM64 {
-		for i, prog := range progs {
-			var nPCs []uint64
-			for _, pc := range prog.PCs {
-				// TODO: avoid to hardcode the address
-				// Fix up kernel PCs, but not the test (userspace) PCs.
-				if pc >= 0x8000000000000000 && pc < 0xffffffd010000000 {
-					pc -= 0x18
-				}
-				nPCs = append(nPCs, pc)
-			}
-			progs[i].PCs = nPCs
-		}
-	}
-	return progs
-}
 
 func (rg *ReportGenerator) DoHTML(w io.Writer, progs []Prog, coverFilter map[uint32]uint32) error {
 	progs = fixUpPCs(rg.target.Arch, progs, coverFilter)
@@ -150,6 +117,66 @@ func (rg *ReportGenerator) DoHTML(w io.Writer, progs []Prog, coverFilter map[uin
 
 	processDir(d.Root)
 	return coverTemplate.Execute(w, d)
+}
+
+type lineCoverExport struct {
+	Module    string `json:",omitempty"`
+	Filename  string
+	Covered   []int `json:",omitempty"`
+	Uncovered []int `json:",omitempty"`
+	Both      []int `json:",omitempty"`
+}
+
+func (rg *ReportGenerator) DoLineJSON(w io.Writer, progs []Prog, coverFilter map[uint32]uint32) error {
+	progs = fixUpPCs(rg.target.Arch, progs, coverFilter)
+	files, err := rg.prepareFileMap(progs)
+	if err != nil {
+		return err
+	}
+	var entries []lineCoverExport
+	for _, file := range files {
+		lines, err := parseFile(file.filename)
+		if err != nil {
+			// Ignore and continue onto the next file.
+			continue
+		}
+		entries = append(entries, fileLineContents(file, lines))
+	}
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "\t")
+	if err := encoder.Encode(entries); err != nil {
+		return fmt.Errorf("encoding [%v] entries failed: %v", len(entries), err)
+	}
+	return nil
+}
+
+func fileLineContents(file *file, lines [][]byte) lineCoverExport {
+	lce := lineCoverExport{
+		Module:   file.module,
+		Filename: file.filename,
+	}
+	lineCover := perLineCoverage(file.covered, file.uncovered)
+	for i, ln := range lines {
+		start := 0
+		cover := append(lineCover[i+1], lineCoverChunk{End: backend.LineEnd})
+		for _, cov := range cover {
+			end := cov.End - 1
+			if end > len(ln) {
+				end = len(ln)
+			}
+			if end == start {
+				continue
+			}
+			if cov.Covered && cov.Uncovered {
+				lce.Both = append(lce.Both, i+1)
+			} else if cov.Covered {
+				lce.Covered = append(lce.Covered, i+1)
+			} else if cov.Uncovered {
+				lce.Uncovered = append(lce.Uncovered, i+1)
+			}
+		}
+	}
+	return lce
 }
 
 func (rg *ReportGenerator) DoRawCoverFiles(w http.ResponseWriter, progs []Prog, coverFilter map[uint32]uint32) error {
@@ -535,6 +562,21 @@ func (rg *ReportGenerator) DoCSV(w io.Writer, progs []Prog, coverFilter map[uint
 	return writer.WriteAll(data)
 }
 
+func fixUpPCs(target string, progs []Prog, coverFilter map[uint32]uint32) []Prog {
+	if coverFilter != nil {
+		for i, prog := range progs {
+			var nPCs []uint64
+			for _, pc := range prog.PCs {
+				if coverFilter[uint32(pc)] != 0 {
+					nPCs = append(nPCs, pc)
+				}
+			}
+			progs[i].PCs = nPCs
+		}
+	}
+	return progs
+}
+
 func fileContents(file *file, lines [][]byte, haveProgs bool) string {
 	var buf bytes.Buffer
 	lineCover := perLineCoverage(file.covered, file.uncovered)
@@ -740,7 +782,7 @@ func percent(covered, total int) int {
 }
 
 func parseFile(fn string) ([][]byte, error) {
-	data, err := ioutil.ReadFile(fn)
+	data, err := os.ReadFile(fn)
 	if err != nil {
 		return nil, err
 	}

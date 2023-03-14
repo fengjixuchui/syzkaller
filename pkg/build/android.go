@@ -1,127 +1,86 @@
-// Copyright 2022 syzkaller project authors. All rights reserved.
+// Copyright 2023 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 package build
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
-const (
-	kernelConfig = "common/build.config.gki_kasan.x86_64"
-	moduleConfig = "common-modules/virtual-device/build.config.virtual_device_kasan.x86_64"
-)
-
 type android struct{}
 
-func (a android) runBuild(kernelDir, buildConfig string) error {
-	cmd := osutil.Command("build/build.sh")
-	cmd.Dir = kernelDir
-	cmd.Env = append(cmd.Env, "OUT_DIR=out", "DIST_DIR=dist", fmt.Sprintf("BUILD_CONFIG=%s", buildConfig))
+var ccCompilerRegexp = regexp.MustCompile(`#define\s+CONFIG_CC_VERSION_TEXT\s+"(.*)"`)
 
-	_, err := osutil.Run(time.Hour, cmd)
-	return err
-}
-
-func (a android) readCompiler(archivePath string) (string, error) {
-	f, err := os.Open(archivePath)
+func (a android) readCompiler(kernelDir string) (string, error) {
+	bytes, err := os.ReadFile(filepath.Join(kernelDir, "out", "mixed", "device-kernel", "private",
+		"gs-google", "include", "generated", "autoconf.h"))
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-
-	gr, err := gzip.NewReader(f)
-	if err != nil {
-		return "", err
+	result := ccCompilerRegexp.FindSubmatch(bytes)
+	if result == nil {
+		return "", fmt.Errorf("include/generated/autoconf.h does not contain build information")
 	}
-	defer gr.Close()
-
-	tr := tar.NewReader(gr)
-
-	h, err := tr.Next()
-	for ; err == nil; h, err = tr.Next() {
-		if filepath.Base(h.Name) == "compile.h" {
-			bytes, err := ioutil.ReadAll(tr)
-			if err != nil {
-				return "", err
-			}
-			result := linuxCompilerRegexp.FindSubmatch(bytes)
-			if result == nil {
-				return "", fmt.Errorf("include/generated/compile.h does not contain build information")
-			}
-
-			return string(result[1]), nil
-		}
-	}
-
-	return "", fmt.Errorf("archive %s doesn't contain include/generated/compile.h", archivePath)
+	return string(result[1]), nil
 }
 
 func (a android) build(params Params) (ImageDetails, error) {
 	var details ImageDetails
-
 	if params.CmdlineFile != "" {
-		return details, fmt.Errorf("cmdline file is not supported for android cuttlefish images")
+		return details, fmt.Errorf("cmdline file is not supported for android images")
 	}
 	if params.SysctlFile != "" {
-		return details, fmt.Errorf("sysctl file is not supported for android cuttlefish images")
+		return details, fmt.Errorf("sysctl file is not supported for android images")
 	}
 
-	if err := a.runBuild(params.KernelDir, kernelConfig); err != nil {
+	// Build kernel.
+	cmd := osutil.Command("./build_cloudripper.sh")
+	cmd.Dir = params.KernelDir
+	// No cloudripper kasan config; currently only slider has a kasan config.
+	defconfigFragment := filepath.Join("private", "gs-google", "build.config.slider.kasan")
+	buildTarget := "cloudripper_gki_kasan"
+	cmd.Env = append(cmd.Env, "OUT_DIR=out", "DIST_DIR=dist", fmt.Sprintf("GKI_DEFCONFIG_FRAGMENT=%v",
+		defconfigFragment), fmt.Sprintf("BUILD_TARGET=%v", buildTarget))
+
+	if _, err := osutil.Run(time.Hour, cmd); err != nil {
 		return details, fmt.Errorf("failed to build kernel: %s", err)
-	}
-	if err := a.runBuild(params.KernelDir, moduleConfig); err != nil {
-		return details, fmt.Errorf("failed to build modules: %s", err)
 	}
 
 	buildDistDir := filepath.Join(params.KernelDir, "dist")
-	bzImage := filepath.Join(buildDistDir, "bzImage")
-	vmlinux := filepath.Join(buildDistDir, "vmlinux")
-	initramfs := filepath.Join(buildDistDir, "initramfs.img")
 
-	buildOutDir := filepath.Join(params.KernelDir, "out")
-	config := filepath.Join(buildOutDir, "common", ".config")
+	vmlinux := filepath.Join(buildDistDir, "vmlinux")
+	config := filepath.Join(params.KernelDir, "out", "mixed", "device-kernel", "private", "gs-google", ".config")
 
 	var err error
-	details.CompilerID, err = a.readCompiler(filepath.Join(buildDistDir, "kernel-headers.tar.gz"))
+	details.CompilerID, err = a.readCompiler(params.KernelDir)
 	if err != nil {
-		return details, err
-	}
-
-	if err := embedFiles(params, func(mountDir string) error {
-		homeDir := filepath.Join(mountDir, "root")
-
-		if err := osutil.CopyFile(bzImage, filepath.Join(homeDir, "bzImage")); err != nil {
-			return err
-		}
-		if err := osutil.CopyFile(vmlinux, filepath.Join(homeDir, "vmlinux")); err != nil {
-			return err
-		}
-		if err := osutil.CopyFile(initramfs, filepath.Join(homeDir, "initramfs.img")); err != nil {
-			return err
-		}
-
-		return nil
-	}); err != nil {
-		return details, err
+		return details, fmt.Errorf("failed to read compiler: %v", err)
 	}
 
 	if err := osutil.CopyFile(vmlinux, filepath.Join(params.OutputDir, "obj", "vmlinux")); err != nil {
-		return details, err
+		return details, fmt.Errorf("failed to copy vmlinux: %v", err)
 	}
-	if err := osutil.CopyFile(initramfs, filepath.Join(params.OutputDir, "obj", "initrd")); err != nil {
-		return details, err
+	if err := osutil.CopyFile(config, filepath.Join(params.OutputDir, "obj", "kernel.config")); err != nil {
+		return details, fmt.Errorf("failed to copy kernel config: %v", err)
 	}
-	if err := osutil.CopyFile(config, filepath.Join(params.OutputDir, "kernel.config")); err != nil {
-		return details, err
+
+	imageFile, err := os.Create(filepath.Join(params.OutputDir, "image"))
+	if err != nil {
+		return details, fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer imageFile.Close()
+
+	if err := a.embedImages(imageFile, buildDistDir, "boot.img", "dtbo.img", "vendor_kernel_boot.img",
+		"vendor_dlkm.img"); err != nil {
+		return details, fmt.Errorf("failed to embed images: %v", err)
 	}
 
 	details.Signature, err = elfBinarySignature(vmlinux, params.Tracer)
@@ -132,6 +91,43 @@ func (a android) build(params Params) (ImageDetails, error) {
 	return details, nil
 }
 
+func (a android) embedImages(w io.Writer, srcDir string, imageNames ...string) error {
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+
+	for _, name := range imageNames {
+		path := filepath.Join(srcDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("failed to read %q: %v", name, err)
+		}
+
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0600,
+			Size: int64(len(data)),
+		}); err != nil {
+			return fmt.Errorf("failed to write header for %q: %v", name, err)
+		}
+
+		if _, err := tw.Write(data); err != nil {
+			return fmt.Errorf("failed to write data for %q: %v", name, err)
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("close archive: %v", err)
+	}
+
+	return nil
+}
+
 func (a android) clean(kernelDir, targetArch string) error {
-	return osutil.RemoveAll(filepath.Join(kernelDir, "out"))
+	if err := osutil.RemoveAll(filepath.Join(kernelDir, "out")); err != nil {
+		return fmt.Errorf("failed to clean 'out' directory: %v", err)
+	}
+	if err := osutil.RemoveAll(filepath.Join(kernelDir, "dist")); err != nil {
+		return fmt.Errorf("failed to clean 'dist' directory: %v", err)
+	}
+	return nil
 }

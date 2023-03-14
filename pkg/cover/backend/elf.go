@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/host"
@@ -17,14 +18,38 @@ import (
 
 func makeELF(target *targets.Target, objDir, srcDir, buildDir string,
 	moduleObj []string, hostModules []host.KernelModule) (*Impl, error) {
-	return makeDWARF(target, objDir, srcDir, buildDir, moduleObj, hostModules,
-		&containerFns{
-			readSymbols:           elfReadSymbols,
-			readTextData:          elfReadTextData,
-			readModuleCoverPoints: elfReadModuleCoverPoints,
-			readTextRanges:        elfReadTextRanges,
-		},
-	)
+	var pcFixUpStart, pcFixUpEnd, pcFixUpOffset uint64
+	if target.Arch == targets.ARM64 {
+		// On arm64 as PLT is enabled by default, .text section is loaded after .plt section,
+		// so there is 0x18 bytes offset from module load address for .text section
+		// we need to remove the 0x18 bytes offset in order to correct module symbol address
+		// TODO: obtain these values from the binary instead of hardcoding.
+		file, err := elf.Open(filepath.Join(objDir, target.KernelObject))
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		if file.Section(".plt") != nil {
+			pcFixUpStart = 0x8000000000000000
+			pcFixUpEnd = 0xffffffd010000000
+			pcFixUpOffset = 0x18
+		}
+	}
+	return makeDWARF(&dwarfParams{
+		target:                target,
+		objDir:                objDir,
+		srcDir:                srcDir,
+		buildDir:              buildDir,
+		moduleObj:             moduleObj,
+		hostModules:           hostModules,
+		pcFixUpStart:          pcFixUpStart,
+		pcFixUpEnd:            pcFixUpEnd,
+		pcFixUpOffset:         pcFixUpOffset,
+		readSymbols:           elfReadSymbols,
+		readTextData:          elfReadTextData,
+		readModuleCoverPoints: elfReadModuleCoverPoints,
+		readTextRanges:        elfReadTextRanges,
+	})
 }
 
 func elfReadSymbols(module *Module, info *symbolInfo) ([]*Symbol, error) {
@@ -32,6 +57,7 @@ func elfReadSymbols(module *Module, info *symbolInfo) ([]*Symbol, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 	text := file.Section(".text")
 	if text == nil {
 		return nil, fmt.Errorf("no .text section in the object file")
@@ -83,6 +109,7 @@ func elfReadTextRanges(module *Module) ([]pcRange, []*CompileUnit, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	defer file.Close()
 	text := file.Section(".text")
 	if text == nil {
 		return nil, nil, fmt.Errorf("no .text section in the object file")
@@ -126,6 +153,7 @@ func elfReadTextData(module *Module) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 	text := file.Section(".text")
 	if text == nil {
 		return nil, fmt.Errorf("no .text section in the object file")
@@ -139,6 +167,7 @@ func elfReadModuleCoverPoints(target *targets.Target, module *Module, info *symb
 	if err != nil {
 		return pcs, err
 	}
+	defer file.Close()
 	callRelocType := arches[target.Arch].callRelocType
 	relaOffset := arches[target.Arch].relaOffset
 	for _, s := range file.Sections {

@@ -22,6 +22,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/html"
+	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vcs"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
@@ -60,10 +61,13 @@ func initHTTPHandlers() {
 		http.Handle("/"+ns+"/graph/crashes", handlerWrapper(handleGraphCrashes))
 		http.Handle("/"+ns+"/repos", handlerWrapper(handleRepos))
 		http.Handle("/"+ns+"/bug-stats", handlerWrapper(handleBugStats))
+		http.Handle("/"+ns+"/subsystems", handlerWrapper(handleSubsystemsList))
+		http.Handle("/"+ns+"/s/", handlerWrapper(handleSubsystemPage))
 	}
-	http.HandleFunc("/cache_update", cacheUpdate)
-	http.HandleFunc("/deprecate_assets", handleDeprecateAssets)
-	http.HandleFunc("/retest_repros", handleRetestRepros)
+	http.HandleFunc("/cron/cache_update", cacheUpdate)
+	http.HandleFunc("/cron/deprecate_assets", handleDeprecateAssets)
+	http.HandleFunc("/cron/retest_repros", handleRetestRepros)
+	http.HandleFunc("/cron/refresh_subsystems", handleRefreshSubsystems)
 }
 
 type uiMainPage struct {
@@ -71,7 +75,23 @@ type uiMainPage struct {
 	Now            time.Time
 	Decommissioned bool
 	Managers       *uiManagerList
+	BugFilter      *uiBugFilter
 	Groups         []*uiBugGroup
+}
+
+type uiBugFilter struct {
+	Filter  *userBugFilter
+	DropURL func(string) string
+}
+
+func makeUIBugFilter(c context.Context, filter *userBugFilter) *uiBugFilter {
+	url := getCurrentURL(c)
+	return &uiBugFilter{
+		Filter: filter,
+		DropURL: func(name string) string {
+			return html.AmendURL(url, name, "")
+		},
+	}
 }
 
 type uiManagerList struct {
@@ -87,10 +107,11 @@ func makeManagerList(managers []*uiManager, ns string) *uiManagerList {
 }
 
 type uiTerminalPage struct {
-	Header *uiHeader
-	Now    time.Time
-	Bugs   *uiBugGroup
-	Stats  *uiBugStats
+	Header    *uiHeader
+	Now       time.Time
+	Bugs      *uiBugGroup
+	Stats     *uiBugStats
+	BugFilter *uiBugFilter
 }
 
 type uiBugStats struct {
@@ -124,6 +145,35 @@ type uiRepo struct {
 	URL    string
 	Branch string
 	Alias  string
+}
+
+type uiSubsystemPage struct {
+	Header   *uiHeader
+	Info     *uiSubsystem
+	Children []*uiSubsystem
+	Parents  []*uiSubsystem
+	Groups   []*uiBugGroup
+}
+
+type uiSubsystemsPage struct {
+	Header       *uiHeader
+	List         []*uiSubsystem
+	Unclassified *uiSubsystem
+	SomeHidden   bool
+	ShowAllURL   string
+}
+
+type uiSubsystem struct {
+	Name        string
+	Lists       string
+	Maintainers string
+	Open        uiSubsystemStats
+	Fixed       uiSubsystemStats
+}
+
+type uiSubsystemStats struct {
+	Count int
+	Link  string
 }
 
 type uiAdminPage struct {
@@ -190,6 +240,7 @@ type uiBugPage struct {
 	Crashes       *uiCrashTable
 	FixBisections *uiCrashTable
 	TestPatchJobs *uiJobList
+	Subsystems    []*uiBugSubsystem
 }
 
 type uiBugGroup struct {
@@ -298,6 +349,63 @@ type uiJob struct {
 	Reported         bool
 }
 
+type userBugFilter struct {
+	Manager     string // show bugs that happened on the manager
+	OnlyManager string // show bugs that happened ONLY on the manager
+	Subsystem   string // only show bugs belonging to the subsystem
+	NoSubsystem bool
+}
+
+func MakeBugFilter(r *http.Request) *userBugFilter {
+	return &userBugFilter{
+		Subsystem:   r.FormValue("subsystem"),
+		NoSubsystem: r.FormValue("no_subsystem") != "",
+		Manager:     r.FormValue("manager"),
+		OnlyManager: r.FormValue("only_manager"),
+	}
+}
+
+func (filter *userBugFilter) MatchManagerName(name string) bool {
+	target := filter.ManagerName()
+	return target == "" || target == name
+}
+
+func (filter *userBugFilter) ManagerName() string {
+	if filter != nil && filter.OnlyManager != "" {
+		return filter.OnlyManager
+	}
+	if filter != nil && filter.Manager != "" {
+		return filter.Manager
+	}
+	return ""
+}
+
+func (filter *userBugFilter) MatchBug(bug *Bug) bool {
+	if filter == nil {
+		return true
+	}
+	if filter.OnlyManager != "" && (len(bug.HappenedOn) != 1 || bug.HappenedOn[0] != filter.OnlyManager) {
+		return false
+	}
+	if filter.Manager != "" && !stringInList(bug.HappenedOn, filter.Manager) {
+		return false
+	}
+	if filter.NoSubsystem && len(bug.Tags.Subsystems) > 0 {
+		return false
+	}
+	if filter.Subsystem != "" && !bug.hasSubsystem(filter.Subsystem) {
+		return false
+	}
+	return true
+}
+
+func (filter *userBugFilter) Any() bool {
+	if filter == nil {
+		return false
+	}
+	return filter.Subsystem != "" || filter.OnlyManager != "" || filter.Manager != "" || filter.NoSubsystem
+}
+
 // handleMain serves main page.
 func handleMain(c context.Context, w http.ResponseWriter, r *http.Request) error {
 	hdr, err := commonHeader(c, r, w, "")
@@ -305,19 +413,12 @@ func handleMain(c context.Context, w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	accessLevel := accessLevel(c, r)
-	onlyManager := r.FormValue("only_manager")
-	manager := onlyManager
-	if manager == "" {
-		manager = r.FormValue("manager")
-	}
-	managers, err := loadManagers(c, accessLevel, hdr.Namespace, manager)
+	filter := MakeBugFilter(r)
+	managers, err := loadManagers(c, accessLevel, hdr.Namespace, filter)
 	if err != nil {
 		return err
 	}
-	groups, err := fetchNamespaceBugs(c, accessLevel, hdr.Namespace,
-		manager, onlyManager != "",
-		r.FormValue("subsystem"),
-	)
+	groups, err := fetchNamespaceBugs(c, accessLevel, hdr.Namespace, filter)
 	if err != nil {
 		return err
 	}
@@ -330,6 +431,7 @@ func handleMain(c context.Context, w http.ResponseWriter, r *http.Request) error
 		Now:            timeNow(c),
 		Groups:         groups,
 		Managers:       makeManagerList(managers, hdr.Namespace),
+		BugFilter:      makeUIBugFilter(c, filter),
 	}
 	return serveTemplate(w, "main.html", data)
 }
@@ -349,6 +451,55 @@ func handleInvalid(c context.Context, w http.ResponseWriter, r *http.Request) er
 		Subpage:   "/invalid",
 		ShowPatch: false,
 		ShowStats: true,
+	})
+}
+
+func handleSubsystemPage(c context.Context, w http.ResponseWriter, r *http.Request) error {
+	hdr, err := commonHeader(c, r, w, "")
+	if err != nil {
+		return err
+	}
+	service := getSubsystemService(c, hdr.Namespace)
+	if service == nil {
+		return fmt.Errorf("the namespace does not have subsystems")
+	}
+	var subsystem *subsystem.Subsystem
+	if pos := strings.Index(r.URL.Path, "/s/"); pos != -1 {
+		subsystem = service.ByName(r.URL.Path[pos+3:])
+	}
+	if subsystem == nil {
+		return fmt.Errorf("the subsystem is not found")
+	}
+	groups, err := fetchNamespaceBugs(c, accessLevel(c, r),
+		hdr.Namespace, &userBugFilter{
+			Subsystem: subsystem.Name,
+		})
+	if err != nil {
+		return err
+	}
+	cached, err := CacheGet(c, r, hdr.Namespace)
+	if err != nil {
+		return err
+	}
+	children := []*uiSubsystem{}
+	for _, item := range service.Children(subsystem) {
+		uiChild := createUISubsystem(hdr.Namespace, item, cached)
+		if uiChild.Open.Count+uiChild.Fixed.Count == 0 {
+			continue
+		}
+		children = append(children, uiChild)
+	}
+	parents := []*uiSubsystem{}
+	for _, item := range subsystem.Parents {
+		parents = append(parents, createUISubsystem(hdr.Namespace, item, cached))
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+	return serveTemplate(w, "subsystem_page.html", &uiSubsystemPage{
+		Header:   hdr,
+		Info:     createUISubsystem(hdr.Namespace, subsystem, cached),
+		Children: children,
+		Parents:  parents,
+		Groups:   groups,
 	})
 }
 
@@ -373,9 +524,7 @@ type TerminalBug struct {
 	ShowPatch   bool
 	ShowPatched bool
 	ShowStats   bool
-	Manager     string
-	OneManager  bool
-	Subsystem   string
+	Filter      *userBugFilter
 }
 
 func handleTerminalBugList(c context.Context, w http.ResponseWriter, r *http.Request, typ *TerminalBug) error {
@@ -385,18 +534,11 @@ func handleTerminalBugList(c context.Context, w http.ResponseWriter, r *http.Req
 		return err
 	}
 	hdr.Subpage = typ.Subpage
-	onlyManager := r.FormValue("only_manager")
-	if onlyManager != "" {
-		typ.Manager = onlyManager
-		typ.OneManager = true
-	} else {
-		typ.Manager = r.FormValue("manager")
-	}
-	typ.Subsystem = r.FormValue("subsystem")
+	typ.Filter = MakeBugFilter(r)
 	extraBugs := []*Bug{}
 	if typ.Status == BugStatusFixed {
 		// Mix in bugs that have pending fixes.
-		extraBugs, err = fetchFixPendingBugs(c, hdr.Namespace, typ.Manager)
+		extraBugs, err = fetchFixPendingBugs(c, hdr.Namespace, typ.Filter.ManagerName())
 		if err != nil {
 			return err
 		}
@@ -409,10 +551,11 @@ func handleTerminalBugList(c context.Context, w http.ResponseWriter, r *http.Req
 		stats = nil
 	}
 	data := &uiTerminalPage{
-		Header: hdr,
-		Now:    timeNow(c),
-		Bugs:   bugs,
-		Stats:  stats,
+		Header:    hdr,
+		Now:       timeNow(c),
+		Bugs:      bugs,
+		Stats:     stats,
+		BugFilter: makeUIBugFilter(c, typ.Filter),
 	}
 	return serveTemplate(w, "terminal.html", data)
 }
@@ -435,27 +578,46 @@ func handleAdmin(c context.Context, w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	memcacheStats, err := memcache.Stats(c)
-	if err != nil {
+	var (
+		memcacheStats *memcache.Statistics
+		managers      []*uiManager
+		errorLog      []byte
+		recentJobs    []*uiJob
+		pendingJobs   []*uiJob
+		runningJobs   []*uiJob
+	)
+	g, _ := errgroup.WithContext(context.Background())
+	g.Go(func() error {
+		var err error
+		memcacheStats, err = memcache.Stats(c)
 		return err
-	}
-	managers, err := loadManagers(c, accessLevel, "", "")
-	if err != nil {
+	})
+	g.Go(func() error {
+		var err error
+		managers, err = loadManagers(c, accessLevel, "", nil)
 		return err
-	}
-	errorLog, err := fetchErrorLogs(c)
-	if err != nil {
+	})
+	g.Go(func() error {
+		var err error
+		errorLog, err = fetchErrorLogs(c)
 		return err
-	}
-	recentJobs, err := loadRecentJobs(c)
-	if err != nil {
+	})
+	g.Go(func() error {
+		var err error
+		recentJobs, err = loadRecentJobs(c)
 		return err
-	}
-	pendingJobs, err := loadPendingJobs(c)
-	if err != nil {
+	})
+	g.Go(func() error {
+		var err error
+		pendingJobs, err = loadPendingJobs(c)
 		return err
-	}
-	runningJobs, err := loadRunningJobs(c)
+	})
+	g.Go(func() error {
+		var err error
+		runningJobs, err = loadRunningJobs(c)
+		return err
+	})
+	err = g.Wait()
 	if err != nil {
 		return err
 	}
@@ -558,6 +720,12 @@ func handleBug(c context.Context, w http.ResponseWriter, r *http.Request) error 
 			PerBug: true,
 			Jobs:   testPatchJobs,
 		},
+	}
+	for _, entry := range bug.Tags.Subsystems {
+		data.Subsystems = append(data.Subsystems, &uiBugSubsystem{
+			Name: entry.Name,
+			Link: html.AmendURL("/"+bug.Namespace, "subsystem", entry.Name),
+		})
 	}
 	// bug.BisectFix is set to BisectNot in two cases :
 	// - no fix bisections have been performed on the bug
@@ -707,6 +875,68 @@ func getUIJob(c context.Context, bug *Bug, jobType JobType) (*uiJob, error) {
 	return makeUIJob(job, jobKey, bug, crash, build), nil
 }
 
+func handleSubsystemsList(c context.Context, w http.ResponseWriter, r *http.Request) error {
+	hdr, err := commonHeader(c, r, w, "")
+	if err != nil {
+		return err
+	}
+	cached, err := CacheGet(c, r, hdr.Namespace)
+	if err != nil {
+		return err
+	}
+	service := getSubsystemService(c, hdr.Namespace)
+	if service == nil {
+		return fmt.Errorf("the namespace does not have subsystems")
+	}
+	nonEmpty := r.FormValue("all") != "true"
+	list := []*uiSubsystem{}
+	someHidden := false
+	for _, item := range service.List() {
+		record := createUISubsystem(hdr.Namespace, item, cached)
+		if nonEmpty && (record.Open.Count+record.Fixed.Count) == 0 {
+			someHidden = true
+			continue
+		}
+		list = append(list, record)
+	}
+	unclassified := &uiSubsystem{
+		Name: "",
+		Open: uiSubsystemStats{
+			Count: cached.NoSubsystem.Open,
+			Link:  html.AmendURL("/"+hdr.Namespace, "no_subsystem", "true"),
+		},
+		Fixed: uiSubsystemStats{
+			Count: cached.NoSubsystem.Fixed,
+			Link:  html.AmendURL("/"+hdr.Namespace+"/fixed", "no_subsystem", "true"),
+		},
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return serveTemplate(w, "subsystems.html", &uiSubsystemsPage{
+		Header:       hdr,
+		List:         list,
+		Unclassified: unclassified,
+		SomeHidden:   someHidden,
+		ShowAllURL:   html.AmendURL(getCurrentURL(c), "all", "true"),
+	})
+}
+
+func createUISubsystem(ns string, item *subsystem.Subsystem, cached *Cached) *uiSubsystem {
+	stats := cached.Subsystems[item.Name]
+	return &uiSubsystem{
+		Name:        item.Name,
+		Lists:       strings.Join(item.Lists, ", "),
+		Maintainers: strings.Join(item.Maintainers, ", "),
+		Open: uiSubsystemStats{
+			Count: stats.Open,
+			Link:  "/" + ns + "/s/" + item.Name,
+		},
+		Fixed: uiSubsystemStats{
+			Count: stats.Fixed,
+			Link:  html.AmendURL("/"+ns+"/fixed", "subsystem", item.Name),
+		},
+	}
+}
+
 // handleText serves plain text blobs (crash logs, reports, reproducers, etc).
 func handleTextImpl(c context.Context, w http.ResponseWriter, r *http.Request, tag string) error {
 	var id int64
@@ -819,9 +1049,9 @@ func fetchFixPendingBugs(c context.Context, ns, manager string) ([]*Bug, error) 
 	return rawBugs, nil
 }
 
-func fetchNamespaceBugs(c context.Context, accessLevel AccessLevel, ns,
-	manager string, oneManager bool, subsystem string) ([]*uiBugGroup, error) {
-	bugs, err := loadVisibleBugs(c, accessLevel, ns, manager)
+func fetchNamespaceBugs(c context.Context, accessLevel AccessLevel, ns string,
+	filter *userBugFilter) ([]*uiBugGroup, error) {
+	bugs, err := loadVisibleBugs(c, accessLevel, ns, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -844,10 +1074,7 @@ func fetchNamespaceBugs(c context.Context, accessLevel AccessLevel, ns,
 			dups = append(dups, bug)
 			continue
 		}
-		if oneManager && len(bug.HappenedOn) > 1 {
-			continue
-		}
-		if subsystem != "" && !bug.hasSubsystem(subsystem) {
+		if !filter.MatchBug(bug) {
 			continue
 		}
 		uiBug := createUIBug(c, bug, state, managers)
@@ -903,7 +1130,8 @@ func fetchNamespaceBugs(c context.Context, accessLevel AccessLevel, ns,
 	return uiGroups, nil
 }
 
-func loadVisibleBugs(c context.Context, accessLevel AccessLevel, ns, manager string) ([]*Bug, error) {
+func loadVisibleBugs(c context.Context, accessLevel AccessLevel, ns string,
+	bugFilter *userBugFilter) ([]*Bug, error) {
 	// Load open and dup bugs in in 2 separate queries.
 	// Ideally we load them in one query with a suitable filter,
 	// but unfortunately status values don't allow one query (<BugStatusFixed || >BugStatusInvalid).
@@ -914,24 +1142,22 @@ func loadVisibleBugs(c context.Context, accessLevel AccessLevel, ns, manager str
 	var dups []*Bug
 	go func() {
 		filter := func(query *db.Query) *db.Query {
-			query = query.Filter("Namespace=", ns).
-				Filter("Status=", BugStatusDup)
-			if manager != "" {
-				query = query.Filter("HappenedOn=", manager)
-			}
-			return query
+			return applyBugFilter(
+				query.Filter("Namespace=", ns).
+					Filter("Status=", BugStatusDup),
+				bugFilter,
+			)
 		}
 		var err error
 		dups, _, err = loadAllBugs(c, filter)
 		errc <- err
 	}()
 	filter := func(query *db.Query) *db.Query {
-		query = query.Filter("Namespace=", ns).
-			Filter("Status<", BugStatusFixed)
-		if manager != "" {
-			query = query.Filter("HappenedOn=", manager)
-		}
-		return query
+		return applyBugFilter(
+			query.Filter("Namespace=", ns).
+				Filter("Status<", BugStatusFixed),
+			bugFilter,
+		)
 	}
 	bugs, _, err := loadAllBugs(c, filter)
 	if err != nil {
@@ -946,12 +1172,10 @@ func loadVisibleBugs(c context.Context, accessLevel AccessLevel, ns, manager str
 func fetchTerminalBugs(c context.Context, accessLevel AccessLevel,
 	ns string, typ *TerminalBug, extraBugs []*Bug) (*uiBugGroup, *uiBugStats, error) {
 	bugs, _, err := loadAllBugs(c, func(query *db.Query) *db.Query {
-		query = query.Filter("Namespace=", ns).
-			Filter("Status=", typ.Status)
-		if typ.Manager != "" {
-			query = query.Filter("HappenedOn=", typ.Manager)
-		}
-		return query
+		return applyBugFilter(
+			query.Filter("Namespace=", ns).Filter("Status=", typ.Status),
+			typ.Filter,
+		)
 	})
 	if err != nil {
 		return nil, nil, err
@@ -985,10 +1209,7 @@ func fetchTerminalBugs(c context.Context, accessLevel AccessLevel,
 		if accessLevel < bug.sanitizeAccess(accessLevel) {
 			continue
 		}
-		if typ.OneManager && len(bug.HappenedOn) > 1 {
-			continue
-		}
-		if typ.Subsystem != "" && !bug.hasSubsystem(typ.Subsystem) {
+		if !typ.Filter.MatchBug(bug) {
 			continue
 		}
 		uiBug := createUIBug(c, bug, state, managers)
@@ -996,6 +1217,17 @@ func fetchTerminalBugs(c context.Context, accessLevel AccessLevel,
 		stats.Record(bug, &bug.Reporting[uiBug.ReportingIndex])
 	}
 	return res, stats, nil
+}
+
+func applyBugFilter(query *db.Query, filter *userBugFilter) *db.Query {
+	manager, subsystem := filter.ManagerName(), filter.Subsystem
+	if subsystem != "" {
+		// Subsystem filter is more granular, so give it priority.
+		query = query.Filter("Tags.Subsystems.Name=", subsystem)
+	} else if manager != "" {
+		query = query.Filter("HappenedOn=", manager)
+	}
+	return query
 }
 
 func loadDupsForBug(c context.Context, r *http.Request, bug *Bug, state *ReportingState, managers []string) (
@@ -1310,7 +1542,7 @@ func makeUIBuild(build *Build) *uiBuild {
 }
 
 func loadRepos(c context.Context, accessLevel AccessLevel, ns string) ([]*uiRepo, error) {
-	managers, _, err := loadManagerList(c, accessLevel, ns, "")
+	managers, _, err := loadManagerList(c, accessLevel, ns, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1350,10 +1582,10 @@ func loadRepos(c context.Context, accessLevel AccessLevel, ns string) ([]*uiRepo
 	return ret, nil
 }
 
-func loadManagers(c context.Context, accessLevel AccessLevel, ns, manager string) ([]*uiManager, error) {
+func loadManagers(c context.Context, accessLevel AccessLevel, ns string, filter *userBugFilter) ([]*uiManager, error) {
 	now := timeNow(c)
 	date := timeDate(now)
-	managers, managerKeys, err := loadManagerList(c, accessLevel, ns, manager)
+	managers, managerKeys, err := loadManagerList(c, accessLevel, ns, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -1450,7 +1682,8 @@ func loadManagers(c context.Context, accessLevel AccessLevel, ns, manager string
 	return results, nil
 }
 
-func loadManagerList(c context.Context, accessLevel AccessLevel, ns, manager string) ([]*Manager, []*db.Key, error) {
+func loadManagerList(c context.Context, accessLevel AccessLevel, ns string,
+	filter *userBugFilter) ([]*Manager, []*db.Key, error) {
 	managers, keys, err := loadAllManagers(c, ns)
 	if err != nil {
 		return nil, nil, err
@@ -1465,7 +1698,7 @@ func loadManagerList(c context.Context, accessLevel AccessLevel, ns, manager str
 		if ns == "" && cfg.Decommissioned {
 			continue
 		}
-		if manager != "" && manager != mgr.Name {
+		if !filter.MatchManagerName(mgr.Name) {
 			continue
 		}
 		filtered = append(filtered, mgr)

@@ -2,14 +2,15 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 // syz-crush replays crash log on multiple VMs. Usage:
-//   syz-crush -config=config.file execution.log
+//
+//	syz-crush -config=config.file execution.log
+//
 // Intended for reproduction of particularly elusive crashes.
 package main
 
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -182,7 +183,7 @@ func runInstance(cfg *mgrconfig.Config, reporter *report.Reporter,
 		res, err = inst.RunSyzProgFile(file, timeout, opts)
 	} else {
 		var src []byte
-		src, err = ioutil.ReadFile(file)
+		src, err = os.ReadFile(file)
 		if err != nil {
 			log.Fatalf("error reading source file from '%s'", file)
 		}

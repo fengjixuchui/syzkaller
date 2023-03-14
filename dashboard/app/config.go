@@ -14,6 +14,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/auth"
 	"github.com/google/syzkaller/pkg/email"
+	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vcs"
 )
 
@@ -54,6 +55,8 @@ type GlobalConfig struct {
 	// Main part of the URL at which the app is reachable.
 	// This URL is used e.g. to construct HTML links contained in the emails sent by the app.
 	AppURL string
+	// The email address to display on all web pages.
+	ContactEmail string
 }
 
 // Per-namespace config.
@@ -104,11 +107,12 @@ type Config struct {
 	Subsystems SubsystemsConfig
 }
 
-// SubsystemsConfig describes how to generate the list of kernel subsystems and the rules of
-// subsystem inference / bug reporting.
+// SubsystemsConfig describes where to take the list of subsystems and how to infer them.
 type SubsystemsConfig struct {
-	// IMPORTANT: this interface is experimental and will likely change in the future.
-	SubsystemCc func(name string) []string
+	// If Service is set, dashboard will use it to infer and recalculate subsystems.
+	Service *subsystem.Service
+	// If all existing subsystem labels must be recalculated, increase this integer.
+	Revision int
 }
 
 // ObsoletingConfig describes how bugs without reproducer should be obsoleted.
@@ -190,6 +194,9 @@ type KernelRepo struct {
 	ReportingPriority int
 	// CC for all bugs reported on this repo.
 	CC CCConfig
+	// This repository is no longer active and should not be polled for commits.
+	// It will only be used to display kernel aliases for older crashes.
+	Obsolete bool
 }
 
 type CCConfig struct {
@@ -347,9 +354,6 @@ func checkNamespace(ns string, cfg *Config, namespaces, clientNames map[string]b
 	}
 	if cfg.Kcidb != nil {
 		checkKcidb(ns, cfg.Kcidb)
-	}
-	if cfg.Subsystems.SubsystemCc == nil {
-		cfg.Subsystems.SubsystemCc = func(string) []string { return nil }
 	}
 	checkKernelRepos(ns, cfg)
 	checkNamespaceReporting(ns, cfg)

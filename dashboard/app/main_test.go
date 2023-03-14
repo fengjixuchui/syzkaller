@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestOnlyManagerFilter(t *testing.T) {
@@ -76,11 +77,14 @@ func TestOnlyManagerFilter(t *testing.T) {
 	}
 }
 
+const (
+	subsystemA = "subsystemA"
+	subsystemB = "subsystemB"
+)
+
 func TestSubsystemFilterMain(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
-
-	subsystemA, subsystemB := "subsystemA", "subsystemB"
 
 	client := c.client
 	build := testBuild(1)
@@ -88,12 +92,12 @@ func TestSubsystemFilterMain(t *testing.T) {
 
 	crash1 := testCrash(build, 1)
 	crash1.Title = "first bug"
-	c.contextVars[overrideSubsystemsKey] = []string{subsystemA}
+	crash1.GuiltyFiles = []string{"a.c"}
 	client.ReportCrash(crash1)
 
 	crash2 := testCrash(build, 2)
-	c.contextVars[overrideSubsystemsKey] = []string{subsystemB}
 	crash2.Title = "second bug"
+	crash2.GuiltyFiles = []string{"b.c"}
 	client.ReportCrash(crash2)
 
 	client.pollBugs(2)
@@ -122,20 +126,18 @@ func TestSubsystemFilterTerminal(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	subsystemA, subsystemB := "subsystemA", "subsystemB"
-
 	client := c.client
 	build := testBuild(1)
 	client.UploadBuild(build)
 
 	crash1 := testCrash(build, 1)
 	crash1.Title = "first bug"
-	c.contextVars[overrideSubsystemsKey] = []string{subsystemA}
+	crash1.GuiltyFiles = []string{"a.c"}
 	client.ReportCrash(crash1)
 
 	crash2 := testCrash(build, 2)
-	c.contextVars[overrideSubsystemsKey] = []string{subsystemB}
 	crash2.Title = "second bug"
+	crash2.GuiltyFiles = []string{"b.c"}
 	client.ReportCrash(crash2)
 
 	// Invalidate all these bugs.
@@ -155,4 +157,93 @@ func TestSubsystemFilterTerminal(t *testing.T) {
 	if !bytes.Contains(reply, []byte(crash2.Title)) {
 		t.Fatalf("%#v is not contained on the invalid bugs page", crash2.Title)
 	}
+}
+
+func TestMainBugFilters(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.client
+	build1 := testBuild(1)
+	build1.Manager = "manager-name-123"
+	client.UploadBuild(build1)
+
+	crash1 := testCrash(build1, 1)
+	crash1.Title = "my-crash-title"
+	client.ReportCrash(crash1)
+	client.pollBugs(1)
+
+	// The normal main page.
+	reply, err := c.AuthGET(AccessAdmin, "/test1")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), build1.Manager)
+	assert.NotContains(t, string(reply), "Applied filters")
+
+	reply, err = c.AuthGET(AccessAdmin, "/test1?subsystem=abcd")
+	c.expectOK(err)
+	assert.NotContains(t, string(reply), build1.Manager) // managers are hidden
+	assert.Contains(t, string(reply), "Applied filters") // we're seeing a prompt to disable the filter
+	assert.NotContains(t, string(reply), crash1.Title)   // the bug does not belong to the subsystem
+
+	reply, err = c.AuthGET(AccessAdmin, "/test1?no_subsystem=true")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), crash1.Title) // the bug has no subsystems
+}
+
+func TestSubsystemsList(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.client
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	crash1 := testCrash(build, 1)
+	crash1.GuiltyFiles = []string{"a.c"}
+	client.ReportCrash(crash1)
+	client.pollBug()
+
+	crash2 := testCrash(build, 2)
+	crash2.GuiltyFiles = []string{"b.c"}
+	client.ReportCrash(crash2)
+	client.updateBug(client.pollBug().ID, dashapi.BugStatusInvalid, "")
+
+	_, err := c.AuthGET(AccessUser, "/cron/refresh_subsystems")
+	c.expectOK(err)
+
+	reply, err := c.AuthGET(AccessAdmin, "/test1/subsystems")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), "subsystemA")
+	assert.NotContains(t, string(reply), "subsystemB")
+
+	reply, err = c.AuthGET(AccessAdmin, "/test1/subsystems?all=true")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), "subsystemA")
+	assert.Contains(t, string(reply), "subsystemB")
+}
+
+func TestSubsystemPage(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.client
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	crash1 := testCrash(build, 1)
+	crash1.Title = "test crash title"
+	crash1.GuiltyFiles = []string{"a.c"}
+	client.ReportCrash(crash1)
+	client.pollBug()
+
+	crash2 := testCrash(build, 2)
+	crash2.GuiltyFiles = []string{"b.c"}
+	client.ReportCrash(crash2)
+	crash2.Title = "crash that must not be present"
+	client.updateBug(client.pollBug().ID, dashapi.BugStatusInvalid, "")
+
+	reply, err := c.AuthGET(AccessAdmin, "/test1/s/subsystemA")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), crash1.Title)
+	assert.NotContains(t, string(reply), crash2.Title)
 }

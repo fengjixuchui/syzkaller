@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -46,6 +45,7 @@ const (
 	CmdTest
 	CmdInvalid
 	CmdUnCC
+	CmdSet
 
 	cmdTest5
 )
@@ -277,6 +277,8 @@ func extractCommand(body string) (cmd Command, str, args string) {
 	switch cmd {
 	case CmdTest:
 		args = extractArgsTokens(body[cmdPos+cmdEnd:], 2)
+	case CmdSet:
+		args = extractArgsLine(body[cmdPos+cmdEnd:])
 	case cmdTest5:
 		args = extractArgsTokens(body[cmdPos+cmdEnd:], 5)
 	case CmdFix, CmdDup:
@@ -307,6 +309,8 @@ func strToCmd(str string) Command {
 		return CmdInvalid
 	case "uncc", "uncc:":
 		return CmdUnCC
+	case "set", "set:":
+		return CmdSet
 	case "test_5_arg_cmd":
 		return cmdTest5
 	}
@@ -367,14 +371,14 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 	}
 	disp, _, _ := mime.ParseMediaType(headers.Get("Content-Disposition"))
 	if disp == "attachment" {
-		attachment, err := ioutil.ReadAll(r)
+		attachment, err := io.ReadAll(r)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read email body: %v", err)
 		}
 		return nil, [][]byte{attachment}, nil
 	}
 	if mediaType == "text/plain" {
-		body, err := ioutil.ReadAll(r)
+		body, err := io.ReadAll(r)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read email body: %v", err)
 		}

@@ -17,9 +17,6 @@ func ctorGvisor(cfg *config) (reporterImpl, []string, error) {
 		config: cfg,
 	}
 	suppressions := []string{
-		"fatal error: runtime: out of memory",
-		"fatal error: runtime: cannot allocate memory",
-		"fatal error: newosproc",
 		"panic: ptrace sysemu failed: no such process",                                          // OOM kill
 		`panic: ptrace (s|g)et fpregs.* failed: no such process`,                                // OOM kill
 		`panic: ptrace (s|g)et regs.* failed: no such process`,                                  // OOM kill
@@ -103,17 +100,6 @@ var gvisorOopses = append([]*oops{
 			{
 				title:        compile("Panic:(.*)"),
 				fmt:          "Panic:%[1]v",
-				noStackTrace: true,
-			},
-		},
-		[]*regexp.Regexp{},
-	},
-	{
-		[]byte("fatal error:"),
-		[]oopsFormat{
-			{
-				title:        compile("fatal error:(.*)"),
-				fmt:          "fatal error:%[1]v",
 				noStackTrace: true,
 			},
 		},

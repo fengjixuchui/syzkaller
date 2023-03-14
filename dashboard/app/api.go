@@ -8,7 +8,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -146,7 +146,7 @@ func handleAPI(c context.Context, r *http.Request) (reply interface{}, err error
 		if err != nil {
 			return nil, fmt.Errorf("failed to ungzip payload: %v", err)
 		}
-		payload, err = ioutil.ReadAll(gr)
+		payload, err = io.ReadAll(gr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to ungzip payload: %v", err)
 		}
@@ -231,6 +231,9 @@ func apiCommitPoll(c context.Context, ns string, r *http.Request, payload []byte
 		ReportEmail: reportEmail(c, ns),
 	}
 	for _, repo := range config.Namespaces[ns].Repos {
+		if repo.Obsolete {
+			continue
+		}
 		resp.Repos = append(resp.Repos, dashapi.Repo{
 			URL:    repo.URL,
 			Branch: repo.Branch,
@@ -751,21 +754,31 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 	} else if len(req.ReproSyz) != 0 {
 		reproLevel = ReproLevelSyz
 	}
-	newSubsystems := []string{}
 	save := reproLevel != ReproLevelNone ||
 		bug.NumCrashes < int64(maxCrashes()) ||
 		now.Sub(bug.LastSavedCrash) > time.Hour ||
 		bug.NumCrashes%20 == 0 ||
 		!stringInList(bug.MergedTitles, req.Title)
 	if save {
-		newSubsystems = detectCrashSubsystems(c, req, build)
-		log.Infof(c, "determined subsystems: %q", newSubsystems)
 		if err := saveCrash(c, ns, req, bug, bugKey, build, assets); err != nil {
 			return nil, err
 		}
 	} else {
 		log.Infof(c, "not saving crash for %q", bug.Title)
 	}
+
+	newSubsystems := []*subsystem.Subsystem{}
+	// Recalculate subsystems on the first saved crash and on the first saved repro.
+	calculateSubsystems := save && (bug.NumCrashes == 0 ||
+		bug.ReproLevel == ReproLevelNone && reproLevel != ReproLevelNone)
+	if calculateSubsystems {
+		newSubsystems, err = inferSubsystems(c, bug, bugKey)
+		if err != nil {
+			log.Errorf(c, "%q: failed to extract subsystems: %s", bug.Title, err)
+			return nil, err
+		}
+	}
+
 	tx := func(c context.Context) error {
 		bug = new(Bug)
 		if err := db.Get(c, bugKey, bug); err != nil {
@@ -786,8 +799,8 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 		if len(req.Report) != 0 {
 			bug.HasReport = true
 		}
-		for _, name := range newSubsystems {
-			bug.addSubsystem(BugSubsystem{name})
+		if calculateSubsystems {
+			bug.SetAutoSubsystems(newSubsystems, now, getSubsystemRevision(c, ns))
 		}
 		bug.increaseCrashStats(now)
 		bug.HappenedOn = mergeString(bug.HappenedOn, build.Manager)
@@ -819,28 +832,6 @@ func parseCrashAssets(c context.Context, req *dashapi.Crash) ([]Asset, error) {
 		assets = append(assets, newAsset)
 	}
 	return assets, nil
-}
-
-const overrideSubsystemsKey = "set_subsystems"
-
-func detectCrashSubsystems(c context.Context, req *dashapi.Crash, build *Build) []string {
-	val, ok := c.Value(overrideSubsystemsKey).([]string)
-	if ok {
-		return val
-	}
-	if build.OS == targets.Linux {
-		extractor := subsystem.MakeLinuxSubsystemExtractor()
-		return extractor.Extract(&subsystem.Crash{
-			GuiltyFiles: req.GuiltyFiles,
-			SyzRepro:    string(req.ReproSyz),
-		})
-	}
-	return nil
-}
-
-func subsystemMaintainers(ns, subsystemName string) []string {
-	nsConfig := config.Namespaces[ns]
-	return nsConfig.Subsystems.SubsystemCc(subsystemName)
 }
 
 func (crash *Crash) UpdateReportingPriority(build *Build, bug *Bug) {
@@ -1352,18 +1343,19 @@ func createBugForCrash(c context.Context, ns string, req *dashapi.Crash) (*Bug, 
 					return fmt.Errorf("failed to get bug: %v", err)
 				}
 				bug = &Bug{
-					Namespace:    ns,
-					Seq:          seq,
-					Title:        req.Title,
-					MergedTitles: []string{req.Title},
-					AltTitles:    req.AltTitles,
-					Status:       BugStatusOpen,
-					NumCrashes:   0,
-					NumRepro:     0,
-					ReproLevel:   ReproLevelNone,
-					HasReport:    false,
-					FirstTime:    now,
-					LastTime:     now,
+					Namespace:      ns,
+					Seq:            seq,
+					Title:          req.Title,
+					MergedTitles:   []string{req.Title},
+					AltTitles:      req.AltTitles,
+					Status:         BugStatusOpen,
+					NumCrashes:     0,
+					NumRepro:       0,
+					ReproLevel:     ReproLevelNone,
+					HasReport:      false,
+					FirstTime:      now,
+					LastTime:       now,
+					SubsystemsTime: now,
 				}
 				err = bug.updateReportings(config.Namespaces[ns], now)
 				if err != nil {
@@ -1500,7 +1492,7 @@ func getText(c context.Context, tag string, id int64) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read text %v: %v", tag, err)
 	}
-	data, err := ioutil.ReadAll(d)
+	data, err := io.ReadAll(d)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read text %v: %v", tag, err)
 	}
@@ -1572,6 +1564,17 @@ func handleRetestRepros(w http.ResponseWriter, r *http.Request) {
 		err := updateRetestReproJobs(c, ns)
 		if err != nil {
 			log.Errorf(c, "failed to update retest repro jobs for %s: %v", ns, err)
+		}
+	}
+}
+
+func handleRefreshSubsystems(w http.ResponseWriter, r *http.Request) {
+	c := appengine.NewContext(r)
+	const updateBugsCount = 25
+	for ns := range config.Namespaces {
+		err := reassignBugSubsystems(c, ns, updateBugsCount)
+		if err != nil {
+			log.Errorf(c, "failed to update subsystems for %s: %v", ns, err)
 		}
 	}
 }

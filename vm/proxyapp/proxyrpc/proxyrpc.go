@@ -18,8 +18,10 @@ type ProxyAppInterface interface {
 }
 
 type CreatePoolParams struct {
-	Debug bool
-	Param string
+	Debug     bool
+	Param     string
+	Image     string
+	ImageData []byte
 }
 
 type CreatePoolResult struct {
@@ -27,8 +29,9 @@ type CreatePoolResult struct {
 }
 
 type CreateInstanceParams struct {
-	Workdir string
-	Index   int
+	Workdir     string
+	Index       int
+	WorkdirData map[string][]byte
 }
 
 type CreateInstanceResult struct {
@@ -38,6 +41,7 @@ type CreateInstanceResult struct {
 type CopyParams struct {
 	ID      string
 	HostSrc string
+	Data    []byte
 }
 
 type CopyResult struct {

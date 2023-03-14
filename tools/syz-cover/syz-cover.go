@@ -12,6 +12,7 @@
 // or from syz-execprog with -coverfile flag.
 //
 // Usage:
+//
 //	syz-cover [-os=OS -arch=ARCH -kernel_src=. -kernel_obj=.] rawcover.file*
 package main
 
@@ -20,7 +21,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"runtime"
@@ -42,6 +42,7 @@ func main() {
 		flagKernelBuildSrc = flag.String("kernel_build_src", "", "path to kernel image's build dir (optional)")
 		flagKernelObj      = flag.String("kernel_obj", "", "path to kernel build/obj dir")
 		flagExportCSV      = flag.String("csv", "", "export coverage data in csv format (optional)")
+		flagExportLineJSON = flag.String("json", "", "export coverage data with source line info in json format (optional)")
 		flagExportHTML     = flag.String("html", "", "save coverage HTML report to file (optional)")
 	)
 	defer tool.Init()()
@@ -54,12 +55,15 @@ func main() {
 	if *flagKernelSrc == "" {
 		*flagKernelSrc = "."
 	}
+	*flagKernelSrc = osutil.Abs(*flagKernelSrc)
 	if *flagKernelObj == "" {
 		*flagKernelObj = *flagKernelSrc
 	}
+	*flagKernelObj = osutil.Abs(*flagKernelObj)
 	if *flagKernelBuildSrc == "" {
 		*flagKernelBuildSrc = *flagKernelSrc
 	}
+	*flagKernelBuildSrc = osutil.Abs(*flagKernelBuildSrc)
 	target := targets.Get(*flagOS, *flagArch)
 	if target == nil {
 		tool.Failf("unknown target %v/%v", *flagOS, *flagArch)
@@ -80,6 +84,15 @@ func main() {
 			tool.Fail(err)
 		}
 		if err := osutil.WriteFile(*flagExportCSV, buf.Bytes()); err != nil {
+			tool.Fail(err)
+		}
+		return
+	}
+	if *flagExportLineJSON != "" {
+		if err := rg.DoLineJSON(buf, progs, nil); err != nil {
+			tool.Fail(err)
+		}
+		if err := osutil.WriteFile(*flagExportLineJSON, buf.Bytes()); err != nil {
 			tool.Fail(err)
 		}
 		return
@@ -109,7 +122,7 @@ func main() {
 func readPCs(files []string) ([]uint64, error) {
 	var pcs []uint64
 	for _, file := range files {
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		if err != nil {
 			return nil, err
 		}

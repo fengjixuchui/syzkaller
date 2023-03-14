@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
@@ -289,6 +288,7 @@ func (mgr *Manager) initBench() {
 			vals["corpus"] = uint64(len(mgr.corpus))
 			vals["uptime"] = uint64(time.Since(mgr.firstConnect)) / 1e9
 			vals["fuzzing"] = uint64(mgr.fuzzingTime) / 1e9
+			vals["candidates"] = uint64(len(mgr.candidates))
 			mgr.mu.Unlock()
 
 			data, err := json.MarshalIndent(vals, "", "  ")
@@ -570,12 +570,12 @@ func (mgr *Manager) preloadCorpus() {
 	mgr.corpusDB = corpusDB
 
 	if seedDir := filepath.Join(mgr.cfg.Syzkaller, "sys", mgr.cfg.TargetOS, "test"); osutil.IsExist(seedDir) {
-		seeds, err := ioutil.ReadDir(seedDir)
+		seeds, err := os.ReadDir(seedDir)
 		if err != nil {
 			log.Fatalf("failed to read seeds dir: %v", err)
 		}
 		for _, seed := range seeds {
-			data, err := ioutil.ReadFile(filepath.Join(seedDir, seed.Name()))
+			data, err := os.ReadFile(filepath.Join(seedDir, seed.Name()))
 			if err != nil {
 				log.Fatalf("failed to read seed %v: %v", seed.Name(), err)
 			}
@@ -882,8 +882,8 @@ func (mgr *Manager) saveCrash(crash *Crash) bool {
 			Log:         crash.Output,
 			Report:      crash.Report.Report,
 			MachineInfo: crash.machineInfo,
-			GuiltyFiles: []string{crash.Report.GuiltyFile},
 		}
+		setGuiltyFiles(dc, crash.Report)
 		resp, err := mgr.dash.ReportCrash(dc)
 		if err != nil {
 			log.Logf(0, "failed to report crash to dashboard: %v", err)
@@ -1073,6 +1073,7 @@ func (mgr *Manager) saveRepro(res *ReproResult) {
 			ReproC:     cprogText,
 			Assets:     mgr.uploadReproAssets(repro),
 		}
+		setGuiltyFiles(dc, report)
 		if _, err := mgr.dash.ReportCrash(dc); err != nil {
 			log.Logf(0, "failed to report repro to dashboard: %v", err)
 		} else {
@@ -1243,6 +1244,12 @@ func (mgr *Manager) minimizeCorpus() {
 		}
 	}
 	mgr.corpusDB.BumpVersion(currentDBVersion)
+}
+
+func setGuiltyFiles(crash *dashapi.Crash, report *report.Report) {
+	if report.GuiltyFile != "" {
+		crash.GuiltyFiles = []string{report.GuiltyFile}
+	}
 }
 
 type CallCov struct {

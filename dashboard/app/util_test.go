@@ -9,7 +9,7 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/subsystem"
 	"golang.org/x/net/context"
 	"google.golang.org/appengine/v2/aetest"
 	db "google.golang.org/appengine/v2/datastore"
@@ -33,15 +34,15 @@ import (
 )
 
 type Ctx struct {
-	t            *testing.T
-	inst         aetest.Instance
-	ctx          context.Context
-	mockedTime   time.Time
-	emailSink    chan *aemail.Message
-	contextVars  map[interface{}]interface{}
-	client       *apiClient
-	client2      *apiClient
-	publicClient *apiClient
+	t                *testing.T
+	inst             aetest.Instance
+	ctx              context.Context
+	mockedTime       time.Time
+	emailSink        chan *aemail.Message
+	transformContext func(context.Context) context.Context
+	client           *apiClient
+	client2          *apiClient
+	publicClient     *apiClient
 }
 
 var skipDevAppserverTests = func() bool {
@@ -68,11 +69,11 @@ func NewCtx(t *testing.T) *Ctx {
 		t.Fatal(err)
 	}
 	c := &Ctx{
-		t:           t,
-		inst:        inst,
-		mockedTime:  time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
-		contextVars: make(map[interface{}]interface{}),
-		emailSink:   make(chan *aemail.Message, 100),
+		t:                t,
+		inst:             inst,
+		mockedTime:       time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+		emailSink:        make(chan *aemail.Message, 100),
+		transformContext: func(c context.Context) context.Context { return c },
 	}
 	c.client = c.makeClient(client1, password1, true)
 	c.client2 = c.makeClient(client2, password2, true)
@@ -187,7 +188,7 @@ func (c *Ctx) Close() {
 			c.expectOK(err)
 		}
 		// No pending emails (tests need to consume them).
-		_, err = c.GET("/email_poll")
+		_, err = c.GET("/cron/email_poll")
 		c.expectOK(err)
 		for len(c.emailSink) != 0 {
 			c.t.Errorf("ERROR: leftover email: %v", (<-c.emailSink).Body)
@@ -203,6 +204,16 @@ func (c *Ctx) Close() {
 
 func (c *Ctx) advanceTime(d time.Duration) {
 	c.mockedTime = c.mockedTime.Add(d)
+}
+
+func (c *Ctx) setSubsystems(ns string, list []*subsystem.Subsystem, rev int) {
+	c.transformContext = func(c context.Context) context.Context {
+		return contextWithSubsystems(c, &customSubsystemList{
+			ns:       ns,
+			list:     list,
+			revision: rev,
+		})
+	}
 }
 
 // GET sends admin-authorized HTTP GET request to the app.
@@ -248,6 +259,7 @@ func (c *Ctx) httpRequest(method, url, body string, access AccessLevel) (*httpte
 		c.t.Fatal(err)
 	}
 	r = registerRequest(r, c)
+	r = r.WithContext(c.transformContext(r.Context()))
 	if access == AccessAdmin || access == AccessUser {
 		user := &user.User{
 			Email:      "user@syzkaller.com",
@@ -344,7 +356,7 @@ func (c *Ctx) checkURLContents(url string, want []byte) {
 }
 
 func (c *Ctx) pollEmailBug() *aemail.Message {
-	_, err := c.GET("/email_poll")
+	_, err := c.GET("/cron/email_poll")
 	c.expectOK(err)
 	if len(c.emailSink) == 0 {
 		c.t.Helper()
@@ -354,7 +366,7 @@ func (c *Ctx) pollEmailBug() *aemail.Message {
 }
 
 func (c *Ctx) expectNoEmail() {
-	_, err := c.GET("/email_poll")
+	_, err := c.GET("/cron/email_poll")
 	c.expectOK(err)
 	if len(c.emailSink) != 0 {
 		msg := <-c.emailSink
@@ -364,7 +376,7 @@ func (c *Ctx) expectNoEmail() {
 }
 
 func (c *Ctx) updRetestReproJobs() {
-	_, err := c.GET("/retest_repros")
+	_, err := c.GET("/cron/retest_repros")
 	c.expectOK(err)
 }
 
@@ -376,17 +388,13 @@ type apiClient struct {
 func (c *Ctx) makeClient(client, key string, failOnErrors bool) *apiClient {
 	doer := func(r *http.Request) (*http.Response, error) {
 		r = registerRequest(r, c)
-		newCtx := r.Context()
-		for key, val := range c.contextVars {
-			newCtx = context.WithValue(newCtx, key, val)
-		}
-		r = r.WithContext(newCtx)
+		r = r.WithContext(c.transformContext(r.Context()))
 		w := httptest.NewRecorder()
 		http.DefaultServeMux.ServeHTTP(w, r)
 		res := &http.Response{
 			StatusCode: w.Code,
 			Status:     http.StatusText(w.Code),
-			Body:       ioutil.NopCloser(w.Result().Body),
+			Body:       io.NopCloser(w.Result().Body),
 		}
 		return res, nil
 	}

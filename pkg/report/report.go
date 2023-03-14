@@ -128,7 +128,17 @@ func NewReporter(cfg *mgrconfig.Config) (*Reporter, error) {
 	if err != nil {
 		return nil, err
 	}
-	supps, err := compileRegexps(append(suppressions, cfg.Suppressions...))
+	suppressions = append(suppressions, []string{
+		// Go runtime OOM messages:
+		"fatal error: runtime: out of memory",
+		"fatal error: runtime: cannot allocate memory",
+		"fatal error: out of memory",
+		"fatal error: newosproc",
+		// Panic with ENOMEM err:
+		"panic: .*cannot allocate memory",
+	}...)
+	suppressions = append(suppressions, cfg.Suppressions...)
+	supps, err := compileRegexps(suppressions)
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +267,20 @@ func (reporter *Reporter) isInteresting(rep *Report) bool {
 		}
 	}
 	return false
+}
+
+// There are cases when we need to extract a guilty file, but have no ability to do it the
+// proper way -- parse and symbolize the raw console output log. One of such cases is
+// the syz-fillreports tool, which only has access to the already symbolized logs.
+// ReportToGuiltyFile does its best to extract the data.
+func (reporter *Reporter) ReportToGuiltyFile(title string, report []byte) string {
+	ii, ok := reporter.impl.(interface {
+		extractGuiltyFileRaw(title string, report []byte) string
+	})
+	if !ok {
+		return ""
+	}
+	return ii.extractGuiltyFileRaw(title, report)
 }
 
 func extractReportType(rep *Report) Type {
@@ -804,6 +828,19 @@ var commonOopses = []*oops{
 			compile("xlog_status:"),
 			compile(`ddb\.onpanic:`),
 			compile(`evtlog_status:`),
+		},
+	},
+	{
+		[]byte("fatal error:"),
+		[]oopsFormat{
+			{
+				title:        compile("fatal error:(.*)"),
+				fmt:          "fatal error:%[1]v",
+				noStackTrace: true,
+			},
+		},
+		[]*regexp.Regexp{
+			compile("ALSA"),
 		},
 	},
 }

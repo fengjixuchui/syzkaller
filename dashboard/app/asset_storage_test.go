@@ -117,7 +117,7 @@ https://goo.gl/tpsmEJ#status for how to communicate with syzbot.`,
 
 	// Invalidate the bug.
 	c.client.updateBug(extBugID, dashapi.BugStatusInvalid, "")
-	_, err = c.GET("/deprecate_assets")
+	_, err = c.GET("/cron/deprecate_assets")
 	c.expectOK(err)
 
 	// Query the needed assets once more, so far there should be no change.
@@ -128,7 +128,7 @@ https://goo.gl/tpsmEJ#status for how to communicate with syzbot.`,
 
 	// Skip one month and deprecate assets.
 	c.advanceTime(time.Hour * 24 * 31)
-	_, err = c.GET("/deprecate_assets")
+	_, err = c.GET("/cron/deprecate_assets")
 	c.expectOK(err)
 
 	// Only the html asset should have persisted.
@@ -148,7 +148,7 @@ func TestCoverReportDisplay(t *testing.T) {
 	c.client.UploadBuild(testBuild(2))
 
 	// We expect no coverage reports to be present.
-	uiManagers, err := loadManagers(c.ctx, AccessAdmin, "test1", "")
+	uiManagers, err := loadManagers(c.ctx, AccessAdmin, "test1", nil)
 	c.expectOK(err)
 	c.expectEQ(len(uiManagers), 2)
 	c.expectEQ(uiManagers[0].CoverLink, "")
@@ -165,7 +165,7 @@ func TestCoverReportDisplay(t *testing.T) {
 			},
 		},
 	}))
-	uiManagers, err = loadManagers(c.ctx, AccessAdmin, "test1", "")
+	uiManagers, err = loadManagers(c.ctx, AccessAdmin, "test1", nil)
 	c.expectOK(err)
 	c.expectEQ(len(uiManagers), 2)
 	c.expectEQ(uiManagers[0].CoverLink, origHTMLAsset)
@@ -182,7 +182,7 @@ func TestCoverReportDisplay(t *testing.T) {
 			},
 		},
 	}))
-	uiManagers, err = loadManagers(c.ctx, AccessAdmin, "test1", "")
+	uiManagers, err = loadManagers(c.ctx, AccessAdmin, "test1", nil)
 	c.expectOK(err)
 	c.expectEQ(len(uiManagers), 2)
 	c.expectEQ(uiManagers[0].CoverLink, newHTMLAsset)
@@ -194,7 +194,7 @@ func TestCoverReportDeprecation(t *testing.T) {
 	defer c.Close()
 
 	ensureNeeded := func(needed []string) {
-		_, err := c.GET("/deprecate_assets")
+		_, err := c.GET("/cron/deprecate_assets")
 		c.expectOK(err)
 		neededResp, err := c.client.NeededAssetsList()
 		c.expectOK(err)
@@ -270,7 +270,7 @@ func TestFreshBuildAssets(t *testing.T) {
 	defer c.Close()
 
 	ensureNeeded := func(needed []string) {
-		_, err := c.GET("/deprecate_assets")
+		_, err := c.GET("/cron/deprecate_assets")
 		c.expectOK(err)
 		neededResp, err := c.client.NeededAssetsList()
 		c.expectOK(err)
@@ -395,7 +395,7 @@ https://goo.gl/tpsmEJ#status for how to communicate with syzbot.`,
 
 	// Invalidate the bug.
 	c.client.updateBug(extBugID, dashapi.BugStatusInvalid, "")
-	_, err = c.GET("/deprecate_assets")
+	_, err = c.GET("/cron/deprecate_assets")
 	c.expectOK(err)
 
 	// Query the needed assets once more, so far there should be no change.
@@ -406,7 +406,7 @@ https://goo.gl/tpsmEJ#status for how to communicate with syzbot.`,
 
 	// Skip one month and deprecate assets.
 	c.advanceTime(time.Hour * 24 * 31)
-	_, err = c.GET("/deprecate_assets")
+	_, err = c.GET("/cron/deprecate_assets")
 	c.expectOK(err)
 
 	// Nothing should have been persisted.

@@ -16,6 +16,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/auth"
 	"github.com/google/syzkaller/pkg/subsystem"
+	_ "github.com/google/syzkaller/pkg/subsystem/lists"
 	"github.com/google/syzkaller/sys/targets"
 	"google.golang.org/appengine/v2/user"
 )
@@ -81,6 +82,12 @@ var testConfig = &GlobalConfig{
 						Maintainers: []string{"maintainers@repo10.org", "bugs@repo10.org"},
 					},
 				},
+				{
+					URL:      "git://github.com/google/syzkaller",
+					Branch:   "old_master",
+					Alias:    "repo10alias",
+					Obsolete: true,
+				},
 			},
 			Managers: map[string]ConfigManager{
 				"special-obsoleting": {
@@ -105,6 +112,9 @@ var testConfig = &GlobalConfig{
 						Index: 2,
 					},
 				},
+			},
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.MustMakeService(testSubsystems),
 			},
 		},
 		"test2": {
@@ -291,6 +301,9 @@ var testConfig = &GlobalConfig{
 					},
 				},
 			},
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.MustMakeService(testSubsystems),
+			},
 		},
 		// The second namespace reporting to the same mailing list.
 		"access-public-email-2": {
@@ -358,7 +371,7 @@ var testConfig = &GlobalConfig{
 				},
 			},
 			Subsystems: SubsystemsConfig{
-				SubsystemCc: subsystem.LinuxGetMaintainers,
+				Service: subsystem.ListService("linux"),
 			},
 		},
 		"test-decommission": {
@@ -436,6 +449,21 @@ var testConfig = &GlobalConfig{
 			},
 			RetestRepros: true,
 		},
+	},
+}
+
+var testSubsystems = []*subsystem.Subsystem{
+	{
+		Name:        "subsystemA",
+		PathRules:   []subsystem.PathRule{{IncludeRegexp: `a\.c`}},
+		Lists:       []string{"subsystemA@list.com"},
+		Maintainers: []string{"subsystemA@person.com"},
+	},
+	{
+		Name:        "subsystemB",
+		PathRules:   []subsystem.PathRule{{IncludeRegexp: `b\.c`}},
+		Lists:       []string{"subsystemB@list.com"},
+		Maintainers: []string{"subsystemB@person.com"},
 	},
 }
 

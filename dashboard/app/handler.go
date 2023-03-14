@@ -32,7 +32,7 @@ func handlerWrapper(fn contextHandler) http.Handler {
 func handleContext(fn contextHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c := appengine.NewContext(r)
-		c = context.WithValue(c, currentURLKey, r.URL.RequestURI())
+		c = context.WithValue(c, &currentURLKey, r.URL.RequestURI())
 		if err := fn(c, w, r); err != nil {
 			hdr := commonHeaderRaw(c, r)
 			data := &struct {
@@ -74,10 +74,10 @@ func handleContext(fn contextHandler) http.Handler {
 	})
 }
 
-const currentURLKey = "current_url"
+var currentURLKey = "the URL of the HTTP request in context"
 
 func getCurrentURL(c context.Context) string {
-	val, ok := c.Value(currentURLKey).(string)
+	val, ok := c.Value(&currentURLKey).(string)
 	if ok {
 		return val
 	}
@@ -127,8 +127,10 @@ type uiHeader struct {
 	AnalyticsTrackingID string
 	Subpage             string
 	Namespace           string
-	Cached              *Cached
+	ContactEmail        string
+	BugCounts           *CachedBugStats
 	Namespaces          []uiNamespace
+	ShowSubsystems      bool
 }
 
 type uiNamespace struct {
@@ -145,6 +147,7 @@ func commonHeaderRaw(c context.Context, r *http.Request) *uiHeader {
 		Admin:               accessLevel(c, r) == AccessAdmin,
 		URLPath:             r.URL.Path,
 		AnalyticsTrackingID: config.AnalyticsTrackingID,
+		ContactEmail:        config.ContactEmail,
 	}
 	if user.Current(c) == nil {
 		h.LoginLink, _ = user.LoginURL(c, r.URL.String())
@@ -203,13 +206,14 @@ func commonHeader(c context.Context, r *http.Request, w http.ResponseWriter, ns 
 	}
 	if ns != adminPage {
 		h.Namespace = ns
+		h.ShowSubsystems = getSubsystemService(c, ns) != nil
 		cookie.Namespace = ns
 		encodeCookie(w, cookie)
 		cached, err := CacheGet(c, r, ns)
 		if err != nil {
 			return nil, err
 		}
-		h.Cached = cached
+		h.BugCounts = &cached.Total
 	}
 	return h, nil
 }

@@ -82,18 +82,33 @@ or alternatively, to test on exact commit reply with:
 ```
 #syz test: git://repo/address.git commit-hash
 ```
+
 If you also provide a patch with the email, `syzbot` will apply it on top of the
-tree before testing. The patch can be provided either inline in email text or as
+tree before testing. The patch can be provided inline in email text or as
 a text attachment (which is more reliable if your email client messes with
 whitespaces).
+
+If you want to include the patch directly in the email body, just paste the diff
+somewhere under the `#syz test` command line, e.g.
+
+```
+#syz test: git://repo/address.git branch
+
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+-       current->kasan_depth++;
++       current->kasan_depth--;
+```
+
+[Here](https://groups.google.com/g/syzkaller-bugs/search?q=%22%23syz%20test%22) are
+some real examples of `#syz test` commands for syzbot-reported bugs.
 
 If you don't provide a patch, `syzbot` will test the tree as is.
 This is useful if this is your own tree which already contains the patch,
 or to check if the bug is already fixed by some recent commit.
 
 After sending an email you should typically get a reply email with results within
-an hour. In certain cases (e.g. syzbot is busy with a bisection) it might take
-singnificantly longer, up to a few days (see #1923 for details).
+an hour.
 
 **Note**: you may send the request only to `syzbot` email address, as patches sent
 to some mailing lists (e.g. netdev, netfilter-devel) will trigger patchwork.
@@ -108,6 +123,31 @@ the supplied patch.
 **Note**: see [below](#kmsan-bugs) for `KMSAN` bugs testing.
 
 **Note**: see [below](#usb-bugs) for `USB` bugs testing.
+
+## Subsystems
+
+For all its bugs, `syzbot` automatically assigns kernel subsystems tags. For Linux,
+the predefined list of kernel subsystems can be found at
+https://syzkaller.appspot.com/upstream/subsystems.
+
+By clicking on a name in the subsystem list or by following a tag after a bug's
+title, you can get the full list of bugs belonging to the subsystem. For example,
+all `nfc` bugs are listed here: https://syzkaller.appspot.com/upstream/s/nfc.
+
+`syzbot` includes subsystem tags into email subject as well, with `?` indicating
+that it's an automatic guess: `[syzbot] [ntfs?] kernel BUG in ntfs_iget`.
+
+Over time, as we improve the classification rules or as syzbot obtains more
+information about the bug (e.g. finds a reproducer), `syzbot` will update tags.
+
+You can also manually override the automatic guess by replying to the `syzbot` email:
+
+```
+#syz set subsystems: net, mm
+```
+
+Names of subsystems must be taken from the subsystem list page on the syzbot web
+dashboard.
 
 <div id="amend"/>
 <div id="linux-next"/>
