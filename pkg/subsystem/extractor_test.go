@@ -12,11 +12,13 @@ import (
 
 func TestExtractor(t *testing.T) {
 	// Objects used in tests.
-	fsPath := "fs/"
-	extProg, nfsProg := []byte("ext prog"), []byte("nfs prog")
-	fs := &Subsystem{Name: "fs"}
+	fsPath, mmFsPath := "fs/", "mm/fs.c"
+	extProg, nfsProg, extNfsProg := []byte("ext"), []byte("nfs"), []byte("ext nfs")
+	all := &Subsystem{Name: "fs"}
+	fs := &Subsystem{Name: "fs", Parents: []*Subsystem{all}}
 	ext := &Subsystem{Name: "ext", Parents: []*Subsystem{fs}}
 	nfs := &Subsystem{Name: "nfs", Parents: []*Subsystem{fs}}
+	mm := &Subsystem{Name: "mm", Parents: []*Subsystem{all}}
 	// Tests themselves.
 	tests := []struct {
 		name    string
@@ -46,7 +48,7 @@ func TestExtractor(t *testing.T) {
 			want: []*Subsystem{ext},
 		},
 		{
-			name: `Two equally present children`,
+			name: `Reproducers hint at different subsystems`,
 			crashes: []*Crash{
 				{
 					GuiltyPath: fsPath,
@@ -60,10 +62,10 @@ func TestExtractor(t *testing.T) {
 					SyzRepro:   nfsProg,
 				},
 			},
-			want: []*Subsystem{nfs, ext},
+			want: []*Subsystem{fs},
 		},
 		{
-			name: `One child is more present than another`,
+			name: `One subsystem from reproducers is irrelevant`,
 			crashes: []*Crash{
 				{
 					GuiltyPath: fsPath,
@@ -74,10 +76,27 @@ func TestExtractor(t *testing.T) {
 				},
 				{
 					GuiltyPath: fsPath,
-					SyzRepro:   nfsProg,
+					SyzRepro:   extNfsProg,
+				},
+			},
+			want: []*Subsystem{ext},
+		},
+		{
+			name: `Reproducer supporting one of guilty paths`,
+			crashes: []*Crash{
+				// The guilty paths correspond both to mm and fs.
+				{
+					GuiltyPath: mmFsPath,
 				},
 				{
-					GuiltyPath: fsPath,
+					GuiltyPath: mmFsPath,
+				},
+				{
+					GuiltyPath: mmFsPath,
+				},
+				{
+					// But one reproducer points clearly to fs.
+					GuiltyPath: mmFsPath,
 					SyzRepro:   extProg,
 				},
 			},
@@ -87,11 +106,13 @@ func TestExtractor(t *testing.T) {
 	extractor := &Extractor{
 		raw: &testRawExtractor{
 			perPath: map[string][]*Subsystem{
-				fsPath: {fs},
+				fsPath:   {fs},
+				mmFsPath: {mm, fs},
 			},
 			perProg: []progSubsystems{
 				{extProg, []*Subsystem{ext}},
 				{nfsProg, []*Subsystem{nfs}},
+				{extNfsProg, []*Subsystem{ext, nfs}},
 			},
 		},
 	}

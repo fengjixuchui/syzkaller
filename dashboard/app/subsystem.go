@@ -5,6 +5,8 @@ package main
 
 import (
 	"fmt"
+	"reflect"
+	"sort"
 	"time"
 
 	"github.com/google/syzkaller/pkg/subsystem"
@@ -111,6 +113,7 @@ func updateBugSubsystems(c context.Context, bugKey *db.Key,
 		}
 		switch v := info.(type) {
 		case autoInference:
+			logSubsystemChange(c, bug, list)
 			bug.SetAutoSubsystems(list, now, int(v))
 		case userAssignment:
 			bug.SetUserSubsystems(list, now, string(v))
@@ -126,9 +129,25 @@ func updateBugSubsystems(c context.Context, bugKey *db.Key,
 	return db.RunInTransaction(c, tx, &db.TransactionOptions{Attempts: 10})
 }
 
+func logSubsystemChange(c context.Context, bug *Bug, new []*subsystem.Subsystem) {
+	var oldNames, newNames []string
+	for _, item := range bug.Tags.Subsystems {
+		oldNames = append(oldNames, item.Name)
+	}
+	for _, item := range new {
+		newNames = append(newNames, item.Name)
+	}
+	sort.Strings(oldNames)
+	sort.Strings(newNames)
+	if !reflect.DeepEqual(oldNames, newNames) {
+		log.Infof(c, "bug %s: subsystems set from %v to %v",
+			bug.keyHash(), oldNames, newNames)
+	}
+}
+
 const (
 	// We load the top crashesForInference crashes to determine the bug subsystem(s).
-	crashesForInference = 5
+	crashesForInference = 7
 	// How often we update open bugs.
 	openBugsUpdateTime = time.Hour * 24 * 30
 )

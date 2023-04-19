@@ -54,6 +54,9 @@ var testConfig = &GlobalConfig{
 		NonFinalMaxPeriod: 60 * 24 * time.Hour,
 		ReproRetestPeriod: 100 * 24 * time.Hour,
 	},
+	DiscussionEmails: []DiscussionEmailConfig{
+		{"lore@email.com", dashapi.DiscussionLore},
+	},
 	DefaultNamespace: "test1",
 	Namespaces: map[string]*Config{
 		"test1": {
@@ -449,6 +452,62 @@ var testConfig = &GlobalConfig{
 			},
 			RetestRepros: true,
 		},
+		"subsystem-reminders": {
+			AccessLevel: AccessPublic,
+			Key:         "subsystemreminderssubsystemreminders",
+			Clients: map[string]string{
+				clientSubsystemRemind: keySubsystemRemind,
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/reminders.git",
+					Branch: "main",
+					Alias:  "main",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessUser,
+					Name:        "non-public",
+					DailyLimit:  1000,
+					Filter: func(bug *Bug) FilterResult {
+						if strings.Contains(bug.Title, "keep private") {
+							return FilterReport
+						}
+						return FilterSkip
+					},
+					Config: &TestConfig{Index: 1},
+				},
+				{
+					AccessLevel: AccessPublic,
+					Name:        "public",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:              "bugs@syzkaller.com",
+						HandleListEmails:   true,
+						MailMaintainers:    true,
+						DefaultMaintainers: []string{"default@maintainers.com"},
+						SubjectPrefix:      "[syzbot]",
+					},
+				},
+			},
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.MustMakeService(testSubsystems),
+				Reminder: &BugListReportingConfig{
+					SourceReporting: "public",
+					BugsInReport:    6,
+					ModerationConfig: &EmailConfig{
+						Email:         "moderation@syzkaller.com",
+						SubjectPrefix: "[moderation]",
+					},
+					Config: &EmailConfig{
+						Email:           "bugs@syzkaller.com",
+						MailMaintainers: true,
+						SubjectPrefix:   "[syzbot]",
+					},
+				},
+			},
+		},
 	},
 }
 
@@ -464,6 +523,13 @@ var testSubsystems = []*subsystem.Subsystem{
 		PathRules:   []subsystem.PathRule{{IncludeRegexp: `b\.c`}},
 		Lists:       []string{"subsystemB@list.com"},
 		Maintainers: []string{"subsystemB@person.com"},
+	},
+	{
+		Name:        "subsystemC",
+		PathRules:   []subsystem.PathRule{{IncludeRegexp: `c\.c`}},
+		Lists:       []string{"subsystemC@list.com"},
+		Maintainers: []string{"subsystemC@person.com"},
+		NoReminders: true,
 	},
 }
 
@@ -488,6 +554,8 @@ const (
 	keyTestDecomm         = "keyTestDecommkeyTestDecomm"
 	clientMgrDecommission = "client-mgr-decommission"
 	keyMgrDecommission    = "keyMgrDecommissionkeyMgrDecommission"
+	clientSubsystemRemind = "client-subystem-reminders"
+	keySubsystemRemind    = "keySubsystemRemindkeySubsystemRemind"
 
 	restrictedManager     = "restricted-manager"
 	noFixBisectionManager = "no-fix-bisection-manager"

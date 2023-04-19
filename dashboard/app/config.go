@@ -57,6 +57,9 @@ type GlobalConfig struct {
 	AppURL string
 	// The email address to display on all web pages.
 	ContactEmail string
+	// Emails received via the addresses below will be attributed to the corresponding
+	// kind of Discussion.
+	DiscussionEmails []DiscussionEmailConfig
 }
 
 // Per-namespace config.
@@ -105,6 +108,16 @@ type Config struct {
 	Kcidb *KcidbConfig
 	// Subsystems config.
 	Subsystems SubsystemsConfig
+	// Instead of Last acitivity, display Discussions on the main page.
+	DisplayDiscussions bool
+}
+
+// DiscussionEmailConfig defines the correspondence between an email and a DiscussionSource.
+type DiscussionEmailConfig struct {
+	// The address at which syzbot has received the message.
+	ReceiveAddress string
+	// The associated DiscussionSource.
+	Source dashapi.DiscussionSource
 }
 
 // SubsystemsConfig describes where to take the list of subsystems and how to infer them.
@@ -113,6 +126,30 @@ type SubsystemsConfig struct {
 	Service *subsystem.Service
 	// If all existing subsystem labels must be recalculated, increase this integer.
 	Revision int
+	// Periodic per-subsystem reminders about open bugs.
+	Reminder *BugListReportingConfig
+}
+
+// BugListReportingConfig describes how aggregated reminders about open bugs should be processed.
+type BugListReportingConfig struct {
+	// Reports are sent every PeriodDays days (30 by default).
+	PeriodDays int
+	// Reports will include details about BugsInReport bugs (10 by default).
+	BugsInReport int
+	// Bugs that were first discovered less than MinBugAge ago, will not be included.
+	// The default value is 2 weeks.
+	MinBugAge time.Duration
+	// Reports will only be sent if there are at least MinBugsCount bugs to notify about.
+	// The default value is 2.
+	MinBugsCount int
+	// SourceReporting is the name of the reporting stage from which bugs should be taken.
+	SourceReporting string
+	// If ModerationConfig is set, bug lists will be first sent there for human confirmation.
+	// For now, only EmailConfig is supported.
+	ModerationConfig ReportingType
+	// Config specifies how exactly such notifications should be delivered.
+	// For now, only EmailConfig is supported.
+	Config ReportingType
 }
 
 // ObsoletingConfig describes how bugs without reproducer should be obsoleted.
@@ -292,6 +329,18 @@ func checkConfig(cfg *GlobalConfig) {
 	for ns, cfg := range cfg.Namespaces {
 		checkNamespace(ns, cfg, namespaces, clientNames)
 	}
+	checkDiscussionEmails(cfg.DiscussionEmails)
+}
+
+func checkDiscussionEmails(list []DiscussionEmailConfig) {
+	dup := map[string]struct{}{}
+	for _, item := range list {
+		email := item.ReceiveAddress
+		if _, ok := dup[email]; ok {
+			panic(fmt.Sprintf("duplicate %s in DiscussionEmails", email))
+		}
+		dup[email] = struct{}{}
+	}
 }
 
 func checkObsoleting(o ObsoletingConfig) {
@@ -357,6 +406,50 @@ func checkNamespace(ns string, cfg *Config, namespaces, clientNames map[string]b
 	}
 	checkKernelRepos(ns, cfg)
 	checkNamespaceReporting(ns, cfg)
+	checkSubsystems(ns, cfg)
+}
+
+func checkSubsystems(ns string, cfg *Config) {
+	if cfg.Subsystems.Reminder == nil {
+		// Nothing to validate.
+		return
+	}
+	if cfg.Subsystems.Service == nil {
+		panic(fmt.Sprintf("%v: Subsystems.Reminder is set while Subsystems.Service is nil", ns))
+	}
+	reminder := cfg.Subsystems.Reminder
+	if reminder.SourceReporting == "" {
+		panic(fmt.Sprintf("%v: Reminder.SourceReporting must be set", ns))
+	}
+	if reminder.Config == nil {
+		panic(fmt.Sprintf("%v: Reminder.Config must be set", ns))
+	}
+	reporting := cfg.ReportingByName(reminder.SourceReporting)
+	if reporting == nil {
+		panic(fmt.Sprintf("%v: Reminder.SourceReporting %v points to a non-existent reporting",
+			ns, reminder.SourceReporting))
+	}
+	if reporting.AccessLevel != AccessPublic {
+		panic(fmt.Sprintf("%v: Reminder.SourceReporting must point to a public reporting", ns))
+	}
+	if reminder.PeriodDays == 0 {
+		reminder.PeriodDays = 30
+	} else if reminder.PeriodDays < 0 {
+		panic(fmt.Sprintf("%v: Reminder.PeriodDays must be > 0", ns))
+	}
+	if reminder.BugsInReport == 0 {
+		reminder.BugsInReport = 10
+	} else if reminder.BugsInReport < 0 {
+		panic(fmt.Sprintf("%v: Reminder.BugsInReport must be > 0", ns))
+	}
+	if reminder.MinBugAge == 0 {
+		reminder.MinBugAge = 24 * time.Hour * 14
+	}
+	if reminder.MinBugsCount == 0 {
+		reminder.MinBugsCount = 2
+	} else if reminder.MinBugsCount < 0 {
+		panic(fmt.Sprintf("%v: Reminder.MinBugsCount must be > 0", ns))
+	}
 }
 
 func checkKernelRepos(ns string, cfg *Config) {

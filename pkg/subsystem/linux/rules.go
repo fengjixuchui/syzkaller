@@ -12,6 +12,8 @@ type customRules struct {
 	// These subsystems need to be extracted even without mailing lists.
 	// Key is the subsystem name, value is the list of raw names in MAINTAINERS.
 	extraSubsystems map[string][]string
+	// For these subsystems we do not generate monthly reminders.
+	noReminders map[string]struct{}
 }
 
 var (
@@ -37,13 +39,14 @@ var (
 			"gfs2":     {"syz_mount_image$gfs2", "syz_mount_image$gfs2meta"},
 			"hfs":      {"syz_mount_image$hfs", "syz_mount_image$hfsplus"},
 			"hpfs":     {"syz_mount_image$hpfs"},
+			"input":    {"syz_usb_connect$hid"},
 			"io-uring": {"syz_io_uring_setup"},
 			"isofs":    {"syz_mount_image$iso9660"},
 			"jffs2":    {"syz_mount_image$jffs2"},
 			"jfs":      {"syz_mount_image$jfs"},
 			"kvm":      {"syz_kvm_setup_cpu"},
 			"minix":    {"syz_mount_image$minix"},
-			"nilfs2":   {"syz_mount_image$nilfs2"},
+			"nilfs":    {"syz_mount_image$nilfs2"},
 			"ntfs":     {"syz_mount_image$ntfs"},
 			"ntfs3":    {"syz_mount_image$ntfs3"},
 			"ocfs2":    {"syz_mount_image$ocfs2"},
@@ -58,6 +61,14 @@ var (
 			"ubifs":    {"syz_mount_image$ubifs"},
 			"udf":      {"syz_mount_image$udf"},
 			"ufs":      {"syz_mount_image$ufs"},
+			"usb": {
+				"syz_usb_connect",
+				"syz_usb_connect$hid",
+				"syz_usb_connect$printer",
+				"syz_usb_connect$cdc_ecm",
+				"syz_usb_connect$cdc_ncm",
+				"syz_usb_connect$uac1",
+			},
 			"vxfs":     {"syz_mount_image$vxfs"},
 			"wireless": {"syz_80211_join_ibss", "syz_80211_inject_frame"},
 			"xfs":      {"syz_mount_image$xfs"},
@@ -78,6 +89,11 @@ var (
 			"isofs":  {"ISOFS FILESYSTEM"},
 			"kernfs": {"KERNFS"},
 			"udf":    {"UDF FILESYSTEM"},
+		},
+		noReminders: map[string]struct{}{
+			// Many misclassified bugs end up in `kernel`, so there's no sense
+			// in generating monthly reports for it.
+			"kernel": {},
 		},
 	}
 )

@@ -452,6 +452,49 @@ type BisectResult struct {
 	Fix             bool
 }
 
+type BugListReport struct {
+	ID          string
+	Config      []byte
+	Bugs        []BugListItem
+	TotalStats  BugListReportStats
+	PeriodStats BugListReportStats
+	PeriodDays  int
+	Link        string
+	Subsystem   string
+	Maintainers []string
+	Moderation  bool
+}
+
+type BugListReportStats struct {
+	Reported int
+	Fixed    int
+}
+
+// BugListItem represents a single bug from the BugListReport entity.
+type BugListItem struct {
+	ID         string
+	Title      string
+	Link       string
+	ReproLevel ReproLevel
+	Hits       int64
+}
+
+type BugListUpdate struct {
+	ID      string // copied from BugListReport
+	ExtID   string
+	Link    string
+	Command BugListUpdateCommand
+}
+
+type BugListUpdateCommand string
+
+const (
+	BugListSentCmd       BugListUpdateCommand = "sent"
+	BugListUpdateCmd     BugListUpdateCommand = "update"
+	BugListUpstreamCmd   BugListUpdateCommand = "upstream"
+	BugListRegenerateCmd BugListUpdateCommand = "regenerate"
+)
+
 type BugUpdate struct {
 	ID              string // copied from BugReport
 	JobID           string // copied from BugReport
@@ -525,6 +568,46 @@ type PollClosedRequest struct {
 
 type PollClosedResponse struct {
 	IDs []string
+}
+
+type DiscussionSource string
+
+const (
+	NoDiscussion   DiscussionSource = ""
+	DiscussionLore DiscussionSource = "lore"
+)
+
+type DiscussionType string
+
+const (
+	DiscussionReport   DiscussionType = "report"
+	DiscussionPatch    DiscussionType = "patch"
+	DiscussionReminder DiscussionType = "reminder"
+	DiscussionMention  DiscussionType = "mention"
+)
+
+type Discussion struct {
+	ID       string
+	Source   DiscussionSource
+	Type     DiscussionType
+	Subject  string
+	BugIDs   []string
+	Messages []DiscussionMessage
+}
+
+type DiscussionMessage struct {
+	ID       string
+	External bool // true if the message is not from the bot itself
+	Time     time.Time
+}
+
+type SaveDiscussionReq struct {
+	// If the discussion already exists, Messages and BugIDs will be appended to it.
+	Discussion *Discussion
+}
+
+func (dash *Dashboard) SaveDiscussion(req *SaveDiscussionReq) error {
+	return dash.Query("save_discussion", req, nil)
 }
 
 type TestPatchRequest struct {
@@ -673,11 +756,13 @@ type FullBugInfo struct {
 }
 
 type SimilarBugInfo struct {
-	Title     string
-	Status    BugStatus
-	Namespace string
-	Link      string
-	Closed    time.Time
+	Title      string
+	Status     BugStatus
+	Namespace  string
+	Link       string
+	ReportLink string
+	Closed     time.Time
+	ReproLevel ReproLevel
 }
 
 func (dash *Dashboard) LoadFullBug(req *LoadFullBugReq) (*FullBugInfo, error) {

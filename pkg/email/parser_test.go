@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -121,7 +122,10 @@ func TestParse(t *testing.T) {
 	for i, test := range parseTests {
 		body := func(t *testing.T, test ParseTest) {
 			email, err := Parse(strings.NewReader(test.email),
-				[]string{"bot <foo@bar.com>"}, []string{"list@googlegroups.com"})
+				[]string{"bot <foo@bar.com>"},
+				[]string{"list@googlegroups.com"},
+				[]string{"bar.com"},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -342,6 +346,8 @@ type ParseTest struct {
 	res   Email
 }
 
+var parseTestZone = time.FixedZone("", -7*60*60)
+
 // nolint: lll
 var parseTests = []ParseTest{
 	{`Date: Sun, 7 May 2017 19:54:00 -0700
@@ -362,8 +368,9 @@ To post to this group, send email to syzkaller@googlegroups.com.
 To view this discussion on the web visit https://groups.google.com/d/msgid/syzkaller/abcdef@google.com.
 For more options, visit https://groups.google.com/d/optout.`,
 		Email{
-			BugID:     "4564456",
+			BugIDs:    []string{"4564456"},
 			MessageID: "<123>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Link:      "https://groups.google.com/d/msgid/syzkaller/abcdef@google.com",
 			Subject:   "test subject",
 			Author:    "bob@example.com",
@@ -394,10 +401,12 @@ Content-Type: text/plain; charset="UTF-8"
 text body
 last line`,
 		Email{
-			BugID:     "4564456",
+			BugIDs:    []string{"4564456"},
 			MessageID: "<123>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:   "test subject",
 			Author:    "foo@bar.com",
+			OwnEmail:  true,
 			Cc:        []string{"bob@example.com"},
 			Body: `text body
 last line`,
@@ -417,6 +426,7 @@ second line
 last line`,
 		Email{
 			MessageID: "<123>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:   "test subject",
 			Author:    "bob@example.com",
 			Cc:        []string{"alice@example.com", "bob@example.com", "bot@example.com"},
@@ -443,6 +453,7 @@ last line
 #syz command`,
 		Email{
 			MessageID: "<123>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:   "test subject",
 			Author:    "bob@example.com",
 			Cc:        []string{"alice@example.com", "bob@example.com", "bot@example.com"},
@@ -483,6 +494,7 @@ IHQpKSB7CiAJCXNwaW5fdW5sb2NrKCZrY292LT5sb2NrKTsKIAkJcmV0dXJuOwo=
 --001a114ce0b01684a6054f0d8b81--`,
 		Email{
 			MessageID: "<123>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:   "test subject",
 			Author:    "bob@example.com",
 			Cc:        []string{"bob@example.com", "bot@example.com"},
@@ -571,6 +583,7 @@ or)</div></div></div>
 --f403043eee70018593054f0d9f1f--`,
 		Email{
 			MessageID: "<123>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:   "test subject",
 			Author:    "bob@example.com",
 			Cc:        []string{"bob@example.com", "bot@example.com"},
@@ -648,6 +661,7 @@ On 2018/06/10 4:57, syzbot wrote:
 d
 `, Email{
 		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Date:      time.Date(2018, time.June, 10, 10, 38, 20, 0, time.FixedZone("", 9*60*60)),
 		Subject:   "Re: BUG: unable to handle kernel NULL pointer dereference in sock_poll",
 		Author:    "bar@foo.com",
 		Cc:        []string{"bar@foo.com", "syzbot@syzkaller.appspotmail.com"},
@@ -709,8 +723,9 @@ To: syzbot <foo+4564456@bar.com>
 
 nothing to see here`,
 		Email{
-			BugID:       "4564456",
+			BugIDs:      []string{"4564456"},
 			MessageID:   "<123>",
+			Date:        time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:     "#syz test: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git master",
 			Author:      "bob@example.com",
 			Cc:          []string{"bob@example.com"},
@@ -729,6 +744,7 @@ To: syzbot <list@googlegroups.com>
 nothing to see here`,
 		Email{
 			MessageID:   "<123>",
+			Date:        time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:     "Subject",
 			Author:      "user@mail.com",
 			MailingList: "list@googlegroups.com",
@@ -746,6 +762,7 @@ To: <user2@mail.com>
 nothing to see here`,
 		Email{
 			MessageID:   "<123>",
+			Date:        time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:     "Subject",
 			Author:      "user@mail.com",
 			MailingList: "list@googlegroups.com",
@@ -763,6 +780,7 @@ To: <user2@mail.com>
 nothing to see here`,
 		Email{
 			MessageID:   "<123>",
+			Date:        time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 			Subject:     "Subject",
 			Author:      "list@googlegroups.com",
 			MailingList: "list@googlegroups.com",
@@ -776,7 +794,7 @@ Subject: Re: BUG: unable to handle kernel NULL pointer dereference in
 To: syzbot <syzbot+344bb0f46d7719cd9483@syzkaller.appspotmail.com>
 From: bar <bar@foo.com>
 Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
-Date: Sun, 10 Jun 2018 10:38:20 +0900
+Date: Sun, 7 May 2017 19:54:00 -0700
 MIME-Version: 1.0
 Content-Type: text/plain; charset="UTF-8"
 Content-Language: en-US
@@ -787,6 +805,7 @@ test: https://github.com/torvalds/linux.git 7b5bb460defa107dd2e82=
 f950fddb9ea6bdb5e39
 `, Email{
 		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
 		Subject:   "Re: BUG: unable to handle kernel NULL pointer dereference in sock_poll",
 		Author:    "bar@foo.com",
 		Cc:        []string{"bar@foo.com", "syzbot@syzkaller.appspotmail.com"},
@@ -796,5 +815,128 @@ test: https://github.com/torvalds/linux.git 7b5bb460defa107dd2e82f950fddb9ea6bdb
 		Command:     CmdTest,
 		CommandStr:  "test:",
 		CommandArgs: "https://github.com/torvalds/linux.git 7b5bb460defa107dd2e82f950fddb9ea6bdb5e39",
+	}},
+	{`Sender: syzkaller-bugs@googlegroups.com
+Subject: [PATCH] Some patch
+To: <someone@foo.com>
+From: bar <bar@foo.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Language: en-US
+Content-Transfer-Encoding: quoted-printable
+
+Reported-by: syzbot <foo+223c7461c58c58a4cb10@bar.com>
+`, Email{
+		BugIDs:    []string{"223c7461c58c58a4cb10"},
+		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+		Subject:   "[PATCH] Some patch",
+		Author:    "bar@foo.com",
+		Cc:        []string{"bar@foo.com", "someone@foo.com"},
+		Body: `Reported-by: syzbot <foo+223c7461c58c58a4cb10@bar.com>
+`,
+		Command: CmdNone,
+	}},
+	{`Sender: syzkaller-bugs@googlegroups.com
+Subject: [PATCH] Some patch
+To: <someone@foo.com>
+From: bar <bar@foo.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Language: en-US
+
+Link: https://bar.com/bug?extid=223c7461c58c58a4cb10@bar.com
+`, Email{
+		BugIDs:    []string{"223c7461c58c58a4cb10"},
+		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+		Subject:   "[PATCH] Some patch",
+		Author:    "bar@foo.com",
+		Cc:        []string{"bar@foo.com", "someone@foo.com"},
+		Body: `Link: https://bar.com/bug?extid=223c7461c58c58a4cb10@bar.com
+`,
+		Command: CmdNone,
+	}},
+
+	{`Sender: syzkaller-bugs@googlegroups.com
+Subject: [PATCH] Some patch
+To: <someone@foo.com>
+From: bar <bar@foo.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Language: en-US
+Content-Transfer-Encoding: quoted-printable
+
+Reported-by: syzbot <foo+223c7461c58c58a4cb10@bar.com>
+Reported-by: syzbot <foo+9909090909090909@bar.com>
+`, Email{
+		BugIDs:    []string{"223c7461c58c58a4cb10", "9909090909090909"},
+		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+		Subject:   "[PATCH] Some patch",
+		Author:    "bar@foo.com",
+		Cc:        []string{"bar@foo.com", "someone@foo.com"},
+		Body: `Reported-by: syzbot <foo+223c7461c58c58a4cb10@bar.com>
+Reported-by: syzbot <foo+9909090909090909@bar.com>
+`,
+		Command: CmdNone,
+	}},
+	{`Sender: syzkaller-bugs@googlegroups.com
+Subject: [PATCH] Some patch
+To: <someone@foo.com>, <foo+9909090909090909@bar.com>
+From: bar <bar@foo.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Language: en-US
+Content-Transfer-Encoding: quoted-printable
+
+Reported-by: syzbot <foo+223c7461c58c58a4cb10@bar.com>
+`, Email{
+		// First come BugIDs from header, then from the body.
+		BugIDs:    []string{"9909090909090909", "223c7461c58c58a4cb10"},
+		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+		Subject:   "[PATCH] Some patch",
+		Author:    "bar@foo.com",
+		Cc:        []string{"bar@foo.com", "someone@foo.com"},
+		Body: `Reported-by: syzbot <foo+223c7461c58c58a4cb10@bar.com>
+`,
+		Command: CmdNone,
+	}},
+	{`Sender: syzkaller-bugs@googlegroups.com
+Subject: Some discussion
+To: <someone@foo.com>
+From: bar <bar@foo.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Language: en-US
+Content-Transfer-Encoding: quoted-printable
+In-Reply-To: <000000000000f1a9d205f909f327@google.com>
+ <000000000000ee3a3005f909f30a@google.com>
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+
+Some text
+`, Email{
+		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		// The first one should be picked up.
+		InReplyTo: "<000000000000f1a9d205f909f327@google.com>",
+		Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+		Subject:   "Some discussion",
+		Author:    "bar@foo.com",
+		Cc:        []string{"bar@foo.com", "someone@foo.com"},
+		Body:      "Some text\n",
+		Command:   CmdNone,
 	}},
 }

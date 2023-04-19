@@ -14,16 +14,20 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 )
 
 type Email struct {
-	BugID       string
+	BugIDs      []string
 	MessageID   string
+	InReplyTo   string
+	Date        time.Time
 	Link        string
 	Subject     string
 	MailingList string
 	Author      string
+	OwnEmail    bool
 	Cc          []string
 	Body        string  // text/plain part
 	Patch       string  // attached patch, if any
@@ -46,6 +50,7 @@ const (
 	CmdInvalid
 	CmdUnCC
 	CmdSet
+	CmdRegenerate
 
 	cmdTest5
 )
@@ -64,7 +69,7 @@ func prepareEmails(list []string) map[string]bool {
 	return ret
 }
 
-func Parse(r io.Reader, ownEmails, goodLists []string) (*Email, error) {
+func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) {
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read email: %v", err)
@@ -80,7 +85,6 @@ func Parse(r io.Reader, ownEmails, goodLists []string) (*Email, error) {
 	to, _ := msg.Header.AddressList("To")
 	// AddressList fails if the header is not present.
 	cc, _ := msg.Header.AddressList("Cc")
-	bugID := ""
 	var ccList []string
 	ownAddrs := prepareEmails(ownEmails)
 	fromMe := false
@@ -98,6 +102,7 @@ func Parse(r io.Reader, ownEmails, goodLists []string) (*Email, error) {
 		originalFrom = originalFroms[0].String()
 	}
 
+	bugIDs := []string{}
 	rawCcList := append(append(append(cc, to...), from...), originalFroms...)
 	for _, addr := range rawCcList {
 		cleaned, context, _ := RemoveAddrContext(addr.Address)
@@ -105,9 +110,7 @@ func Parse(r io.Reader, ownEmails, goodLists []string) (*Email, error) {
 			cleaned = addr.Address
 		}
 		if ownAddrs[cleaned] {
-			if bugID == "" {
-				bugID = context
-			}
+			bugIDs = append(bugIDs, context)
 		} else {
 			ccList = append(ccList, CanonicalEmail(cleaned))
 		}
@@ -141,6 +144,8 @@ func Parse(r io.Reader, ownEmails, goodLists []string) (*Email, error) {
 		}
 		cmd, cmdStr, cmdArgs = extractCommand(subject + "\n" + bodyStr)
 	}
+	bugIDs = append(bugIDs, extractBodyBugIDs(bodyStr, ownAddrs, domains)...)
+
 	link := ""
 	if match := groupsLinkRe.FindStringSubmatchIndex(bodyStr); match != nil {
 		link = bodyStr[match[2]:match[3]]
@@ -161,12 +166,15 @@ func Parse(r io.Reader, ownEmails, goodLists []string) (*Email, error) {
 		// In other cases, the mailing list would preserve From and just change Sender.
 		mailingList = CanonicalEmail(sender)
 	}
-
+	date, _ := mail.ParseDate(msg.Header.Get("Date"))
 	email := &Email{
-		BugID:       bugID,
+		BugIDs:      dedupBugIDs(bugIDs),
 		MessageID:   msg.Header.Get("Message-ID"),
+		InReplyTo:   extractInReplyTo(msg.Header),
+		Date:        date,
 		Link:        link,
 		Author:      author,
+		OwnEmail:    fromMe,
 		MailingList: mailingList,
 		Subject:     subject,
 		Cc:          ccList,
@@ -311,6 +319,8 @@ func strToCmd(str string) Command {
 		return CmdUnCC
 	case "set", "set:":
 		return CmdSet
+	case "regenerate":
+		return CmdRegenerate
 	case "test_5_arg_cmd":
 		return cmdTest5
 	}
@@ -407,6 +417,67 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 		}
 		attachments = append(attachments, attachments1...)
 	}
+}
+
+var extractMessageIDs = regexp.MustCompile(`<.+?>`)
+
+func extractInReplyTo(header mail.Header) string {
+	value := header.Get("In-Reply-To")
+	// Normally there should be just one message, to which we reply.
+	// However, there have been some cases when multiple addresses were mentioned.
+	// For now let's just take the first one.
+	ret := extractMessageIDs.FindStringSubmatch(value)
+	if ret != nil {
+		return ret[0]
+	}
+	return ""
+}
+
+func extractBodyBugIDs(body string, ownEmailMap map[string]bool, domains []string) []string {
+	// Let's build a regular expression.
+	var rb strings.Builder
+	for email := range ownEmailMap {
+		escaped := regexp.QuoteMeta(email)
+		part := strings.ReplaceAll(escaped, `@`, `\+(\w+?)@`)
+		if rb.Len() > 0 {
+			rb.WriteString(`|`)
+		}
+		rb.WriteString(part)
+	}
+	for _, domain := range domains {
+		escaped := regexp.QuoteMeta(domain + "/bug?extid=")
+		if rb.Len() > 0 {
+			rb.WriteString(`|`)
+		}
+		rb.WriteString(escaped)
+		rb.WriteString(`([\w]+)`)
+	}
+	rg := regexp.MustCompile(rb.String())
+	ids := []string{}
+	for _, match := range rg.FindAllStringSubmatch(body, -1) {
+		// Take all non-empty group matches.
+		for i := 1; i < len(match); i++ {
+			if match[i] == "" {
+				continue
+			}
+			ids = append(ids, match[i])
+		}
+	}
+	return ids
+}
+
+func dedupBugIDs(list []string) []string {
+	// We should preserve the original order of IDs.
+	var ret []string
+	dup := map[string]struct{}{}
+	for _, v := range list {
+		if _, ok := dup[v]; ok {
+			continue
+		}
+		dup[v] = struct{}{}
+		ret = append(ret, v)
+	}
+	return ret
 }
 
 // MergeEmailLists merges several email lists removing duplicates and invalid entries.
