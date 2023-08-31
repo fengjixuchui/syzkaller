@@ -53,6 +53,23 @@ func TestGenerate(t *testing.T) {
 			checked[target.OS] = true
 			t.Parallel()
 			testTarget(t, target, full)
+			testPseudoSyscalls(t, target)
+		})
+	}
+}
+
+func testPseudoSyscalls(t *testing.T, target *prog.Target) {
+	// Use options that are as minimal as possible.
+	// We want to ensure that the code can always be compiled.
+	opts := Options{
+		Slowdown: 1,
+	}
+	rs := testutil.RandSource(t)
+	for _, meta := range target.PseudoSyscalls() {
+		p := target.GenSampleProg(meta, rs)
+		t.Run(fmt.Sprintf("single_%s", meta.CallName), func(t *testing.T) {
+			t.Parallel()
+			testOne(t, p, opts)
 		})
 	}
 }
@@ -174,10 +191,10 @@ r0 = csource0(0x1)
 csource1(r0)
 `,
 			output: `
-res = syscall(SYS_csource0, 1);
+res = syscall(SYS_csource0, /*num=*/1);
 if (res != -1)
 	r[0] = res;
-syscall(SYS_csource1, r[0]);
+syscall(SYS_csource1, /*fd=*/r[0]);
 `,
 		},
 		{
@@ -190,15 +207,15 @@ csource6(&AUTO)
 `,
 			output: fmt.Sprintf(`
 NONFAILING(memcpy((void*)0x%x, "\x12\x34\x56\x78", 4));
-syscall(SYS_csource2, 0x%xul);
+syscall(SYS_csource2, /*buf=*/0x%xul);
 NONFAILING(memset((void*)0x%x, 0, 10));
-syscall(SYS_csource3, 0x%xul);
+syscall(SYS_csource3, /*buf=*/0x%xul);
 NONFAILING(memset((void*)0x%x, 48, 10));
-syscall(SYS_csource4, 0x%xul);
+syscall(SYS_csource4, /*buf=*/0x%xul);
 NONFAILING(memcpy((void*)0x%x, "0101010101", 10));
-syscall(SYS_csource5, 0x%xul);
+syscall(SYS_csource5, /*buf=*/0x%xul);
 NONFAILING(memcpy((void*)0x%x, "101010101010", 12));
-syscall(SYS_csource6, 0x%xul);
+syscall(SYS_csource6, /*buf=*/0x%xul);
 `,
 				target.DataOffset+0x40, target.DataOffset+0x40,
 				target.DataOffset+0x80, target.DataOffset+0x80,

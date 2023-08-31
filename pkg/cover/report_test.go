@@ -220,7 +220,7 @@ func buildTestBinary(t *testing.T, target *targets.Target, test Test, dir string
 		errText = strings.ReplaceAll(errText, "‘", "'")
 		errText = strings.ReplaceAll(errText, "’", "'")
 		if strings.Contains(errText, "error: unrecognized command line option '-fsanitize-coverage=trace-pc'") &&
-			(os.Getenv("SYZ_BIG_ENV") == "" || target.OS == targets.Akaros) {
+			(os.Getenv("SYZ_ENV") == "" || target.OS == targets.Akaros) {
 			t.Skip("skipping test, -fsanitize-coverage=trace-pc is not supported")
 		}
 		t.Fatal(err)
@@ -248,7 +248,7 @@ func buildTestBinary(t *testing.T, target *targets.Target, test Test, dir string
 		ldflags = ldflags[:len(ldflags)-1]
 	}
 	if _, err := osutil.RunCmd(time.Hour, "", target.CCompiler, ldflags...); err != nil {
-		// Arm linker in the big-env image has a bug when linking a clang-produced files.
+		// Arm linker in the env image has a bug when linking a clang-produced files.
 		if regexp.MustCompile(`arm-linux-gnueabi.* assertion fail`).MatchString(err.Error()) {
 			t.Skipf("skipping test, broken arm linker (%v)", err)
 		}
@@ -260,6 +260,15 @@ func buildTestBinary(t *testing.T, target *targets.Target, test Test, dir string
 func generateReport(t *testing.T, target *targets.Target, test Test) ([]byte, []byte, error) {
 	dir := t.TempDir()
 	bin := buildTestBinary(t, target, test, dir)
+	cfg := &mgrconfig.Config{
+		Derived: mgrconfig.Derived{
+			SysTarget: target,
+		},
+		KernelObj:      dir,
+		KernelSrc:      dir,
+		KernelBuildSrc: dir,
+		Type:           "",
+	}
 	subsystem := []mgrconfig.Subsystem{
 		{
 			Name: "sound",
@@ -277,7 +286,7 @@ func generateReport(t *testing.T, target *targets.Target, test Test) ([]byte, []
 		progs = append(progs, Prog{Sig: p.Sig, Data: p.Data, PCs: append([]uint64{}, p.PCs...)})
 	}
 
-	rg, err := MakeReportGenerator(target, "", dir, dir, dir, subsystem, nil, nil, false)
+	rg, err := MakeReportGenerator(cfg, subsystem, nil, false)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -59,9 +59,9 @@ NORETURN void doexit_thread(int status)
 #endif
 #endif
 
-#if SYZ_EXECUTOR || SYZ_MULTI_PROC || SYZ_REPEAT && SYZ_CGROUPS ||         \
-    SYZ_NET_DEVICES || __NR_syz_mount_image || __NR_syz_read_part_table || \
-    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k ||                  \
+#if SYZ_EXECUTOR || SYZ_MULTI_PROC || SYZ_REPEAT && SYZ_CGROUPS ||                      \
+    SYZ_NET_DEVICES || __NR_syz_mount_image || __NR_syz_read_part_table ||              \
+    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_usbip_server_init || \
     (GOOS_freebsd || GOOS_darwin || GOOS_openbsd || GOOS_netbsd) && SYZ_NET_INJECTION
 static unsigned long long procid;
 #endif
@@ -165,7 +165,9 @@ static void kill_and_wait(int pid, int* status)
 
 #if !GOOS_windows
 #if SYZ_EXECUTOR || SYZ_THREADED || SYZ_REPEAT && SYZ_EXECUTOR_USES_FORK_SERVER || \
-    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_sleep_ms
+    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_sleep_ms ||     \
+    __NR_syz_usb_control_io || __NR_syz_usb_ep_read || __NR_syz_usb_ep_write ||    \
+    __NR_syz_usb_disconnect
 static void sleep_ms(uint64 ms)
 {
 	usleep(ms * 1000);
@@ -362,7 +364,7 @@ static void event_set(event_t* ev)
 {
 	pthread_mutex_lock(&ev->mu);
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	ev->state = 1;
 	pthread_mutex_unlock(&ev->mu);
 	pthread_cond_broadcast(&ev->cv);
@@ -480,7 +482,7 @@ void child()
 }
 #endif
 
-#elif GOOS_freebsd || GOOS_darwin || GOOS_netbsd || GOOS_openbsd
+#elif GOOS_freebsd || GOOS_darwin || GOOS_netbsd
 
 #include <unistd.h>
 
@@ -492,7 +494,7 @@ void child()
 
 #if GOOS_netbsd
 
-#if SYZ_EXECUTOR || __NR_syz_usb_connect
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_disconnect
 
 #include <dev/usb/usb.h>
 #include <dev/usb/usbhid.h>
@@ -636,6 +638,8 @@ struct usb_qualifier_descriptor {
 #define USB_REQ_GET_VDM 23
 #define USB_REQ_SEND_VDM 24
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect
+
 #define USB_MAX_IFACE_NUM 4
 #define USB_MAX_EP_NUM 32
 #define USB_MAX_FDS 6
@@ -670,7 +674,21 @@ struct usb_info {
 	struct usb_device_index index;
 };
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || \
+    __NR_syz_usb_control_io || __NR_syz_usb_ep_read || __NR_syz_usb_ep_write
 static struct usb_info usb_devices[USB_MAX_FDS];
+
+static struct usb_device_index* lookup_usb_index(int fd)
+{
+	for (int i = 0; i < USB_MAX_FDS; i++) {
+		if (__atomic_load_n(&usb_devices[i].fd, __ATOMIC_ACQUIRE) == fd)
+			return &usb_devices[i].index;
+	}
+	return NULL;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
 static int usb_devices_num;
 
 static bool parse_usb_descriptor(const char* buffer, size_t length, struct usb_device_index* index)
@@ -734,14 +752,7 @@ static struct usb_device_index* add_usb_index(int fd, const char* dev, size_t de
 	return &usb_devices[i].index;
 }
 
-static struct usb_device_index* lookup_usb_index(int fd)
-{
-	for (int i = 0; i < USB_MAX_FDS; i++) {
-		if (__atomic_load_n(&usb_devices[i].fd, __ATOMIC_ACQUIRE) == fd)
-			return &usb_devices[i].index;
-	}
-	return NULL;
-}
+#endif
 
 #if USB_DEBUG
 
@@ -1168,6 +1179,8 @@ struct vusb_connect_descriptors {
 	struct vusb_connect_string_descriptor strs[0];
 } __attribute__((packed));
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
+
 static const char default_string[] = {
     8, USB_DT_STRING,
     's', 0, 'y', 0, 'z', 0
@@ -1254,6 +1267,8 @@ static bool lookup_connect_response_in(int fd, const struct vusb_connect_descrip
 	debug("lookup_connect_response_in: unknown request");
 	return false;
 }
+
+#endif
 
 typedef bool (*lookup_connect_out_response_t)(int fd, const struct vusb_connect_descriptors* descs,
 					      const struct usb_ctrlrequest* ctrl, bool* done);
@@ -1565,7 +1580,6 @@ static volatile long syz_usb_connect_impl(int fd, uint64 speed, uint64 dev_len,
 	return fd;
 }
 
-#if SYZ_EXECUTOR || __NR_syz_usb_connect
 static volatile long syz_usb_connect(volatile long a0, volatile long a1,
 				     volatile long a2, volatile long a3)
 {
@@ -1681,24 +1695,8 @@ static int fault_injected(int fd)
 
 #endif
 
-#if GOOS_openbsd || GOOS_darwin
+#if GOOS_darwin
 #define __syscall syscall
-#endif
-
-#if GOOS_openbsd && (SYZ_EXECUTOR || __NR_syz_open_pts)
-#include <termios.h>
-#include <util.h>
-
-static uintptr_t syz_open_pts(void)
-{
-	int master, slave;
-
-	if (openpty(&master, &slave, NULL, NULL, NULL) == -1)
-		return -1;
-	if (dup2(master, master + 100) != -1)
-		close(master);
-	return slave;
-}
 #endif
 
 #if SYZ_EXECUTOR || SYZ_NET_INJECTION
@@ -1715,8 +1713,6 @@ static int tunfd = -1;
 #define MAX_TUN 64
 #elif GOOS_freebsd
 #define MAX_TUN 256
-#elif GOOS_openbsd
-#define MAX_TUN 8
 #else
 #define MAX_TUN 4
 #endif
@@ -1820,9 +1816,7 @@ static void initialize_tun(int tun_id)
 
 	char local_mac[sizeof(LOCAL_MAC)];
 	snprintf_check(local_mac, sizeof(local_mac), LOCAL_MAC);
-#if GOOS_openbsd
-	execute_command(1, "ifconfig %s lladdr %s", tun_iface, local_mac);
-#elif GOOS_netbsd
+#if GOOS_netbsd
 	execute_command(1, "ifconfig %s link %s", tun_iface, local_mac);
 #else
 	execute_command(1, "ifconfig %s ether %s", tun_iface, local_mac);
@@ -2043,6 +2037,350 @@ static int do_sandbox_setuid(void)
 }
 #endif
 
+#elif GOOS_openbsd
+
+#include <unistd.h>
+
+#include <pwd.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/event.h>
+#include <sys/ioctl.h>
+#include <sys/ktrace.h>
+#include <sys/mman.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/syslog.h>
+
+#define CAST
+
+#if (SYZ_EXECUTOR || __NR_syz_open_pts)
+#include <termios.h>
+#include <util.h>
+
+static uintptr_t syz_open_pts(void)
+{
+	int master, slave;
+
+	if (openpty(&master, &slave, NULL, NULL, NULL) == -1)
+		return -1;
+	if (dup2(master, master + 100) != -1)
+		close(master);
+	return slave;
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_NET_INJECTION
+
+#include <net/if_tun.h>
+#include <sys/types.h>
+
+static int tunfd = -1;
+
+#define MAX_TUN 8
+#define TUN_IFACE "tap%d"
+#define MAX_TUN_IFACE_SIZE sizeof("tap2147483647")
+#define TUN_DEVICE "/dev/tap%d"
+#define MAX_TUN_DEVICE_SIZE sizeof("/dev/tap2147483647")
+
+#define LOCAL_MAC "aa:aa:aa:aa:aa:aa"
+#define REMOTE_MAC "aa:aa:aa:aa:aa:bb"
+#define LOCAL_IPV4 "172.20.%d.170"
+#define MAX_LOCAL_IPV4_SIZE sizeof("172.20.255.170")
+#define REMOTE_IPV4 "172.20.%d.187"
+#define MAX_REMOTE_IPV4_SIZE sizeof("172.20.255.187")
+#define LOCAL_IPV6 "fe80::%02xaa"
+#define MAX_LOCAL_IPV6_SIZE sizeof("fe80::ffaa")
+#define REMOTE_IPV6 "fe80::%02xbb"
+#define MAX_REMOTE_IPV6_SIZE sizeof("fe80::ffbb")
+
+static void vsnprintf_check(char* str, size_t size, const char* format, va_list args)
+{
+	int rv = vsnprintf(str, size, format, args);
+	if (rv < 0)
+		fail("vsnprintf failed");
+	if ((size_t)rv >= size)
+		failmsg("vsnprintf: string doesn't fit into buffer", "string='%s'", str);
+}
+
+static void snprintf_check(char* str, size_t size, const char* format, ...)
+{
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf_check(str, size, format, args);
+	va_end(args);
+}
+
+#define COMMAND_MAX_LEN 128
+#define PATH_PREFIX "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
+#define PATH_PREFIX_LEN (sizeof(PATH_PREFIX) - 1)
+
+static void execute_command(bool panic, const char* format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	char command[PATH_PREFIX_LEN + COMMAND_MAX_LEN];
+	memcpy(command, PATH_PREFIX, PATH_PREFIX_LEN);
+	vsnprintf_check(command + PATH_PREFIX_LEN, COMMAND_MAX_LEN, format, args);
+	va_end(args);
+	int rv = system(command);
+	if (rv) {
+		if (panic)
+			failmsg("command failed", "command=%s: %d", &command[0], rv);
+		debug("command '%s': %d\n", &command[0], rv);
+	}
+}
+
+static void initialize_tun(int tun_id)
+{
+#if SYZ_EXECUTOR
+	if (!flag_net_injection)
+		return;
+#endif
+
+	if (tun_id < 0 || tun_id >= MAX_TUN)
+		failmsg("tun_id out of range", "tun_id=%d", tun_id);
+
+	char tun_device[MAX_TUN_DEVICE_SIZE];
+	snprintf_check(tun_device, sizeof(tun_device), TUN_DEVICE, tun_id);
+
+	char tun_iface[MAX_TUN_IFACE_SIZE];
+	snprintf_check(tun_iface, sizeof(tun_iface), TUN_IFACE, tun_id);
+
+	execute_command(0, "ifconfig %s destroy", tun_iface);
+
+	tunfd = open(tun_device, O_RDWR | O_NONBLOCK);
+	if (tunfd == -1) {
+#if SYZ_EXECUTOR
+		failmsg("tun: can't open device", "device=%s", tun_device);
+#else
+		printf("tun: can't open %s: errno=%d\n", tun_device, errno);
+		return;
+#endif
+	}
+	const int kTunFd = 200;
+	if (dup2(tunfd, kTunFd) < 0)
+		fail("dup2(tunfd, kTunFd) failed");
+	close(tunfd);
+	tunfd = kTunFd;
+
+	char local_mac[sizeof(LOCAL_MAC)];
+	snprintf_check(local_mac, sizeof(local_mac), LOCAL_MAC);
+	execute_command(1, "ifconfig %s lladdr %s", tun_iface, local_mac);
+	char local_ipv4[MAX_LOCAL_IPV4_SIZE];
+	snprintf_check(local_ipv4, sizeof(local_ipv4), LOCAL_IPV4, tun_id);
+	execute_command(1, "ifconfig %s inet %s netmask 255.255.255.0", tun_iface, local_ipv4);
+	char remote_mac[sizeof(REMOTE_MAC)];
+	char remote_ipv4[MAX_REMOTE_IPV4_SIZE];
+	snprintf_check(remote_mac, sizeof(remote_mac), REMOTE_MAC);
+	snprintf_check(remote_ipv4, sizeof(remote_ipv4), REMOTE_IPV4, tun_id);
+	execute_command(0, "arp -s %s %s", remote_ipv4, remote_mac);
+	char local_ipv6[MAX_LOCAL_IPV6_SIZE];
+	snprintf_check(local_ipv6, sizeof(local_ipv6), LOCAL_IPV6, tun_id);
+	execute_command(1, "ifconfig %s inet6 %s", tun_iface, local_ipv6);
+	char remote_ipv6[MAX_REMOTE_IPV6_SIZE];
+	snprintf_check(remote_ipv6, sizeof(remote_ipv6), REMOTE_IPV6, tun_id);
+	execute_command(0, "ndp -s %s%%%s %s", remote_ipv6, tun_iface, remote_mac);
+}
+
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_emit_ethernet && SYZ_NET_INJECTION
+#include <sys/uio.h>
+
+static long syz_emit_ethernet(volatile long a0, volatile long a1)
+{
+	if (tunfd < 0)
+		return (uintptr_t)-1;
+
+	size_t length = a0;
+	const char* data = (char*)a1;
+	debug_dump_data(data, length);
+
+	return write(tunfd, data, length);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_NET_INJECTION && (__NR_syz_extract_tcp_res || SYZ_REPEAT)
+#include <errno.h>
+
+static int read_tun(char* data, int size)
+{
+	if (tunfd < 0)
+		return -1;
+
+	int rv = read(tunfd, data, size);
+	if (rv < 0) {
+		if (errno == EAGAIN)
+			return -1;
+		fail("tun: read failed");
+	}
+	return rv;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_extract_tcp_res && SYZ_NET_INJECTION
+
+struct tcp_resources {
+	uint32 seq;
+	uint32 ack;
+};
+
+#include <net/ethertypes.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/if_ether.h>
+
+static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile long a2)
+{
+
+	if (tunfd < 0)
+		return (uintptr_t)-1;
+	char data[1000];
+	int rv = read_tun(&data[0], sizeof(data));
+	if (rv == -1)
+		return (uintptr_t)-1;
+	size_t length = rv;
+	debug_dump_data(data, length);
+
+	if (length < sizeof(struct ether_header))
+		return (uintptr_t)-1;
+	struct ether_header* ethhdr = (struct ether_header*)&data[0];
+
+	struct tcphdr* tcphdr = 0;
+	if (ethhdr->ether_type == htons(ETHERTYPE_IP)) {
+		if (length < sizeof(struct ether_header) + sizeof(struct ip))
+			return (uintptr_t)-1;
+		struct ip* iphdr = (struct ip*)&data[sizeof(struct ether_header)];
+		if (iphdr->ip_p != IPPROTO_TCP)
+			return (uintptr_t)-1;
+		if (length < sizeof(struct ether_header) + iphdr->ip_hl * 4 + sizeof(struct tcphdr))
+			return (uintptr_t)-1;
+		tcphdr = (struct tcphdr*)&data[sizeof(struct ether_header) + iphdr->ip_hl * 4];
+	} else {
+		if (length < sizeof(struct ether_header) + sizeof(struct ip6_hdr))
+			return (uintptr_t)-1;
+		struct ip6_hdr* ipv6hdr = (struct ip6_hdr*)&data[sizeof(struct ether_header)];
+		if (ipv6hdr->ip6_nxt != IPPROTO_TCP)
+			return (uintptr_t)-1;
+		if (length < sizeof(struct ether_header) + sizeof(struct ip6_hdr) + sizeof(struct tcphdr))
+			return (uintptr_t)-1;
+		tcphdr = (struct tcphdr*)&data[sizeof(struct ether_header) + sizeof(struct ip6_hdr)];
+	}
+
+	struct tcp_resources* res = (struct tcp_resources*)a0;
+	res->seq = htonl(ntohl(tcphdr->th_seq) + (uint32)a1);
+	res->ack = htonl(ntohl(tcphdr->th_ack) + (uint32)a2);
+
+	debug("extracted seq: %08x\n", res->seq);
+	debug("extracted ack: %08x\n", res->ack);
+
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NONE
+
+#include <sys/resource.h>
+
+static void sandbox_common()
+{
+#if !SYZ_THREADED
+#if SYZ_EXECUTOR
+	if (!flag_threaded)
+#endif
+		if (setsid() == -1)
+			fail("setsid failed");
+#endif
+	struct rlimit rlim;
+	rlim.rlim_cur = rlim.rlim_max = 8 << 20;
+	setrlimit(RLIMIT_MEMLOCK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
+	setrlimit(RLIMIT_FSIZE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
+	setrlimit(RLIMIT_STACK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 0;
+	setrlimit(RLIMIT_CORE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 256;
+	setrlimit(RLIMIT_NOFILE, &rlim);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
+
+static void loop();
+
+static int do_sandbox_none(void)
+{
+	sandbox_common();
+#if SYZ_EXECUTOR || SYZ_NET_INJECTION
+	initialize_tun(procid);
+#endif
+	loop();
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_SETUID
+
+#include <sys/wait.h>
+
+static void loop();
+
+static int wait_for_loop(int pid)
+{
+	if (pid < 0)
+		fail("sandbox fork failed");
+	debug("spawned loop pid %d\n", pid);
+	int status = 0;
+	while (waitpid(-1, &status, WUNTRACED) != pid) {
+	}
+	return WEXITSTATUS(status);
+}
+
+#define SYZ_HAVE_SANDBOX_SETUID 1
+static int do_sandbox_setuid(void)
+{
+	int pid = fork();
+	if (pid != 0)
+		return wait_for_loop(pid);
+
+	sandbox_common();
+#if SYZ_EXECUTOR || SYZ_NET_INJECTION
+	initialize_tun(procid);
+#endif
+
+	char pwbuf[1024];
+	struct passwd *pw, pwres;
+	if (getpwnam_r("nobody", &pwres, pwbuf, sizeof(pwbuf), &pw) != 0 || !pw)
+		fail("getpwnam_r(\"nobody\") failed");
+
+	if (setgroups(0, NULL))
+		fail("failed to setgroups");
+	if (setgid(pw->pw_gid))
+		fail("failed to setgid");
+	if (setuid(pw->pw_uid))
+		fail("failed to setuid");
+
+	loop();
+	doexit(1);
+}
+#endif
+
 #elif GOOS_fuchsia
 
 #include <fcntl.h>
@@ -2200,7 +2538,7 @@ static void event_reset(event_t* ev)
 static void event_set(event_t* ev)
 {
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	__atomic_store_n(&ev->state, 1, __ATOMIC_RELEASE);
 }
 
@@ -2348,7 +2686,7 @@ static void event_reset(event_t* ev)
 static void event_set(event_t* ev)
 {
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	__atomic_store_n(&ev->state, 1, __ATOMIC_RELEASE);
 	syscall(SYS_futex, &ev->state, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1000000);
 }
@@ -2424,6 +2762,7 @@ static bool write_file(const char* file, const char* what, ...)
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154 || \
     __NR_syz_genetlink_get_family_id || __NR_syz_80211_inject_frame || __NR_syz_80211_join_ibss || SYZ_NIC_VF
 #include <arpa/inet.h>
+#include <errno.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -3428,6 +3767,18 @@ static void initialize_wifi_devices(void)
 }
 #endif
 
+#if SYZ_EXECUTOR || (SYZ_NET_DEVICES && SYZ_NIC_VF) || SYZ_SWAP
+static int runcmdline(char* cmdline)
+{
+	debug("%s\n", cmdline);
+	int ret = system(cmdline);
+	if (ret) {
+		debug("FAIL: %s\n", cmdline);
+	}
+	return ret;
+}
+#endif
+
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 #include <arpa/inet.h>
 #include <errno.h>
@@ -3689,15 +4040,6 @@ error:
 }
 
 #if SYZ_EXECUTOR || SYZ_NIC_VF
-static int runcmdline(char* cmdline)
-{
-	debug("%s\n", cmdline);
-	int ret = system(cmdline);
-	if (ret) {
-		debug("FAIL: %s\n", cmdline);
-	}
-	return ret;
-}
 
 static void netlink_nicvf_setup(void)
 {
@@ -4105,23 +4447,25 @@ struct io_uring_params {
 
 #include <sys/mman.h>
 #include <unistd.h>
-static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5)
+static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
 	uint32 entries = (uint32)a0;
 	struct io_uring_params* setup_params = (struct io_uring_params*)a1;
-	void* vma1 = (void*)a2;
-	void* vma2 = (void*)a3;
-	void** ring_ptr_out = (void**)a4;
-	void** sqes_ptr_out = (void**)a5;
+	void** ring_ptr_out = (void**)a2;
+	void** sqes_ptr_out = (void**)a3;
 
 	uint32 fd_io_uring = syscall(__NR_io_uring_setup, entries, setup_params);
 	uint32 sq_ring_sz = setup_params->sq_off.array + setup_params->sq_entries * sizeof(uint32);
 	uint32 cq_ring_sz = setup_params->cq_off.cqes + setup_params->cq_entries * SIZEOF_IO_URING_CQE;
 	uint32 ring_sz = sq_ring_sz > cq_ring_sz ? sq_ring_sz : cq_ring_sz;
-	*ring_ptr_out = mmap(vma1, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE | MAP_FIXED, fd_io_uring, IORING_OFF_SQ_RING);
+	*ring_ptr_out = mmap(0, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_io_uring, IORING_OFF_SQ_RING);
 
 	uint32 sqes_sz = setup_params->sq_entries * SIZEOF_IO_URING_SQE;
-	*sqes_ptr_out = mmap(vma2, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE | MAP_FIXED, fd_io_uring, IORING_OFF_SQES);
+	*sqes_ptr_out = mmap(0, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_io_uring, IORING_OFF_SQES);
+
+	uint32* array = (uint32*)((uintptr_t)*ring_ptr_out + setup_params->sq_off.array);
+	for (uint32 index = 0; index < entries; index++)
+		array[index] = index;
 
 	return fd_io_uring;
 }
@@ -4130,26 +4474,19 @@ static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long
 
 #if SYZ_EXECUTOR || __NR_syz_io_uring_submit
 
-static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile long a2)
 {
 	char* ring_ptr = (char*)a0;
 	char* sqes_ptr = (char*)a1;
-	char* sqe = (char*)a2;
-	uint32 sqes_index = (uint32)a3;
 
-	uint32 sq_ring_entries = *(uint32*)(ring_ptr + SQ_RING_ENTRIES_OFFSET);
-	uint32 cq_ring_entries = *(uint32*)(ring_ptr + CQ_RING_ENTRIES_OFFSET);
-	uint32 sq_array_off = (CQ_CQES_OFFSET + cq_ring_entries * SIZEOF_IO_URING_CQE + 63) & ~63;
-	if (sq_ring_entries)
-		sqes_index %= sq_ring_entries;
-	char* sqe_dest = sqes_ptr + sqes_index * SIZEOF_IO_URING_SQE;
-	memcpy(sqe_dest, sqe, SIZEOF_IO_URING_SQE);
+	char* sqe = (char*)a2;
+
 	uint32 sq_ring_mask = *(uint32*)(ring_ptr + SQ_RING_MASK_OFFSET);
 	uint32* sq_tail_ptr = (uint32*)(ring_ptr + SQ_TAIL_OFFSET);
 	uint32 sq_tail = *sq_tail_ptr & sq_ring_mask;
+	char* sqe_dest = sqes_ptr + sq_tail * SIZEOF_IO_URING_SQE;
+	memcpy(sqe_dest, sqe, SIZEOF_IO_URING_SQE);
 	uint32 sq_tail_next = *sq_tail_ptr + 1;
-	uint32* sq_array = (uint32*)(ring_ptr + sq_array_off);
-	*(sq_array + sq_tail) = sqes_index;
 	__atomic_store_n(sq_tail_ptr, sq_tail_next, __ATOMIC_RELEASE);
 	return 0;
 }
@@ -4464,7 +4801,9 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
 #define MAX_FDS 30
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k ||       \
+    __NR_syz_usb_ep_write || __NR_syz_usb_ep_read || __NR_syz_usb_control_io || \
+    __NR_syz_usb_disconnect
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/usb/ch9.h>
@@ -4510,7 +4849,21 @@ struct usb_info {
 	struct usb_device_index index;
 };
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || \
+    __NR_syz_usb_control_io || __NR_syz_usb_ep_read || __NR_syz_usb_ep_write
 static struct usb_info usb_devices[USB_MAX_FDS];
+
+static struct usb_device_index* lookup_usb_index(int fd)
+{
+	for (int i = 0; i < USB_MAX_FDS; i++) {
+		if (__atomic_load_n(&usb_devices[i].fd, __ATOMIC_ACQUIRE) == fd)
+			return &usb_devices[i].index;
+	}
+	return NULL;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
 static int usb_devices_num;
 
 static bool parse_usb_descriptor(const char* buffer, size_t length, struct usb_device_index* index)
@@ -4574,14 +4927,7 @@ static struct usb_device_index* add_usb_index(int fd, const char* dev, size_t de
 	return &usb_devices[i].index;
 }
 
-static struct usb_device_index* lookup_usb_index(int fd)
-{
-	for (int i = 0; i < USB_MAX_FDS; i++) {
-		if (__atomic_load_n(&usb_devices[i].fd, __ATOMIC_ACQUIRE) == fd)
-			return &usb_devices[i].index;
-	}
-	return NULL;
-}
+#endif
 
 #if USB_DEBUG
 
@@ -5008,6 +5354,8 @@ struct vusb_connect_descriptors {
 	struct vusb_connect_string_descriptor strs[0];
 } __attribute__((packed));
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
+
 static const char default_string[] = {
     8, USB_DT_STRING,
     's', 0, 'y', 0, 'z', 0
@@ -5094,6 +5442,8 @@ static bool lookup_connect_response_in(int fd, const struct vusb_connect_descrip
 	debug("lookup_connect_response_in: unknown request");
 	return false;
 }
+
+#endif
 
 typedef bool (*lookup_connect_out_response_t)(int fd, const struct vusb_connect_descriptors* descs,
 					      const struct usb_ctrlrequest* ctrl, bool* done);
@@ -5323,6 +5673,7 @@ struct usb_raw_eps_info {
 #define USB_RAW_IOCTL_EP_CLEAR_HALT _IOW('U', 14, __u32)
 #define USB_RAW_IOCTL_EP_SET_WEDGE _IOW('U', 15, __u32)
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
 static int usb_raw_open()
 {
 	return open("/dev/raw-gadget", O_RDWR);
@@ -5341,21 +5692,7 @@ static int usb_raw_run(int fd)
 {
 	return ioctl(fd, USB_RAW_IOCTL_RUN, 0);
 }
-
-static int usb_raw_event_fetch(int fd, struct usb_raw_event* event)
-{
-	return ioctl(fd, USB_RAW_IOCTL_EVENT_FETCH, event);
-}
-
-static int usb_raw_ep0_write(int fd, struct usb_raw_ep_io* io)
-{
-	return ioctl(fd, USB_RAW_IOCTL_EP0_WRITE, io);
-}
-
-static int usb_raw_ep0_read(int fd, struct usb_raw_ep_io* io)
-{
-	return ioctl(fd, USB_RAW_IOCTL_EP0_READ, io);
-}
+#endif
 
 #if SYZ_EXECUTOR || __NR_syz_usb_ep_write
 static int usb_raw_ep_write(int fd, struct usb_raw_ep_io* io)
@@ -5371,15 +5708,7 @@ static int usb_raw_ep_read(int fd, struct usb_raw_ep_io* io)
 }
 #endif
 
-static int usb_raw_ep_enable(int fd, struct usb_endpoint_descriptor* desc)
-{
-	return ioctl(fd, USB_RAW_IOCTL_EP_ENABLE, desc);
-}
-
-static int usb_raw_ep_disable(int fd, int ep)
-{
-	return ioctl(fd, USB_RAW_IOCTL_EP_DISABLE, ep);
-}
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
 
 static int usb_raw_configure(int fd)
 {
@@ -5391,10 +5720,39 @@ static int usb_raw_vbus_draw(int fd, uint32 power)
 	return ioctl(fd, USB_RAW_IOCTL_VBUS_DRAW, power);
 }
 
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_usb_control_io
+static int usb_raw_ep0_write(int fd, struct usb_raw_ep_io* io)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EP0_WRITE, io);
+}
+
+static int usb_raw_ep0_read(int fd, struct usb_raw_ep_io* io)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EP0_READ, io);
+}
+
+static int usb_raw_event_fetch(int fd, struct usb_raw_event* event)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EVENT_FETCH, event);
+}
+
+static int usb_raw_ep_enable(int fd, struct usb_endpoint_descriptor* desc)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EP_ENABLE, desc);
+}
+
+static int usb_raw_ep_disable(int fd, int ep)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EP_DISABLE, ep);
+}
+
 static int usb_raw_ep0_stall(int fd)
 {
 	return ioctl(fd, USB_RAW_IOCTL_EP0_STALL, 0);
 }
+#endif
 
 #if SYZ_EXECUTOR || __NR_syz_usb_control_io
 static int lookup_interface(int fd, uint8 bInterfaceNumber, uint8 bAlternateSetting)
@@ -5421,13 +5779,27 @@ static int lookup_endpoint(int fd, uint8 bEndpointAddress)
 	if (index->iface_cur < 0)
 		return -1;
 
-	for (int ep = 0; index->ifaces[index->iface_cur].eps_num; ep++)
+	for (int ep = 0; ep < index->ifaces[index->iface_cur].eps_num; ep++)
 		if (index->ifaces[index->iface_cur].eps[ep].desc.bEndpointAddress == bEndpointAddress)
 			return index->ifaces[index->iface_cur].eps[ep].handle;
 	return -1;
 }
 #endif
 
+#define USB_MAX_PACKET_SIZE 4096
+
+struct usb_raw_control_event {
+	struct usb_raw_event inner;
+	struct usb_ctrlrequest ctrl;
+	char data[USB_MAX_PACKET_SIZE];
+};
+
+struct usb_raw_ep_io_data {
+	struct usb_raw_ep_io inner;
+	char data[USB_MAX_PACKET_SIZE];
+};
+
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_usb_control_io
 static void set_interface(int fd, int n)
 {
 	struct usb_device_index* index = lookup_usb_index(fd);
@@ -5461,7 +5833,9 @@ static void set_interface(int fd, int n)
 		index->iface_cur = n;
 	}
 }
+#endif
 
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
 static int configure_device(int fd)
 {
 	struct usb_device_index* index = lookup_usb_index(fd);
@@ -5482,19 +5856,6 @@ static int configure_device(int fd)
 	set_interface(fd, 0);
 	return 0;
 }
-
-#define USB_MAX_PACKET_SIZE 4096
-
-struct usb_raw_control_event {
-	struct usb_raw_event inner;
-	struct usb_ctrlrequest ctrl;
-	char data[USB_MAX_PACKET_SIZE];
-};
-
-struct usb_raw_ep_io_data {
-	struct usb_raw_ep_io inner;
-	char data[USB_MAX_PACKET_SIZE];
-};
 
 static volatile long syz_usb_connect_impl(uint64 speed, uint64 dev_len, const char* dev,
 					  const struct vusb_connect_descriptors* descs,
@@ -5630,6 +5991,8 @@ static volatile long syz_usb_connect_impl(uint64 speed, uint64 dev_len, const ch
 
 	return fd;
 }
+
+#endif
 
 #if SYZ_EXECUTOR || __NR_syz_usb_connect
 static volatile long syz_usb_connect(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
@@ -6666,6 +7029,7 @@ static int puff_zlib_to_file(const unsigned char* source, unsigned long sourcele
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/loop.h>
+#include <stdbool.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -8705,9 +9069,9 @@ static void mount_cgroups2(const char** controllers, int count)
 
 static void setup_cgroups()
 {
-	const char* unified_controllers[] = {"+cpu", "+memory", "+io", "+pids"};
+	const char* unified_controllers[] = {"+cpu", "+io", "+pids"};
 	const char* net_controllers[] = {"net", "net_prio", "devices", "blkio", "freezer"};
-	const char* cpu_controllers[] = {"cpuset", "cpuacct", "hugetlb", "rlimit"};
+	const char* cpu_controllers[] = {"cpuset", "cpuacct", "hugetlb", "rlimit", "memory"};
 	if (mkdir("/syzcgroup", 0777)) {
 		debug("mkdir(/syzcgroup) failed: %d\n", errno);
 		return;
@@ -8735,12 +9099,6 @@ static void setup_cgroups_loop()
 	}
 	snprintf(file, sizeof(file), "%s/pids.max", cgroupdir);
 	write_file(file, "32");
-	snprintf(file, sizeof(file), "%s/memory.low", cgroupdir);
-	write_file(file, "%d", 298 << 20);
-	snprintf(file, sizeof(file), "%s/memory.high", cgroupdir);
-	write_file(file, "%d", 299 << 20);
-	snprintf(file, sizeof(file), "%s/memory.max", cgroupdir);
-	write_file(file, "%d", 300 << 20);
 	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
 	write_file(file, "%d", pid);
 	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
@@ -8749,6 +9107,10 @@ static void setup_cgroups_loop()
 	}
 	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
 	write_file(file, "%d", pid);
+	snprintf(file, sizeof(file), "%s/memory.soft_limit_in_bytes", cgroupdir);
+	write_file(file, "%d", 299 << 20);
+	snprintf(file, sizeof(file), "%s/memory.limit_in_bytes", cgroupdir);
+	write_file(file, "%d", 300 << 20);
 	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
 	if (mkdir(cgroupdir, 0777)) {
 		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
@@ -9610,126 +9972,119 @@ BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 static const struct sock_filter* system_filter = arm_system_filter;
 static const size_t system_filter_size = arm_system_filter_size;
 #define kFilterMaxSize (arm_app_filter_size + 3 + 1 + 4 + 2)
-
 #elif GOARCH_amd64
 #define PRIMARY_ARCH AUDIT_ARCH_X86_64
 
 const struct sock_filter x86_64_app_filter[] = {
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 114),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 202, 112, 0),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 16, 111, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 166, 55, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 104, 27, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 13, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 32, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 17, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 8, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 6, 105, 104),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 16, 104, 103),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 24, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 21, 102, 101),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 29, 101, 100),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 38, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 35, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 33, 98, 97),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 37, 97, 96),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 96, 95),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 91, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 72, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 92, 91),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 64, 91, 90),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 89, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 82, 89, 88),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 90, 88, 87),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 92, 85, 84),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 84, 83),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 103, 83, 82),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 135, 13, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 117, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 112, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 107, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 105, 78, 77),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 111, 77, 76),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 115, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 113, 75, 74),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 116, 74, 73),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 124, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 120, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 119, 71, 70),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 122, 70, 69),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 132, 69, 68),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 157, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 140, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 65, 64),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 139, 64, 63),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 155, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 153, 62, 61),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 156, 61, 60),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 162, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 160, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 159, 58, 57),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 161, 57, 56),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 163, 56, 55),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 275, 27, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 228, 13, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 206, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 186, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 179, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 167, 50, 49),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 180, 49, 48),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 203, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 201, 47, 46),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 205, 46, 45),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 221, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 217, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 211, 43, 42),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 220, 42, 41),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 227, 41, 40),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 254, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 247, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 233, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 232, 37, 36),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 235, 36, 35),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 251, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 248, 34, 33),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 253, 33, 32),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 262, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 257, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 30, 29),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 261, 29, 28),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 274, 28, 27),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 321, 13, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 302, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 283, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 280, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 279, 23, 22),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 282, 22, 21),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 284, 20, 19),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 300, 19, 18),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 314, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 306, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 303, 16, 15),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 312, 15, 14),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 320, 14, 13),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 424, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 332, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 329, 10, 9),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 333, 9, 8),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 7, 6),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 6, 5),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 3, 2),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
-BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0, 0, 108),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 202, 106, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 16, 105, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 162, 53, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 104, 27, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 44, 13, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 32, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 17, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 8, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 6, 99, 98),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 16, 98, 97),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 24, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 21, 96, 95),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 29, 95, 94),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 38, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 35, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 33, 92, 91),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 37, 91, 90),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 43, 90, 89),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 91, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 72, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 58, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 57, 86, 85),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 64, 85, 84),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 89, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 82, 83, 82),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 90, 82, 81),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 95, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 93, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 92, 79, 78),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 94, 78, 77),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 103, 77, 76),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 135, 13, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 117, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 112, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 107, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 105, 72, 71),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 111, 71, 70),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 115, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 113, 69, 68),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 116, 68, 67),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 124, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 120, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 119, 65, 64),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 122, 64, 63),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 132, 63, 62),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 155, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 140, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 137, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 136, 59, 58),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 139, 58, 57),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 153, 57, 56),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 160, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 157, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 156, 54, 53),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 159, 53, 52),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 161, 52, 51),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 262, 25, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 228, 13, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 206, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 186, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 179, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 163, 46, 45),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 180, 45, 44),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 203, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 201, 43, 42),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 205, 42, 41),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 221, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 217, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 211, 39, 38),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 220, 38, 37),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 227, 37, 36),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 251, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 247, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 233, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 232, 33, 32),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 235, 32, 31),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 248, 31, 30),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 257, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 254, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 253, 28, 27),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 256, 27, 26),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 261, 26, 25),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 321, 13, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 302, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 283, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 280, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 279, 21, 20),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 282, 20, 19),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 285, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 284, 18, 17),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 300, 17, 16),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 314, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 306, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 303, 14, 13),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 312, 13, 12),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 320, 12, 11),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 434, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 424, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 332, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 329, 8, 7),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 333, 7, 6),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 425, 6, 5),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 440, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 438, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 437, 3, 2),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 439, 2, 1),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 441, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 };
 
 #define x86_64_app_filter_size (sizeof(x86_64_app_filter) / sizeof(struct sock_filter))
@@ -9738,107 +10093,105 @@ static const struct sock_filter* primary_app_filter = x86_64_app_filter;
 static const size_t primary_app_filter_size = x86_64_app_filter_size;
 
 const struct sock_filter x86_64_system_filter[] = {
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 100),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 202, 98, 0),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 16, 97, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 203, 49, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 25, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 13, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 32, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 17, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 8, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 6, 91, 90),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 16, 90, 89),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 24, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 21, 88, 87),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 29, 87, 86),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 38, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 35, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 33, 84, 83),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 37, 83, 82),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 82, 81),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 79, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 72, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 78, 77),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 64, 77, 76),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 78, 76, 75),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 91, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 89, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 82, 73, 72),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 90, 72, 71),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 92, 71, 70),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 155, 11, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 135, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 112, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 66, 65),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 111, 65, 64),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 132, 64, 63),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 140, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 61, 60),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 139, 60, 59),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 153, 59, 58),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 175, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 169, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 157, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 156, 55, 54),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 167, 54, 53),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 172, 53, 52),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 186, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 179, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 177, 50, 49),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 180, 49, 48),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 201, 48, 47),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 283, 23, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 251, 11, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 221, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 217, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 206, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 205, 42, 41),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 211, 41, 40),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 220, 40, 39),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 247, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 233, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 232, 37, 36),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 235, 36, 35),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 248, 35, 34),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 262, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 257, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 254, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 253, 31, 30),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 30, 29),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 261, 29, 28),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 280, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 275, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 274, 26, 25),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 279, 25, 24),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 282, 24, 23),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 332, 11, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 305, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 302, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 284, 19, 18),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 300, 18, 17),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 303, 17, 16),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 321, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 314, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 312, 14, 13),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 320, 13, 12),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 329, 12, 11),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 424, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 333, 8, 7),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 7, 6),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 6, 5),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 3, 2),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
-BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0, 0, 98),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 202, 96, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 16, 95, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 186, 47, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 91, 23, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 38, 11, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 24, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 17, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 8, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 6, 89, 88),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 16, 88, 87),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 21, 87, 86),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 35, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 32, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 29, 84, 83),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 33, 83, 82),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 37, 82, 81),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 72, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 58, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 44, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 43, 78, 77),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 57, 77, 76),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 64, 76, 75),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 89, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 79, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 78, 73, 72),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 82, 72, 71),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 90, 71, 70),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 140, 11, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 112, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 95, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 93, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 92, 66, 65),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 94, 65, 64),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 111, 64, 63),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 137, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 135, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 132, 61, 60),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 136, 60, 59),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 139, 59, 58),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 169, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 157, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 155, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 153, 55, 54),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 156, 54, 53),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 167, 53, 52),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 179, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 175, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 172, 50, 49),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 177, 49, 48),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 180, 48, 47),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 280, 23, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 247, 11, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 217, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 206, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 203, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 201, 42, 41),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 205, 41, 40),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 211, 40, 39),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 233, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 221, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 220, 37, 36),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 232, 36, 35),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 235, 35, 34),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 257, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 254, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 251, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 248, 31, 30),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 253, 30, 29),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 256, 29, 28),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 265, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 262, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 261, 26, 25),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 264, 25, 24),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 279, 24, 23),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 321, 11, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 302, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 285, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 283, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 282, 19, 18),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 284, 18, 17),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 300, 17, 16),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 314, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 305, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 303, 14, 13),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 312, 13, 12),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 320, 12, 11),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 434, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 424, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 332, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 329, 8, 7),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 333, 7, 6),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 425, 6, 5),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 440, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 438, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 437, 3, 2),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 439, 2, 1),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 441, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 };
 
 #define x86_64_system_filter_size (sizeof(x86_64_system_filter) / sizeof(struct sock_filter))
@@ -9851,147 +10204,141 @@ static const size_t system_filter_size = x86_64_system_filter_size;
 #define PRIMARY_ARCH AUDIT_ARCH_I386
 
 const struct sock_filter x86_app_filter[] = {
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 140),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 240, 138, 0),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 54, 137, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 183, 69, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 85, 35, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 45, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 26, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 19, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 10, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 8, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 7, 130, 129),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 9, 129, 128),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 13, 128, 127),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 24, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 21, 126, 125),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 25, 125, 124),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 36, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 33, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 27, 122, 121),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 34, 121, 120),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 41, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 40, 119, 118),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 118, 117),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 63, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 55, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 52, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 46, 113, 112),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 53, 112, 111),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 56, 111, 110),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 60, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 109, 108),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 61, 108, 107),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 75, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 66, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 65, 105, 104),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 68, 104, 103),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 77, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 76, 102, 101),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 79, 101, 100),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 122, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 104, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 96, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 90, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 86, 95, 94),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 94, 93),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 93, 92),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 102, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 98, 91, 90),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 103, 90, 89),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 116, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 114, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 107, 87, 86),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 115, 86, 85),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 118, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 117, 84, 83),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 121, 83, 82),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 140, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 131, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 125, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 123, 79, 78),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 126, 78, 77),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 134, 76, 75),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 75, 74),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 168, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 150, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 149, 72, 71),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 164, 71, 70),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 172, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 169, 69, 68),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 182, 68, 67),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 300, 33, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 245, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 211, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 205, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 199, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 190, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 188, 61, 60),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 198, 60, 59),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 203, 59, 58),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 207, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 206, 57, 56),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 210, 56, 55),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 224, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 218, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 212, 53, 52),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 222, 52, 51),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 241, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 240, 50, 49),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 244, 49, 48),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 272, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 254, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 252, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 250, 45, 44),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 253, 44, 43),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 265, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 264, 42, 41),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 271, 41, 40),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 291, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 284, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 273, 38, 37),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 37, 36),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 295, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 294, 35, 34),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 299, 34, 33),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 383, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 344, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 322, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 318, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 313, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 312, 28, 27),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 317, 27, 26),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 321, 26, 25),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 340, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 337, 24, 23),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 341, 23, 22),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 351, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 346, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 345, 20, 19),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 349, 19, 18),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 374, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 359, 17, 16),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 380, 16, 15),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 417, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 403, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 384, 12, 11),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 415, 11, 10),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 420, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 418, 9, 8),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 8, 7),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 5, 4),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 4, 3),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
-BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0, 0, 134),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 240, 132, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 54, 131, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 172, 65, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 85, 33, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 45, 17, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 26, 9, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 19, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 10, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 8, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 7, 124, 123),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 9, 123, 122),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 13, 122, 121),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 24, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 21, 120, 119),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 25, 119, 118),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 36, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 33, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 27, 116, 115),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 34, 115, 114),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 41, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 40, 113, 112),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 44, 112, 111),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 63, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 57, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 55, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 46, 108, 107),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 56, 107, 106),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 60, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 58, 105, 104),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 61, 104, 103),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 75, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 66, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 65, 101, 100),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 68, 100, 99),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 77, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 76, 98, 97),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 79, 97, 96),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 118, 15, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 102, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 94, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 90, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 86, 92, 91),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 93, 91, 90),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 96, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 95, 89, 88),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 98, 88, 87),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 114, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 104, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 103, 85, 84),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 107, 84, 83),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 116, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 115, 82, 81),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 117, 81, 80),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 136, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 125, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 122, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 121, 77, 76),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 123, 76, 75),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 131, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 126, 74, 73),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 134, 73, 72),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 150, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 140, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 137, 70, 69),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 149, 69, 68),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 168, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 164, 67, 66),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 169, 66, 65),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 295, 33, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 241, 17, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 207, 9, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 199, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 190, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 183, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 182, 59, 58),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 188, 58, 57),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 198, 57, 56),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 205, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 203, 55, 54),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 206, 54, 53),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 218, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 211, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 210, 51, 50),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 212, 50, 49),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 224, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 222, 48, 47),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 240, 47, 46),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 265, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 252, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 245, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 244, 43, 42),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 250, 42, 41),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 254, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 253, 40, 39),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 264, 39, 38),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 284, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 272, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 271, 36, 35),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 273, 35, 34),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 291, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 285, 33, 32),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 294, 32, 31),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 374, 15, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 340, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 318, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 300, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 299, 27, 26),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 317, 26, 25),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 322, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 321, 24, 23),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 337, 23, 22),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 346, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 344, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 341, 20, 19),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 345, 19, 18),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 351, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 349, 17, 16),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 359, 16, 15),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 421, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 403, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 383, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 380, 12, 11),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 384, 11, 10),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 417, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 415, 9, 8),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 418, 8, 7),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 438, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 434, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 425, 5, 4),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 437, 4, 3),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 440, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 439, 2, 1),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 441, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 };
 
 #define x86_app_filter_size (sizeof(x86_app_filter) / sizeof(struct sock_filter))
@@ -10000,143 +10347,141 @@ static const struct sock_filter* primary_app_filter = x86_app_filter;
 static const size_t primary_app_filter_size = x86_app_filter_size;
 
 const struct sock_filter x86_system_filter[] = {
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 136),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 240, 134, 0),
-BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 54, 133, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 190, 67, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 88, 33, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 51, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 36, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 19, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 11, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 3, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 2, 126, 125),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 7, 125, 124),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 13, 124, 123),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 26, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 22, 122, 121),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 27, 121, 120),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 41, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 38, 118, 117),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 42, 117, 116),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 45, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 115, 114),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 46, 114, 113),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 66, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 60, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 53, 110, 109),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 109, 108),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 64, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 62, 107, 106),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 65, 106, 105),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 77, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 74, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 68, 103, 102),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 76, 102, 101),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 85, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 80, 100, 99),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 86, 99, 98),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 128, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 114, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 96, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 91, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 89, 93, 92),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 92, 91),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 91, 90),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 102, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 98, 89, 88),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 107, 88, 87),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 118, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 116, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 115, 85, 84),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 117, 84, 83),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 124, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 123, 82, 81),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 126, 81, 80),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 143, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 131, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 130, 77, 76),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 134, 76, 75),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 138, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 74, 73),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 141, 73, 72),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 172, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 150, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 149, 70, 69),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 164, 69, 68),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 183, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 182, 67, 66),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 188, 66, 65),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 318, 33, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 255, 17, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 224, 9, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 213, 5, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 199, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 197, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 196, 59, 58),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 198, 58, 57),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 212, 57, 56),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 218, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 215, 55, 54),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 222, 54, 53),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 245, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 241, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 240, 51, 50),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 244, 50, 49),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 252, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 250, 48, 47),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 253, 47, 46),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 292, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 272, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 258, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 43, 42),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 271, 42, 41),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 284, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 273, 40, 39),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 39, 38),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 300, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 295, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 294, 36, 35),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 299, 35, 34),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 313, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 312, 33, 32),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 317, 32, 31),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 383, 15, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 343, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 324, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 322, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 321, 27, 26),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 323, 26, 25),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 340, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 337, 24, 23),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 341, 23, 22),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 351, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 346, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 345, 20, 19),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 349, 19, 18),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 374, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 359, 17, 16),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 380, 16, 15),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 7, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 417, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 403, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 384, 12, 11),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 415, 11, 10),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 420, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 418, 9, 8),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 8, 7),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 3, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 5, 4),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 4, 3),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 1, 0),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
-BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
-BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0, 0, 134),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 240, 132, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 54, 131, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 183, 65, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 88, 33, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 51, 17, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 36, 9, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 19, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 11, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 3, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 2, 124, 123),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 7, 123, 122),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 13, 122, 121),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 26, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 22, 120, 119),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 27, 119, 118),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 43, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 41, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 38, 116, 115),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 42, 115, 114),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 45, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 44, 113, 112),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 46, 112, 111),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 66, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 60, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 57, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 53, 108, 107),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 58, 107, 106),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 64, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 62, 105, 104),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 65, 104, 103),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 77, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 74, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 68, 101, 100),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 76, 100, 99),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 85, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 80, 98, 97),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 86, 97, 96),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 124, 15, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 102, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 94, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 91, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 89, 92, 91),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 93, 91, 90),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 96, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 95, 89, 88),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 98, 88, 87),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 116, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 114, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 107, 85, 84),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 115, 84, 83),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 118, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 117, 82, 81),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 123, 81, 80),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 140, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 131, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 128, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 126, 77, 76),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 130, 76, 75),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 136, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 134, 74, 73),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 137, 73, 72),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 150, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 143, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 141, 70, 69),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 149, 69, 68),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 172, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 164, 67, 66),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 182, 66, 65),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 303, 33, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 252, 17, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 218, 9, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 199, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 197, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 190, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 188, 59, 58),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 196, 58, 57),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 198, 57, 56),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 213, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 212, 55, 54),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 217, 54, 53),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 241, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 224, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 222, 51, 50),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 240, 50, 49),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 245, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 244, 48, 47),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 250, 47, 46),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 284, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 258, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 255, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 253, 43, 42),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 256, 42, 41),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 272, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 271, 40, 39),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 273, 39, 38),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 295, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 292, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 285, 36, 35),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 294, 35, 34),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 300, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 299, 33, 32),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 302, 32, 31),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 374, 15, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 340, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 322, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 318, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 317, 27, 26),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 321, 26, 25),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 324, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 323, 24, 23),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 337, 23, 22),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 346, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 343, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 341, 20, 19),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 345, 19, 18),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 351, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 349, 17, 16),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 359, 16, 15),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 421, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 403, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 383, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 380, 12, 11),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 384, 11, 10),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 417, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 415, 9, 8),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 418, 8, 7),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 438, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 434, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 425, 5, 4),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 437, 4, 3),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 440, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 439, 2, 1),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 441, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 };
 
 #define x86_system_filter_size (sizeof(x86_system_filter) / sizeof(struct sock_filter))
@@ -11174,6 +11519,7 @@ static volatile long syz_fuse_handle_req(volatile long a0,
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_80211_inject_frame
+#include <errno.h>
 #include <linux/genetlink.h>
 #include <linux/if_ether.h>
 #include <linux/nl80211.h>
@@ -11395,6 +11741,43 @@ static long syz_pkey_set(volatile long pkey, volatile long val)
 #endif
 	return 0;
 }
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SWAP
+#include <fcntl.h>
+#include <linux/falloc.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/swap.h>
+#include <sys/types.h>
+
+#define SWAP_FILE "./swap-file"
+#define SWAP_FILE_SIZE (128 * 1000 * 1000)
+
+static void setup_swap()
+{
+	swapoff(SWAP_FILE);
+	unlink(SWAP_FILE);
+	int fd = open(SWAP_FILE, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+	if (fd == -1) {
+		failmsg("swap file open failed", "file: %s", SWAP_FILE);
+		return;
+	}
+	fallocate(fd, FALLOC_FL_ZERO_RANGE, 0, SWAP_FILE_SIZE);
+	close(fd);
+	char cmdline[64];
+	sprintf(cmdline, "mkswap %s", SWAP_FILE);
+	if (runcmdline(cmdline)) {
+		fail("mkswap failed");
+		return;
+	}
+	if (swapon(SWAP_FILE, SWAP_FLAG_PREFER) == 1) {
+		failmsg("swapon failed", "file: %s", SWAP_FILE);
+		return;
+	}
+}
+
 #endif
 
 #elif GOOS_test
@@ -11921,7 +12304,7 @@ static void event_set(event_t* ev)
 {
 	EnterCriticalSection(&ev->cs);
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	ev->state = 1;
 	LeaveCriticalSection(&ev->cs);
 	WakeAllConditionVariable(&ev->cv);
@@ -12256,9 +12639,6 @@ int main(void)
 	/*{{{MMAP_DATA}}}*/
 #endif
 
-#if SYZ_HAVE_SETUP_EXT
-	setup_ext();
-#endif
 #if SYZ_SYSCTL
 	setup_sysctl();
 #endif
@@ -12283,9 +12663,14 @@ int main(void)
 #if SYZ_802154
 	setup_802154();
 #endif
-
+#if SYZ_SWAP
+	setup_swap();
+#endif
 #if SYZ_HANDLE_SEGV
 	install_segv_handler();
+#endif
+#if SYZ_HAVE_SETUP_EXT
+	setup_ext();
 #endif
 #if SYZ_MULTI_PROC
 	for (procid = 0; procid < /*{{{PROCS}}}*/; procid++) {

@@ -113,6 +113,7 @@ type Commit struct {
 	Recipients Recipients
 	BugIDs     []string // ID's extracted from Reported-by tags
 	Date       time.Time
+	Link       string // set if the commit is a part of a reply
 }
 
 func (dash *Dashboard) UploadBuild(build *Build) error {
@@ -170,15 +171,23 @@ type ManagerJobs struct {
 	BisectFix   bool
 }
 
+func (m ManagerJobs) Any() bool {
+	return m.TestPatches || m.BisectCause || m.BisectFix
+}
+
 type JobPollResp struct {
-	ID                string
-	Type              JobType
-	Manager           string
-	KernelRepo        string
-	KernelBranch      string
+	ID         string
+	Type       JobType
+	Manager    string
+	KernelRepo string
+	// KernelBranch is used for patch testing and serves as the current HEAD
+	// for bisections.
+	KernelBranch    string
+	MergeBaseRepo   string
+	MergeBaseBranch string
+	// Bisection starts from KernelCommit.
 	KernelCommit      string
 	KernelCommitTitle string
-	KernelCommitDate  time.Time
 	KernelConfig      []byte
 	SyzkallerCommit   string
 	Patch             []byte
@@ -217,11 +226,35 @@ const (
 type JobDoneFlags int64
 
 const (
-	BisectResultMerge   JobDoneFlags = 1 << iota // bisected to a merge commit
-	BisectResultNoop                             // commit does not affect resulting kernel binary
-	BisectResultRelease                          // commit is a kernel release
-	BisectResultIgnore                           // this particular commit should be ignored, see syz-ci/jobs.go
+	BisectResultMerge      JobDoneFlags = 1 << iota // bisected to a merge commit
+	BisectResultNoop                                // commit does not affect resulting kernel binary
+	BisectResultRelease                             // commit is a kernel release
+	BisectResultIgnore                              // this particular commit should be ignored, see syz-ci/jobs.go
+	BisectResultInfraError                          // the bisect failed due to an infrastructure problem
 )
+
+func (flags JobDoneFlags) String() string {
+	if flags&BisectResultInfraError != 0 {
+		return "[infra failure]"
+	}
+	res := ""
+	if flags&BisectResultMerge != 0 {
+		res += "merge "
+	}
+	if flags&BisectResultNoop != 0 {
+		res += "no-op "
+	}
+	if flags&BisectResultRelease != 0 {
+		res += "release "
+	}
+	if flags&BisectResultIgnore != 0 {
+		res += "ignored "
+	}
+	if res == "" {
+		return res
+	}
+	return "[" + res + "commit]"
+}
 
 func (dash *Dashboard) JobPoll(req *JobPollReq) (*JobPollResp, error) {
 	resp := new(JobPollResp)
@@ -318,6 +351,7 @@ type CrashID struct {
 	Corrupted    bool
 	Suppressed   bool
 	MayBeMissing bool
+	ReproLog     []byte
 }
 
 type NeedReproResp struct {
@@ -397,6 +431,7 @@ type BugReport struct {
 	ReproOpts         []byte
 	MachineInfo       []byte
 	MachineInfoLink   string
+	Manager           string
 	CrashID           int64 // returned back in BugUpdate
 	CrashTime         time.Time
 	NumCrashes        int64
@@ -412,6 +447,7 @@ type BugReport struct {
 	Assets         []Asset
 	Subsystems     []BugSubsystem
 	ReportElements *ReportElements
+	LabelMessages  map[string]string // notification messages for bug labels
 }
 
 type ReportElements struct {
@@ -450,10 +486,12 @@ type BisectResult struct {
 	CrashLogLink    string
 	CrashReportLink string
 	Fix             bool
+	CrossTree       bool
 }
 
 type BugListReport struct {
 	ID          string
+	Created     time.Time
 	Config      []byte
 	Bugs        []BugListItem
 	TotalStats  BugListReportStats
@@ -502,6 +540,7 @@ type BugUpdate struct {
 	Link            string
 	Status          BugStatus
 	StatusReason    BugStatusReason
+	Labels          []string // the reported labels
 	ReproLevel      ReproLevel
 	DupOf           string
 	OnHold          bool     // If set for open bugs, don't upstream this bug.
@@ -543,10 +582,12 @@ type BugNotification struct {
 	ExtID       string // arbitrary reporting ID forwarded from BugUpdate.ExtID
 	Title       string
 	Text        string   // meaning depends on Type
+	Label       string   // for BugNotifLabel Type specifies the exact label
 	CC          []string // deprecated in favor of Recipients
 	Maintainers []string // deprecated in favor of Recipients
 	Link        string
 	Recipients  Recipients
+	TreeJobs    []*JobInfo // set for some BugNotifLabel
 	// Public is what we want all involved people to see (e.g. if we notify about a wrong commit title,
 	// people need to see it and provide the right title). Not public is what we want to send only
 	// to a minimal set of recipients (our mailing list) (e.g. notification about an obsoleted bug
@@ -749,10 +790,12 @@ type LoadFullBugReq struct {
 }
 
 type FullBugInfo struct {
-	SimilarBugs []*SimilarBugInfo
-	BisectCause *BugReport
-	BisectFix   *BugReport
-	Crashes     []*BugReport
+	SimilarBugs  []*SimilarBugInfo
+	BisectCause  *BugReport
+	BisectFix    *BugReport
+	Crashes      []*BugReport
+	TreeJobs     []*JobInfo
+	FixCandidate *BugReport
 }
 
 type SimilarBugInfo struct {
@@ -813,6 +856,9 @@ const (
 	BugNotifObsoleted
 	// Bug fixing commit can't be discovered (wrong commit title).
 	BugNotifBadCommit
+	// New bug label has been assigned (only if enabled).
+	// Text contains the custome message that needs to be delivered to the user.
+	BugNotifLabel
 )
 
 const (
@@ -828,6 +874,45 @@ const (
 	ReportBisectCause                   // Cause bisection result for an already reported bug.
 	ReportBisectFix                     // Fix bisection result for an already reported bug.
 )
+
+type JobInfo struct {
+	JobKey           string
+	Type             JobType
+	Flags            JobDoneFlags
+	Created          time.Time
+	BugLink          string
+	ExternalLink     string
+	User             string
+	Reporting        string
+	Namespace        string
+	Manager          string
+	BugTitle         string
+	BugID            string
+	KernelRepo       string
+	KernelBranch     string
+	KernelAlias      string
+	KernelCommit     string
+	KernelCommitLink string
+	KernelLink       string
+	PatchLink        string
+	Attempts         int
+	Started          time.Time
+	Finished         time.Time
+	Duration         time.Duration
+	CrashTitle       string
+	CrashLogLink     string
+	CrashReportLink  string
+	LogLink          string
+	ErrorLink        string
+	ReproCLink       string
+	ReproSyzLink     string
+	Commit           *Commit   // for conclusive bisection
+	Commits          []*Commit // for inconclusive bisection
+	Reported         bool
+	InvalidatedBy    string
+	TreeOrigin       bool
+	OnMergeBase      bool
+}
 
 func (dash *Dashboard) Query(method string, req, reply interface{}) error {
 	if dash.logger != nil {
@@ -870,7 +955,7 @@ func (dash *Dashboard) queryImpl(method string, req, reply interface{}) error {
 	if req != nil {
 		data, err := json.Marshal(req)
 		if err != nil {
-			return fmt.Errorf("failed to marshal request: %v", err)
+			return fmt.Errorf("failed to marshal request: %w", err)
 		}
 		buf := new(bytes.Buffer)
 		gz := gzip.NewWriter(buf)
@@ -889,7 +974,7 @@ func (dash *Dashboard) queryImpl(method string, req, reply interface{}) error {
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := dash.doer(r)
 	if err != nil {
-		return fmt.Errorf("http request failed: %v", err)
+		return fmt.Errorf("http request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -898,7 +983,7 @@ func (dash *Dashboard) queryImpl(method string, req, reply interface{}) error {
 	}
 	if reply != nil {
 		if err := json.NewDecoder(resp.Body).Decode(reply); err != nil {
-			return fmt.Errorf("failed to unmarshal response: %v", err)
+			return fmt.Errorf("failed to unmarshal response: %w", err)
 		}
 	}
 	return nil

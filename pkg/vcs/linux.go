@@ -10,13 +10,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/kconfig"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 )
@@ -64,12 +64,16 @@ func (ctx *linux) PreviousReleaseTags(commit, compilerType string) ([]string, er
 		//
 		// We used to use 4.1 as the oldest tested release (it works in general).
 		// However, there is correlation between how far back we go and probability
-		// of getting correct result (see #1532). So we now stop at 4.6.
+		// of getting correct result (see #1532). So we then stopped at 4.6.
 		// 4.6 is somewhat arbitrary, we've seen lots of wrong results in 4.5..4.6 range,
 		// but there is definitive reason for 4.6. Most likely later we want to bump it
 		// even more (as new releases are produced). Next good candidate may be 4.11
 		// because then we won't need gcc 5.5.
-		cutoff = "v4.5"
+		//
+		// TODO: The buildroot images deployed after #2820 can only boot v4.19+ kernels.
+		// This has caused lots of bad bisection results, see #3224. We either need a new
+		// universal image or a kernel version dependant image selection.
+		cutoff = "v4.18"
 	} else if compilerType == "clang" {
 		// v5.3 was the first release with solid clang support, however I was able to
 		// compile v5.1..v5.3 using a newer defconfig + make oldconfig. Everything older
@@ -100,40 +104,26 @@ func gitParseReleaseTags(output []byte, includeRC bool) []string {
 }
 
 func gitReleaseTagToInt(tag string, includeRC bool) uint64 {
-	matches := releaseTagRe.FindStringSubmatchIndex(tag)
-	if matches == nil {
+	v1, v2, rc, v3 := ParseReleaseTag(tag)
+	if v1 < 0 {
 		return 0
 	}
-	v1, err := strconv.ParseUint(tag[matches[2]:matches[3]], 10, 64)
-	if err != nil {
-		return 0
+	if v3 < 0 {
+		v3 = 0
 	}
-	v2, err := strconv.ParseUint(tag[matches[4]:matches[5]], 10, 64)
-	if err != nil {
-		return 0
-	}
-	rc := uint64(999)
-	if matches[6] != -1 {
+	if rc >= 0 {
 		if !includeRC {
 			return 0
 		}
-		rc, err = strconv.ParseUint(tag[matches[6]:matches[7]], 10, 64)
-		if err != nil {
-			return 0
-		}
+	} else {
+		rc = 999
 	}
-	var v3 uint64
-	if matches[8] != -1 {
-		v3, err = strconv.ParseUint(tag[matches[8]:matches[9]], 10, 64)
-		if err != nil {
-			return 0
-		}
-	}
-	return v1*1e9 + v2*1e6 + rc*1e3 + v3
+	return uint64(v1)*1e9 + uint64(v2)*1e6 + uint64(rc)*1e3 + uint64(v3)
 }
 
 func (ctx *linux) EnvForCommit(
 	defaultCompiler, compilerType, binDir, commit string, kernelConfig []byte,
+	backports []BackportCommit,
 ) (*BisectEnv, error) {
 	tagList, err := ctx.previousReleaseTags(commit, true, false, false)
 	if err != nil {
@@ -147,7 +137,7 @@ func (ctx *linux) EnvForCommit(
 	if err != nil {
 		return nil, err
 	}
-	linuxAlterConfigs(cf, tags)
+	setLinuxTagConfigs(cf, tags)
 
 	compiler := ""
 	if compilerType == "gcc" {
@@ -162,23 +152,10 @@ func (ctx *linux) EnvForCommit(
 		Compiler:     compiler,
 		KernelConfig: cf.Serialize(),
 	}
-
-	// Compiling v4.6..v5.11 with a modern objtool, w/o this patch, results in the
-	// following issue, when compiling with clang:
-	// arch/x86/entry/thunk_64.o: warning: objtool: missing symbol table
-	// We don't bisect that far back with neither clang nor gcc, so this should be fine:
-	fix := "1d489151e9f9d1647110277ff77282fe4d96d09b"
-	contained, err := ctx.git.Contains(fix)
+	err = linuxFixBackports(ctx.git, backports...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to cherry pick fixes: %w", err)
 	}
-	if !contained {
-		_, err := ctx.git.git("cherry-pick", "--no-commit", fix)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	return env, nil
 }
 
@@ -199,9 +176,11 @@ func linuxClangPath(tags map[string]bool, binDir, defaultCompiler string) string
 func linuxGCCPath(tags map[string]bool, binDir, defaultCompiler string) string {
 	version := ""
 	switch {
-	case tags["v5.9"]:
-		// Verified to work with 10.1.0.
+	case tags["v5.16"]:
+		// Verified to work with 15.0.7.
 		return defaultCompiler
+	case tags["v5.9"]:
+		version = "10.1.0"
 	case tags["v4.12"]:
 		version = "8.1.0"
 	case tags["v4.11"]:
@@ -210,85 +189,6 @@ func linuxGCCPath(tags map[string]bool, binDir, defaultCompiler string) string {
 		version = "5.5.0"
 	}
 	return filepath.Join(binDir, "gcc-"+version, "bin", "gcc")
-}
-
-func linuxAlterConfigs(cf *kconfig.ConfigFile, tags map[string]bool) {
-	const disableAlways = "disable-always"
-	// If tags is nil, disable only configs marked as disableAlways.
-	checkTag := func(tag string) bool {
-		return tags != nil && !tags[tag] ||
-			tags == nil && tag == disableAlways
-	}
-	disable := map[string]string{
-		// 5.2 has CONFIG_SECURITY_TOMOYO_INSECURE_BUILTIN_SETTING which allows to test tomoyo better.
-		// This config also enables CONFIG_SECURITY_TOMOYO_OMIT_USERSPACE_LOADER
-		// but we need it disabled to boot older kernels.
-		"SECURITY_TOMOYO_OMIT_USERSPACE_LOADER": "v5.2",
-		// Kernel is boot broken before 4.15 due to double-free in vudc_probe:
-		// https://lkml.org/lkml/2018/9/7/648
-		// Fixed by e28fd56ad5273be67d0fae5bedc7e1680e729952.
-		"USBIP_VUDC": "v4.15",
-		// CONFIG_CAN causes:
-		// all runs: crashed: INFO: trying to register non-static key in can_notifier
-		// for v4.11..v4.12 and v4.12..v4.13 ranges.
-		// Fixed by 74b7b490886852582d986a33443c2ffa50970169.
-		"CAN": "v4.13",
-		// Setup of network devices is broken before v4.12 with a "WARNING in hsr_get_node".
-		// Fixed by 675c8da049fd6556eb2d6cdd745fe812752f07a8.
-		"HSR": "v4.12",
-		// Setup of network devices is broken before v4.12 with a "WARNING: ODEBUG bug in __sk_destruct"
-		// coming from smc_release.
-		"SMC": "v4.12",
-		// Kernel is boot broken before 4.10 with a lockdep warning in vhci_hcd_probe.
-		"USBIP_VHCI_HCD": "v4.10",
-		"BT_HCIVHCI":     "v4.10",
-		// Setup of network devices is broken before v4.7 with a deadlock involving team.
-		"NET_TEAM": "v4.7",
-		// Setup of network devices is broken before v4.5 with a warning in batadv_tvlv_container_remove.
-		"BATMAN_ADV": "v4.5",
-		// UBSAN is broken in multiple ways before v5.3, see:
-		// https://github.com/google/syzkaller/issues/1523#issuecomment-696514105
-		"UBSAN": "v5.3",
-		// First, we disable coverage in pkg/bisect because it fails machine testing starting from 4.7.
-		// Second, at 6689da155bdcd17abfe4d3a8b1e245d9ed4b5f2c CONFIG_KCOV selects CONFIG_GCC_PLUGIN_SANCOV
-		// (why?), which is build broken for hundreds of revisions.
-		"KCOV": disableAlways,
-		// This helps to produce stable binaries in presence of kernel tag changes.
-		"LOCALVERSION_AUTO": disableAlways,
-		// BTF fails lots of builds with:
-		// pahole version v1.9 is too old, need at least v1.13
-		// Failed to generate BTF for vmlinux. Try to disable CONFIG_DEBUG_INFO_BTF.
-		"DEBUG_INFO_BTF": disableAlways,
-		// This config only adds debug output. It should not be enabled at all,
-		// but it was accidentially enabled on some instances for some periods of time,
-		// and kernel is boot-broken for prolonged ranges of commits with deadlock
-		// which makes bisections take weeks.
-		"DEBUG_KOBJECT": disableAlways,
-		// This config is causing problems to kernel signature calculation as new initramfs is generated
-		// as a part of every build. Due to this init.data section containing this generated initramfs
-		// is differing between builds causing signture being random number.
-		"BLK_DEV_INITRD": disableAlways,
-	}
-	for cfg, tag := range disable {
-		if checkTag(tag) {
-			cf.Unset(cfg)
-		}
-	}
-	alter := []struct {
-		From string
-		To   string
-		Tag  string
-	}{
-		// Even though ORC unwinder was introduced a long time ago, it might have been broken for
-		// some time. 5.4 is chosen as a version tag, where ORC unwinder seems to work properly.
-		{"UNWINDER_ORC", "UNWINDER_FRAME_POINTER", "v5.4"},
-	}
-	for _, a := range alter {
-		if checkTag(a.Tag) {
-			cf.Unset(a.From)
-			cf.Set(a.To, kconfig.Yes)
-		}
-	}
 }
 
 func (ctx *linux) PrepareBisect() error {
@@ -376,7 +276,12 @@ func ParseMaintainersLinux(text []byte) Recipients {
 
 const configBisectTag = "# Minimized by syzkaller"
 
-func (ctx *linux) Minimize(target *targets.Target, original, baseline []byte,
+// Minimize() attempts to drop Linux kernel configs that are unnecessary(*) for bug reproduction.
+// 1. Remove sanitizers that are not needed to trigger the target class of bugs.
+// 2. Disable unrelated kernel subsystems. This is done by bisecting config changes between
+// `original` and `baseline`.
+// (*) After an unnecessary config is deleted, we still have pred() == BisectBad.
+func (ctx *linux) Minimize(target *targets.Target, original, baseline []byte, types []crash.Type,
 	dt debugtracer.DebugTracer, pred func(test []byte) (BisectResult, error)) ([]byte, error) {
 	if bytes.HasPrefix(original, []byte(configBisectTag)) {
 		dt.Log("# configuration already minimized\n")
@@ -384,29 +289,114 @@ func (ctx *linux) Minimize(target *targets.Target, original, baseline []byte,
 	}
 	kconf, err := kconfig.Parse(target, filepath.Join(ctx.git.dir, "Kconfig"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Kconfig: %v", err)
+		return nil, fmt.Errorf("failed to parse Kconfig: %w", err)
 	}
-	originalConfig, err := kconfig.ParseConfigData(original, "original")
+	config, err := kconfig.ParseConfigData(original, "original")
 	if err != nil {
 		return nil, err
 	}
-	baselineConfig, err := kconfig.ParseConfigData(baseline, "baseline")
-	if err != nil {
-		return nil, err
+	minimizeCtx := &minimizeLinuxCtx{
+		kconf:  kconf,
+		config: config,
+		pred: func(cfg *kconfig.ConfigFile) (bool, error) {
+			res, err := pred(serialize(cfg))
+			return res == BisectBad, err
+		},
+		transform: func(cfg *kconfig.ConfigFile) {
+			setLinuxTagConfigs(cfg, nil)
+		},
+		DebugTracer: dt,
 	}
-	linuxAlterConfigs(originalConfig, nil)
-	linuxAlterConfigs(baselineConfig, nil)
-	kconfPred := func(candidate *kconfig.ConfigFile) (bool, error) {
-		res, err := pred(serialize(candidate))
-		return res == BisectBad, err
+	if len(types) > 0 {
+		// Technically, as almost all sanitizers are Yes/No config options, we could have
+		// achieved this minimization simply by disabling them all in the baseline config.
+		// However, we are now trying to make the most out of the few config minimization
+		// iterations we're ready to make do during the bisection process.
+		// Since it's possible to quite reliably determine the needed and unneeded sanitizers
+		// just by looking at crash reports, let's prefer a more complicated logic over worse
+		// bisection results.
+		// Once we start doing proper config minimizations for every reproducer, we can delete
+		// most of the related code.
+		err := minimizeCtx.dropInstrumentation(types)
+		if err != nil {
+			return nil, err
+		}
 	}
-	minConfig, err := kconf.Minimize(baselineConfig, originalConfig, kconfPred, dt)
-	if err != nil {
-		return nil, err
+	if len(baseline) > 0 {
+		baselineConfig, err := kconfig.ParseConfigData(baseline, "baseline")
+		if err != nil {
+			return nil, err
+		}
+		err = minimizeCtx.minimizeAgainst(baselineConfig)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return serialize(minConfig), nil
+	return minimizeCtx.getConfig(), nil
 }
 
 func serialize(cf *kconfig.ConfigFile) []byte {
 	return []byte(fmt.Sprintf("%v, rev: %v\n%s", configBisectTag, prog.GitRevision, cf.Serialize()))
+}
+
+type minimizeLinuxCtx struct {
+	kconf     *kconfig.KConfig
+	config    *kconfig.ConfigFile
+	pred      func(*kconfig.ConfigFile) (bool, error)
+	transform func(*kconfig.ConfigFile)
+	debugtracer.DebugTracer
+}
+
+func (ctx *minimizeLinuxCtx) minimizeAgainst(base *kconfig.ConfigFile) error {
+	base = base.Clone()
+	ctx.transform(base)
+	// Don't do too many minimization runs, it will make bug bisections too long.
+	// The purpose is only to reduce the number of build/boot/test errors due to bugs
+	// in unrelated parts of the kernel.
+	// Bisection is not getting much faster with smaller configs, only more reliable,
+	// so there's a trade-off. Try to do best in 5 iterations, that's about 1.5 hours.
+	const minimizeRuns = 5
+	minConfig, err := ctx.kconf.Minimize(base, ctx.config, ctx.runPred, minimizeRuns, ctx)
+	if err != nil {
+		return err
+	}
+	ctx.config = minConfig
+	return nil
+}
+
+func (ctx *minimizeLinuxCtx) dropInstrumentation(types []crash.Type) error {
+	ctx.Log("check whether we can drop unnecessary instrumentation")
+	oldTransform := ctx.transform
+	transform := func(c *kconfig.ConfigFile) {
+		oldTransform(c)
+		setLinuxSanitizerConfigs(c, types, ctx)
+	}
+	newConfig := ctx.config.Clone()
+	transform(newConfig)
+	if bytes.Equal(ctx.config.Serialize(), newConfig.Serialize()) {
+		ctx.Log("there was nothing we could disable; skip")
+		return nil
+	}
+	ctx.SaveFile("no-instrumentation.config", newConfig.Serialize())
+	ok, err := ctx.runPred(newConfig)
+	if err != nil {
+		return err
+	}
+	if ok {
+		ctx.Log("the bug reproduces without the instrumentation")
+		ctx.transform = transform
+		ctx.config = newConfig
+	}
+	return nil
+}
+
+func (ctx *minimizeLinuxCtx) runPred(cfg *kconfig.ConfigFile) (bool, error) {
+	cfg = cfg.Clone()
+	ctx.transform(cfg)
+	return ctx.pred(cfg)
+}
+
+func (ctx *minimizeLinuxCtx) getConfig() []byte {
+	ctx.transform(ctx.config)
+	return serialize(ctx.config)
 }

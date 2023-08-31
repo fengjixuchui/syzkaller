@@ -85,18 +85,19 @@ type Env struct {
 }
 
 // BootError is returned by Pool.Create when VM does not boot.
+// It should not be used for VMM intfrastructure errors, i.e. for problems not related
+// to the tested kernel itself.
 type BootError struct {
 	Title  string
 	Output []byte
 }
 
 func MakeBootError(err error, output []byte) error {
-	switch err1 := err.(type) {
-	case *osutil.VerboseError:
-		return BootError{err1.Title, append(err1.Output, output...)}
-	default:
-		return BootError{err.Error(), output}
+	var verboseError *osutil.VerboseError
+	if errors.As(err, &verboseError) {
+		return BootError{verboseError.Title, append(verboseError.Output, output...)}
 	}
+	return BootError{err.Error(), output}
 }
 
 func (err BootError) Error() string {
@@ -104,6 +105,21 @@ func (err BootError) Error() string {
 }
 
 func (err BootError) BootError() (string, []byte) {
+	return err.Title, err.Output
+}
+
+// By default, all Pool.Create() errors are related to infrastructure problems.
+// InfraError is to be used when we want to also attach output to the title.
+type InfraError struct {
+	Title  string
+	Output []byte
+}
+
+func (err InfraError) Error() string {
+	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
+}
+
+func (err InfraError) InfraError() (string, []byte) {
 	return err.Title, err.Output
 }
 

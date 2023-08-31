@@ -51,6 +51,7 @@ type Config struct {
 	// older versions of the kernel. For linux, it needs to include several
 	// compiler versions.
 	BinDir        string `json:"bin_dir"`
+	Linker        string `json:"linker"`
 	Ccache        string `json:"ccache"`
 	KernelRepo    string `json:"kernel_repo"`
 	KernelBranch  string `json:"kernel_branch"`
@@ -61,8 +62,10 @@ type Config struct {
 	// Sysctl/cmdline files used to build the image which was used to crash the kernel, e.g. see:
 	// dashboard/config/upstream.sysctl
 	// dashboard/config/upstream-selinux.cmdline
-	Sysctl  string `json:"sysctl"`
-	Cmdline string `json:"cmdline"`
+	Sysctl    string               `json:"sysctl"`
+	Cmdline   string               `json:"cmdline"`
+	CrossTree bool                 `json:"cross_tree"`
+	Backports []vcs.BackportCommit `json:"backports"`
 
 	KernelConfig         string `json:"kernel_config"`
 	KernelBaselineConfig string `json:"kernel_baseline_config"`
@@ -100,8 +103,10 @@ func main() {
 		Fix:             *flagFix,
 		DefaultCompiler: mycfg.Compiler,
 		CompilerType:    mycfg.CompilerType,
+		Linker:          mycfg.Linker,
 		BinDir:          mycfg.BinDir,
 		Ccache:          mycfg.Ccache,
+		CrossTree:       mycfg.CrossTree,
 		Kernel: bisect.KernelConfig{
 			Repo:        mycfg.KernelRepo,
 			Branch:      mycfg.KernelBranch,
@@ -110,6 +115,7 @@ func main() {
 			Userspace:   mycfg.Userspace,
 			Sysctl:      mycfg.Sysctl,
 			Cmdline:     mycfg.Cmdline,
+			Backports:   mycfg.Backports,
 		},
 		Syzkaller: bisect.SyzkallerConfig{
 			Repo:   mycfg.SyzkallerRepo,

@@ -55,7 +55,7 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		Count: 1,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse vm config: %v", err)
+		return nil, fmt.Errorf("failed to parse vm config: %w", err)
 	}
 	if cfg.Count < 1 || cfg.Count > 128 {
 		return nil, fmt.Errorf("invalid config param count: %v, want [1, 128]", cfg.Count)
@@ -93,13 +93,14 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		}
 		caps += "\"" + c + "\""
 	}
-	vmConfig := fmt.Sprintf(configTempl, imageDir, caps)
+	name := fmt.Sprintf("%v-%v", pool.env.Name, index)
+	vmConfig := fmt.Sprintf(configTempl, imageDir, caps, name)
 	if err := osutil.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(vmConfig)); err != nil {
 		return nil, err
 	}
 	bin, err := exec.LookPath(os.Args[0])
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup %v: %v", os.Args[0], err)
+		return nil, fmt.Errorf("failed to lookup %v: %w", os.Args[0], err)
 	}
 	if err := osutil.CopyFile(bin, filepath.Join(imageDir, "init")); err != nil {
 		return nil, err
@@ -143,7 +144,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		debug:    pool.env.Debug,
 		rootDir:  rootDir,
 		imageDir: imageDir,
-		name:     fmt.Sprintf("%v-%v", pool.env.Name, index),
+		name:     name,
 		merger:   merger,
 	}
 
@@ -236,6 +237,10 @@ func (inst *instance) runscCmd(add ...string) *exec.Cmd {
 	cmd.Env = []string{
 		"GOTRACEBACK=all",
 		"GORACE=halt_on_error=1",
+		// New glibc-s enable rseq by default but ptrace and systrap
+		// platforms don't work in this case. runsc is linked with libc
+		// only when the race detector is enabled.
+		"GLIBC_TUNABLES=glibc.pthread.rseq=0",
 	}
 	return cmd
 }
@@ -403,6 +408,14 @@ const configTempl = `
 	"root": {
 		"path": "%[1]v",
 		"readonly": true
+	},
+	"linux": {
+	  "cgroupsPath": "%[3]v",
+	  "resources": {
+		  "cpu": {
+			"shares": 1024
+		  }
+	  }
 	},
 	"process":{
                 "args": ["/init"],

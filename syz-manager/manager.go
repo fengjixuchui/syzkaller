@@ -31,6 +31,7 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	crash_pkg "github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/pkg/repro"
 	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
@@ -91,7 +92,7 @@ type Manager struct {
 
 	modules            []host.KernelModule
 	coverFilter        map[uint32]uint32
-	coverFilterBitmap  []byte
+	execCoverFilter    map[uint32]uint32
 	modulesInitialized bool
 
 	assetStorage *asset.Storage
@@ -152,6 +153,10 @@ func main() {
 	cfg, err := mgrconfig.LoadFile(*flagConfig)
 	if err != nil {
 		log.Fatalf("%v", err)
+	}
+	if cfg.DashboardAddr != "" {
+		// This lets better distinguish logs of individual syz-manager instances.
+		log.SetName(cfg.Name)
 	}
 	RunManager(cfg)
 }
@@ -242,12 +247,13 @@ func RunManager(cfg *mgrconfig.Config) {
 			corpusCover := mgr.stats.corpusCover.get()
 			corpusSignal := mgr.stats.corpusSignal.get()
 			maxSignal := mgr.stats.maxSignal.get()
+			triageQLen := len(mgr.candidates)
 			mgr.mu.Unlock()
 			numReproducing := atomic.LoadUint32(&mgr.numReproducing)
 			numFuzzing := atomic.LoadUint32(&mgr.numFuzzing)
 
-			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v",
-				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing)
+			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v, triageQLen %v",
+				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing, triageQLen)
 		}
 	}()
 
@@ -323,7 +329,7 @@ type ReproResult struct {
 func (mgr *Manager) vmLoop() {
 	log.Logf(0, "booting test machines...")
 	log.Logf(0, "wait for the connection from test machine...")
-	instancesPerRepro := 4
+	instancesPerRepro := 3
 	vmCount := mgr.vmPool.Count()
 	maxReproVMs := vmCount - mgr.cfg.FuzzingVMs
 	if instancesPerRepro > maxReproVMs && maxReproVMs > 0 {
@@ -432,7 +438,7 @@ func (mgr *Manager) vmLoop() {
 			log.Logf(1, "loop: repro on %+v finished '%v', repro=%v crepro=%v desc='%v'",
 				res.instances, res.report0.Title, res.repro != nil, crepro, title)
 			if res.err != nil {
-				log.Logf(0, "repro failed: %v", res.err)
+				reportReproError(res.err)
 			}
 			delete(reproducing, res.report0.Title)
 			if res.repro == nil {
@@ -461,6 +467,29 @@ func (mgr *Manager) vmLoop() {
 			goto wait
 		}
 	}
+}
+
+func reportReproError(err error) {
+	shutdown := false
+	select {
+	case <-vm.Shutdown:
+		shutdown = true
+	default:
+	}
+
+	switch err {
+	case repro.ErrNoPrograms:
+		// This is not extraordinary as programs are collected via SSH.
+		log.Logf(0, "repro failed: %v", err)
+		return
+	case repro.ErrNoVMs:
+		// This error is to be expected if we're shutting down.
+		if shutdown {
+			return
+		}
+	}
+	// Report everything else as errors.
+	log.Errorf("repro failed: %v", err)
 }
 
 func (mgr *Manager) runRepro(crash *Crash, vmIndexes []int, putInstances func(...int)) *ReproResult {
@@ -565,7 +594,7 @@ func (mgr *Manager) preloadCorpus() {
 		if corpusDB == nil {
 			log.Fatalf("failed to open corpus database: %v", err)
 		}
-		log.Logf(0, "read %v inputs from corpus and got error: %v", len(corpusDB.Records), err)
+		log.Errorf("read %v inputs from corpus and got error: %v", len(corpusDB.Records), err)
 	}
 	mgr.corpusDB = corpusDB
 
@@ -738,18 +767,18 @@ func (mgr *Manager) runInstance(index int) (*Crash, error) {
 func (mgr *Manager) runInstanceInner(index int, instanceName string) (*report.Report, []byte, error) {
 	inst, err := mgr.vmPool.Create(index)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create instance: %v", err)
+		return nil, nil, fmt.Errorf("failed to create instance: %w", err)
 	}
 	defer inst.Close()
 
 	fwdAddr, err := inst.Forward(mgr.serv.port)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to setup port forwarding: %v", err)
+		return nil, nil, fmt.Errorf("failed to setup port forwarding: %w", err)
 	}
 
 	fuzzerBin, err := inst.Copy(mgr.cfg.FuzzerBin)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to copy binary: %v", err)
+		return nil, nil, fmt.Errorf("failed to copy binary: %w", err)
 	}
 
 	// If ExecutorBin is provided, it means that syz-executor is already in the image,
@@ -758,7 +787,7 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*report.Re
 	if executorBin == "" {
 		executorBin, err = inst.Copy(mgr.cfg.ExecutorBin)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to copy binary: %v", err)
+			return nil, nil, fmt.Errorf("failed to copy binary: %w", err)
 		}
 	}
 
@@ -797,7 +826,7 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*report.Re
 	cmd := instance.FuzzerCmd(args)
 	outc, errc, err := inst.Run(mgr.cfg.Timeouts.VMRunningTime, mgr.vmStop, cmd)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to run fuzzer: %v", err)
+		return nil, nil, fmt.Errorf("failed to run fuzzer: %w", err)
 	}
 
 	var vmInfo []byte
@@ -832,14 +861,14 @@ func (mgr *Manager) emailCrash(crash *Crash) {
 
 func (mgr *Manager) saveCrash(crash *Crash) bool {
 	if err := mgr.reporter.Symbolize(crash.Report); err != nil {
-		log.Logf(0, "failed to symbolize report: %v", err)
+		log.Errorf("failed to symbolize report: %v", err)
 	}
-	if crash.Type == report.MemoryLeak {
+	if crash.Type == crash_pkg.MemoryLeak {
 		mgr.mu.Lock()
 		mgr.memoryLeakFrames[crash.Frame] = true
 		mgr.mu.Unlock()
 	}
-	if crash.Type == report.DataRace {
+	if crash.Type == crash_pkg.DataRace {
 		mgr.mu.Lock()
 		mgr.dataRaceFrames[crash.Frame] = true
 		mgr.mu.Unlock()
@@ -869,7 +898,7 @@ func (mgr *Manager) saveCrash(crash *Crash) bool {
 	mgr.mu.Unlock()
 
 	if mgr.dash != nil {
-		if crash.Type == report.MemoryLeak {
+		if crash.Type == crash_pkg.MemoryLeak {
 			return true
 		}
 		dc := &dashapi.Crash{
@@ -960,7 +989,7 @@ func (mgr *Manager) needRepro(crash *Crash) bool {
 		return true
 	}
 	if mgr.checkResult == nil || (mgr.checkResult.Features[host.FeatureLeak].Enabled &&
-		crash.Type != report.MemoryLeak) {
+		crash.Type != crash_pkg.MemoryLeak) {
 		// Leak checking is very slow, don't bother reproducing other crashes on leak instance.
 		return false
 	}
@@ -972,7 +1001,7 @@ func (mgr *Manager) needRepro(crash *Crash) bool {
 		Title:        crash.Title,
 		Corrupted:    crash.Corrupted,
 		Suppressed:   crash.Suppressed,
-		MayBeMissing: crash.Type == report.MemoryLeak, // we did not send the original crash w/o repro
+		MayBeMissing: crash.Type == crash_pkg.MemoryLeak, // we did not send the original crash w/o repro
 	}
 	needRepro, err := mgr.dash.NeedRepro(cid)
 	if err != nil {
@@ -982,8 +1011,9 @@ func (mgr *Manager) needRepro(crash *Crash) bool {
 }
 
 func (mgr *Manager) saveFailedRepro(rep *report.Report, stats *repro.Stats) {
+	reproLog := fullReproLog(stats)
 	if mgr.dash != nil {
-		if rep.Type == report.MemoryLeak {
+		if rep.Type == crash_pkg.MemoryLeak {
 			// Don't send failed leak repro attempts to dashboard
 			// as we did not send the crash itself.
 			return
@@ -993,7 +1023,8 @@ func (mgr *Manager) saveFailedRepro(rep *report.Report, stats *repro.Stats) {
 			Title:        rep.Title,
 			Corrupted:    rep.Corrupted,
 			Suppressed:   rep.Suppressed,
-			MayBeMissing: rep.Type == report.MemoryLeak,
+			MayBeMissing: rep.Type == crash_pkg.MemoryLeak,
+			ReproLog:     reproLog,
 		}
 		if err := mgr.dash.ReportFailedRepro(cid); err != nil {
 			log.Logf(0, "failed to report failed repro to dashboard: %v", err)
@@ -1005,8 +1036,8 @@ func (mgr *Manager) saveFailedRepro(rep *report.Report, stats *repro.Stats) {
 	osutil.MkdirAll(dir)
 	for i := 0; i < maxReproAttempts; i++ {
 		name := filepath.Join(dir, fmt.Sprintf("repro%v", i))
-		if !osutil.IsExist(name) {
-			saveReproStats(name, stats)
+		if !osutil.IsExist(name) && len(reproLog) > 0 {
+			osutil.WriteFile(name, reproLog)
 			break
 		}
 	}
@@ -1104,7 +1135,8 @@ func (mgr *Manager) saveRepro(res *ReproResult) {
 		osutil.WriteFile(filepath.Join(dir, "repro.cprog"), cprogText)
 	}
 	repro.Prog.ForEachAsset(func(name string, typ prog.AssetType, r io.Reader) {
-		if err := osutil.WriteGzipStream(name+".gz", r); err != nil {
+		fileName := filepath.Join(dir, name+".gz")
+		if err := osutil.WriteGzipStream(fileName, r); err != nil {
 			log.Logf(0, "failed to write crash asset: type %d, write error %v", typ, err)
 		}
 	})
@@ -1118,7 +1150,9 @@ func (mgr *Manager) saveRepro(res *ReproResult) {
 			osutil.WriteFile(filepath.Join(dir, "strace.log"), res.strace.Output)
 		}
 	}
-	saveReproStats(filepath.Join(dir, "repro.stats"), res.stats)
+	if reproLog := fullReproLog(res.stats); len(reproLog) > 0 {
+		osutil.WriteFile(filepath.Join(dir, "repro.stats"), reproLog)
+	}
 }
 
 func (mgr *Manager) uploadReproAssets(repro *repro.Result) []dashapi.NewAsset {
@@ -1144,15 +1178,14 @@ func (mgr *Manager) uploadReproAssets(repro *repro.Result) []dashapi.NewAsset {
 	return ret
 }
 
-func saveReproStats(filename string, stats *repro.Stats) {
-	text := ""
-	if stats != nil {
-		text = fmt.Sprintf("Extracting prog: %v\nMinimizing prog: %v\n"+
-			"Simplifying prog options: %v\nExtracting C: %v\nSimplifying C: %v\n\n\n%s",
-			stats.ExtractProgTime, stats.MinimizeProgTime,
-			stats.SimplifyProgTime, stats.ExtractCTime, stats.SimplifyCTime, stats.Log)
+func fullReproLog(stats *repro.Stats) []byte {
+	if stats == nil {
+		return nil
 	}
-	osutil.WriteFile(filename, []byte(text))
+	return []byte(fmt.Sprintf("Extracting prog: %v\nMinimizing prog: %v\n"+
+		"Simplifying prog options: %v\nExtracting C: %v\nSimplifying C: %v\n\n\n%s",
+		stats.ExtractProgTime, stats.MinimizeProgTime,
+		stats.SimplifyProgTime, stats.ExtractCTime, stats.SimplifyCTime, stats.Log))
 }
 
 func (mgr *Manager) getMinimizedCorpus() (corpus, repros [][]byte) {
@@ -1283,7 +1316,7 @@ func (mgr *Manager) collectSyscallInfoUnlocked() map[string]*CallCov {
 }
 
 func (mgr *Manager) fuzzerConnect(modules []host.KernelModule) (
-	[]rpctype.Input, BugFrames, map[uint32]uint32, []byte, error) {
+	[]rpctype.Input, BugFrames, map[uint32]uint32, map[uint32]uint32, error) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
@@ -1305,13 +1338,13 @@ func (mgr *Manager) fuzzerConnect(modules []host.KernelModule) (
 	if !mgr.modulesInitialized {
 		var err error
 		mgr.modules = modules
-		mgr.coverFilterBitmap, mgr.coverFilter, err = mgr.createCoverageFilter()
+		mgr.execCoverFilter, mgr.coverFilter, err = mgr.createCoverageFilter()
 		if err != nil {
 			log.Fatalf("failed to create coverage filter: %v", err)
 		}
 		mgr.modulesInitialized = true
 	}
-	return corpus, frames, mgr.coverFilter, mgr.coverFilterBitmap, nil
+	return corpus, frames, mgr.coverFilter, mgr.execCoverFilter, nil
 }
 
 func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*prog.Syscall]bool) {
@@ -1359,7 +1392,7 @@ func (mgr *Manager) newInput(inp rpctype.Input, sign signal.Signal) bool {
 		}
 		mgr.corpusDB.Save(sig, inp.Prog, 0)
 		if err := mgr.corpusDB.Flush(); err != nil {
-			log.Logf(0, "failed to save corpus database: %v", err)
+			log.Errorf("failed to save corpus database: %v", err)
 		}
 	}
 	return true
@@ -1389,6 +1422,20 @@ func (mgr *Manager) candidateBatch(size int) []rpctype.Candidate {
 		}
 	}
 	return res
+}
+
+func (mgr *Manager) hubIsUnreachable() {
+	var dash *dashapi.Dashboard
+	mgr.mu.Lock()
+	if mgr.phase == phaseTriagedCorpus {
+		dash = mgr.dash
+		mgr.phase = phaseTriagedHub
+		log.Errorf("did not manage to connect to syz-hub; moving forward")
+	}
+	mgr.mu.Unlock()
+	if dash != nil {
+		mgr.dash.LogError(mgr.cfg.Name, "did not manage to connect to syz-hub")
+	}
 }
 
 func (mgr *Manager) rotateCorpus() bool {

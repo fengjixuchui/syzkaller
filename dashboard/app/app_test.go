@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -80,16 +81,16 @@ var testConfig = &GlobalConfig{
 				{
 					URL:    "git://github.com/google/syzkaller",
 					Branch: "master",
-					Alias:  "repo10alias",
+					Alias:  "repo10alias1",
 					CC: CCConfig{
 						Maintainers: []string{"maintainers@repo10.org", "bugs@repo10.org"},
 					},
 				},
 				{
-					URL:      "git://github.com/google/syzkaller",
-					Branch:   "old_master",
-					Alias:    "repo10alias",
-					Obsolete: true,
+					URL:    "git://github.com/google/syzkaller",
+					Branch: "old_master",
+					Alias:  "repo10alias2",
+					NoPoll: true,
 				},
 			},
 			Managers: map[string]ConfigManager{
@@ -190,7 +191,6 @@ var testConfig = &GlobalConfig{
 					},
 				},
 			},
-			RetestRepros: true,
 		},
 		// Namespaces for access level testing.
 		"access-admin": {
@@ -254,9 +254,10 @@ var testConfig = &GlobalConfig{
 			},
 			Repos: []KernelRepo{
 				{
-					URL:    "git://syzkaller.org/access-public.git",
-					Branch: "access-public",
-					Alias:  "access-public",
+					URL:                    "git://syzkaller.org/access-public.git",
+					Branch:                 "access-public",
+					Alias:                  "access-public",
+					DetectMissingBackports: true,
 				},
 			},
 			Reporting: []Reporting{
@@ -272,6 +273,7 @@ var testConfig = &GlobalConfig{
 					Config:     &TestConfig{Index: 2},
 				},
 			},
+			FindBugOriginTrees: true,
 		},
 		"access-public-email": {
 			AccessLevel: AccessPublic,
@@ -291,6 +293,12 @@ var testConfig = &GlobalConfig{
 					Branch: "access-public-email",
 					Alias:  "access-public-email",
 				},
+				{
+					// Needed for TestTreeOriginLtsBisection().
+					URL:    "https://upstream.repo/repo",
+					Branch: "upstream-master",
+					Alias:  "upstream-master",
+				},
 			},
 			Reporting: []Reporting{
 				{
@@ -304,8 +312,12 @@ var testConfig = &GlobalConfig{
 					},
 				},
 			},
+			RetestRepros: true,
 			Subsystems: SubsystemsConfig{
 				Service: subsystem.MustMakeService(testSubsystems),
+				Redirect: map[string]string{
+					"oldSubsystem": "subsystemA",
+				},
 			},
 		},
 		// The second namespace reporting to the same mailing list.
@@ -508,6 +520,51 @@ var testConfig = &GlobalConfig{
 				},
 			},
 		},
+		"tree-tests": {
+			AccessLevel:           AccessPublic,
+			FixBisectionAutoClose: true,
+			Key:                   "treeteststreeteststreeteststreeteststreeteststreetests",
+			Clients: map[string]string{
+				clientTreeTests: keyTreeTests,
+			},
+			Repos: []KernelRepo{
+				{
+					URL:                    "git://syzkaller.org/test.git",
+					Branch:                 "main",
+					Alias:                  "main",
+					DetectMissingBackports: true,
+				},
+			},
+			Managers: map[string]ConfigManager{
+				"better-manager": {
+					Priority: 1,
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessAdmin,
+					Name:        "non-public",
+					DailyLimit:  1000,
+					Filter: func(bug *Bug) FilterResult {
+						return FilterReport
+					},
+					Config: &TestConfig{Index: 1},
+				},
+				{
+					AccessLevel: AccessUser,
+					Name:        "user",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:         "bugs@syzkaller.com",
+						SubjectPrefix: "[syzbot]",
+					},
+					Labels: map[string]string{
+						"origin:downstream": "Bug presence analysis results: the bug reproduces only on the downstream tree.",
+					},
+				},
+			},
+			FindBugOriginTrees: true,
+		},
 	},
 }
 
@@ -556,6 +613,8 @@ const (
 	keyMgrDecommission    = "keyMgrDecommissionkeyMgrDecommission"
 	clientSubsystemRemind = "client-subystem-reminders"
 	keySubsystemRemind    = "keySubsystemRemindkeySubsystemRemind"
+	clientTreeTests       = "clientTreeTestsclientTreeTests"
+	keyTreeTests          = "keyTreeTestskeyTreeTestskeyTreeTests"
 
 	restrictedManager     = "restricted-manager"
 	noFixBisectionManager = "no-fix-bisection-manager"
@@ -777,8 +836,8 @@ func checkLoginRedirect(c *Ctx, accessLevel AccessLevel, url string) {
 func checkRedirect(c *Ctx, accessLevel AccessLevel, from, to string, status int) {
 	_, err := c.AuthGET(accessLevel, from)
 	c.expectNE(err, nil)
-	httpErr, ok := err.(HTTPError)
-	c.expectTrue(ok)
+	var httpErr *HTTPError
+	c.expectTrue(errors.As(err, &httpErr))
 	c.expectEQ(httpErr.Code, status)
 	c.expectEQ(httpErr.Headers["Location"], []string{to})
 }
@@ -786,8 +845,8 @@ func checkRedirect(c *Ctx, accessLevel AccessLevel, from, to string, status int)
 func checkResponseStatusCode(c *Ctx, accessLevel AccessLevel, url string, status int) {
 	_, err := c.AuthGET(accessLevel, url)
 	c.expectNE(err, nil)
-	httpErr, ok := err.(HTTPError)
-	c.expectTrue(ok)
+	var httpErr *HTTPError
+	c.expectTrue(errors.As(err, &httpErr))
 	c.expectEQ(httpErr.Code, status)
 }
 

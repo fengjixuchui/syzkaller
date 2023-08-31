@@ -21,6 +21,7 @@ func init() {
 	}
 	machineModulesInfo = getModulesInfo
 	machineGlobsInfo = getGlobsInfo
+	machineParseModules = parseModules
 }
 
 func readCPUInfo(buffer *bytes.Buffer) error {
@@ -125,17 +126,26 @@ func readKVMInfo(buffer *bytes.Buffer) error {
 }
 
 func getModulesInfo() ([]KernelModule, error) {
-	var modules []KernelModule
 	modulesText, _ := os.ReadFile("/proc/modules")
-	re := regexp.MustCompile(`(\w+) .*(0[x|X][a-fA-F0-9]+)[^\n]*`)
+	return parseModules(modulesText)
+}
+
+func parseModules(modulesText []byte) ([]KernelModule, error) {
+	var modules []KernelModule
+	re := regexp.MustCompile(`(\w+) ([0-9]+) .*(0[x|X][a-fA-F0-9]+)[^\n]*`)
 	for _, m := range re.FindAllSubmatch(modulesText, -1) {
-		addr, err := strconv.ParseUint(string(m[2]), 0, 64)
+		addr, err := strconv.ParseUint(string(m[3]), 0, 64)
 		if err != nil {
-			return nil, fmt.Errorf("address parsing error in /proc/modules: %v", err)
+			return nil, fmt.Errorf("address parsing error in /proc/modules: %w", err)
+		}
+		size, err := strconv.ParseUint(string(m[2]), 0, 64)
+		if err != nil {
+			return nil, fmt.Errorf("module size parsing error in /proc/modules: %w", err)
 		}
 		modules = append(modules, KernelModule{
 			Name: string(m[1]),
 			Addr: addr,
+			Size: size,
 		})
 	}
 	return modules, nil

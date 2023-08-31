@@ -35,11 +35,11 @@ func testImage(hostAddr string, args *checkArgs) {
 	log.Logf(0, "connecting to host at %v", hostAddr)
 	conn, err := rpctype.Dial(hostAddr, args.ipcConfig.Timeouts.Scale)
 	if err != nil {
-		log.Fatalf("BUG: failed to connect to host: %v", err)
+		log.SyzFatalf("BUG: failed to connect to host: %v", err)
 	}
 	conn.Close()
 	if _, err := checkMachine(args); err != nil {
-		log.Fatalf("BUG: %v", err)
+		log.SyzFatalf("BUG: %v", err)
 	}
 }
 
@@ -48,7 +48,7 @@ func runTest(target *prog.Target, manager *rpctype.RPCClient, name, executor str
 	for {
 		req := new(rpctype.RunTestPollRes)
 		if err := manager.Call("Manager.Poll", pollReq, req); err != nil {
-			log.Fatalf("Manager.Poll call failed: %v", err)
+			log.SyzFatalf("Manager.Poll call failed: %v", err)
 		}
 		if len(req.Bin) == 0 && len(req.Prog) == 0 {
 			return
@@ -67,7 +67,7 @@ func runTest(target *prog.Target, manager *rpctype.RPCClient, name, executor str
 			reply.Error = test.Err.Error()
 		}
 		if err := manager.Call("Manager.Done", reply, nil); err != nil {
-			log.Fatalf("Manager.Done call failed: %v", err)
+			log.SyzFatalf("Manager.Done call failed: %v", err)
 		}
 	}
 }
@@ -126,7 +126,7 @@ func checkMachine(args *checkArgs) (*rpctype.CheckArgs, error) {
 	}
 	globFiles, err := host.CollectGlobsInfo(args.target.GetGlobs())
 	if err != nil {
-		return nil, fmt.Errorf("failed to collect glob info: %v", err)
+		return nil, fmt.Errorf("failed to collect glob info: %w", err)
 	}
 	// TODO: make host.DetectSupportedSyscalls below filter out globs with no values.
 	// Also make prog package more strict with respect to generation/mutation of globs
@@ -217,7 +217,7 @@ func checkRevisions(args *checkArgs) error {
 	}
 	out, err := osutil.Run(time.Minute, cmd)
 	if err != nil {
-		return fmt.Errorf("failed to run executor version: %v", err)
+		return fmt.Errorf("failed to run executor version: %w", err)
 	}
 	vers := strings.Split(strings.TrimSpace(string(out)), " ")
 	if len(vers) != 4 {
@@ -248,17 +248,17 @@ func checkRevisions(args *checkArgs) error {
 func checkSimpleProgram(args *checkArgs, features *host.Features) error {
 	log.Logf(0, "testing simple program...")
 	if err := host.Setup(args.target, features, args.featureFlags, args.ipcConfig.Executor); err != nil {
-		return fmt.Errorf("host setup failed: %v", err)
+		return fmt.Errorf("host setup failed: %w", err)
 	}
 	env, err := ipc.MakeEnv(args.ipcConfig, 0)
 	if err != nil {
-		return fmt.Errorf("failed to create ipc env: %v", err)
+		return fmt.Errorf("failed to create ipc env: %w", err)
 	}
 	defer env.Close()
 	p := args.target.DataMmapProg()
 	output, info, hanged, err := env.Exec(args.ipcExecOpts, p)
 	if err != nil {
-		return fmt.Errorf("program execution failed: %v\n%s", err, output)
+		return fmt.Errorf("program execution failed: %w\n%s", err, output)
 	}
 	if hanged {
 		return fmt.Errorf("program hanged:\n%s", output)
@@ -297,11 +297,13 @@ func buildCallList(target *prog.Target, enabledCalls []int, sandbox string) (
 
 	_, unsupported, err := host.DetectSupportedSyscalls(target, sandbox, calls)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to detect host supported syscalls: %v", err)
+		return nil, nil, fmt.Errorf("failed to detect host supported syscalls: %w", err)
 	}
 	for c := range calls {
 		if reason, ok := unsupported[c]; ok {
-			log.Logf(1, "unsupported syscall: %v: %v", c.Name, reason)
+			// Note: if we print call name followed by ':', it may be detected
+			// as a kernel crash if the call ends with "BUG" or "INFO".
+			log.Logf(1, "unsupported syscall: %v(): %v", c.Name, reason)
 			disabled = append(disabled, rpctype.SyscallReason{
 				ID:     c.ID,
 				Reason: reason,
@@ -312,7 +314,7 @@ func buildCallList(target *prog.Target, enabledCalls []int, sandbox string) (
 	_, unsupported = target.TransitivelyEnabledCalls(calls)
 	for c := range calls {
 		if reason, ok := unsupported[c]; ok {
-			log.Logf(1, "transitively unsupported: %v: %v", c.Name, reason)
+			log.Logf(1, "transitively unsupported: %v(): %v", c.Name, reason)
 			disabled = append(disabled, rpctype.SyscallReason{
 				ID:     c.ID,
 				Reason: reason,

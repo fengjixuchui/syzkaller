@@ -5,17 +5,20 @@ package repro
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/google/syzkaller/pkg/bisect/minimize"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
@@ -42,14 +45,17 @@ type Stats struct {
 
 type reproInstance struct {
 	index    int
-	execProg *instance.ExecProgInstance
+	execProg execInterface
 }
 
 type context struct {
+	logf         func(string, ...interface{})
 	target       *targets.Target
 	reporter     *report.Reporter
 	crashTitle   string
-	crashType    report.Type
+	crashType    crash.Type
+	crashStart   int
+	entries      []*prog.LogEntry
 	instances    chan *reproInstance
 	bootRequests chan int
 	testTimeouts []time.Duration
@@ -59,17 +65,47 @@ type context struct {
 	timeouts     targets.Timeouts
 }
 
+// execInterface describes what's needed from a VM by a pkg/repro.
+type execInterface interface {
+	Close()
+	RunCProg(p *prog.Prog, duration time.Duration, opts csource.Options) (*instance.RunResult, error)
+	RunSyzProg(syzProg []byte, duration time.Duration, opts csource.Options) (*instance.RunResult, error)
+}
+
+var ErrNoPrograms = errors.New("crash log does not contain any programs")
+
 func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, reporter *report.Reporter,
 	vmPool *vm.Pool, vmIndexes []int) (*Result, *Stats, error) {
-	if len(vmIndexes) == 0 {
-		return nil, nil, fmt.Errorf("no VMs provided")
+	ctx, err := prepareCtx(crashLog, cfg, features, reporter, len(vmIndexes))
+	if err != nil {
+		return nil, nil, err
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx.createInstances(cfg, vmPool)
+	}()
+	// Prepare VMs in advance.
+	for _, idx := range vmIndexes {
+		ctx.bootRequests <- idx
+	}
+	// Wait until all VMs are really released.
+	defer wg.Wait()
+	return ctx.run()
+}
+
+func prepareCtx(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, reporter *report.Reporter,
+	VMs int) (*context, error) {
+	if VMs == 0 {
+		return nil, fmt.Errorf("no VMs provided")
 	}
 	entries := cfg.Target.ParseLog(crashLog)
 	if len(entries) == 0 {
-		return nil, nil, fmt.Errorf("crash log does not contain any programs")
+		return nil, ErrNoPrograms
 	}
 	crashStart := len(crashLog)
-	crashTitle, crashType := "", report.Unknown
+	crashTitle, crashType := "", crash.UnknownType
 	if rep := reporter.Parse(crashLog); rep != nil {
 		crashStart = rep.StartPos
 		crashTitle = rep.Title
@@ -88,10 +124,10 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, report
 		// No output can only be reproduced with the max timeout.
 		// As a compromise we use the smallest and the largest timeouts.
 		testTimeouts = []time.Duration{testTimeouts[0], testTimeouts[2]}
-	case crashType == report.MemoryLeak:
+	case crashType == crash.MemoryLeak:
 		// Memory leaks can't be detected quickly because of expensive setup and scanning.
 		testTimeouts = testTimeouts[1:]
-	case crashType == report.Hang:
+	case crashType == crash.Hang:
 		testTimeouts = testTimeouts[2:]
 	}
 	ctx := &context{
@@ -99,59 +135,24 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, report
 		reporter:     reporter,
 		crashTitle:   crashTitle,
 		crashType:    crashType,
-		instances:    make(chan *reproInstance, len(vmIndexes)),
-		bootRequests: make(chan int, len(vmIndexes)),
+		crashStart:   crashStart,
+		entries:      entries,
+		instances:    make(chan *reproInstance, VMs),
+		bootRequests: make(chan int, VMs),
 		testTimeouts: testTimeouts,
 		startOpts:    createStartOptions(cfg, features, crashType),
 		stats:        new(Stats),
 		timeouts:     cfg.Timeouts,
 	}
-	ctx.reproLogf(0, "%v programs, %v VMs, timeouts %v", len(entries), len(vmIndexes), testTimeouts)
-	var wg sync.WaitGroup
-	wg.Add(len(vmIndexes))
-	for _, vmIndex := range vmIndexes {
-		ctx.bootRequests <- vmIndex
-		go func() {
-			defer wg.Done()
-			for vmIndex := range ctx.bootRequests {
-				var inst *instance.ExecProgInstance
-				maxTry := 3
-				for try := 0; try < maxTry; try++ {
-					select {
-					case <-vm.Shutdown:
-						try = maxTry
-						continue
-					default:
-					}
-					var err error
-					inst, err = instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
-						reporter, &instance.OptionalConfig{Logf: ctx.reproLogf})
-					if err != nil {
-						ctx.reproLogf(0, "failed to init instance: %v", err)
-						time.Sleep(10 * time.Second)
-						continue
-					}
-					break
-				}
-				if inst == nil {
-					break
-				}
-				ctx.instances <- &reproInstance{execProg: inst, index: vmIndex}
-			}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(ctx.instances)
-	}()
-	defer func() {
-		close(ctx.bootRequests)
-		for inst := range ctx.instances {
-			inst.execProg.VMInstance.Close()
-		}
-	}()
+	ctx.reproLogf(0, "%v programs, %v VMs, timeouts %v", len(entries), VMs, testTimeouts)
+	return ctx, nil
+}
 
-	res, err := ctx.repro(entries, crashStart)
+func (ctx *context) run() (*Result, *Stats, error) {
+	// Indicate that we no longer need VMs.
+	defer close(ctx.bootRequests)
+
+	res, err := ctx.repro()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -177,9 +178,10 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, report
 	return res, ctx.stats, nil
 }
 
-func createStartOptions(cfg *mgrconfig.Config, features *host.Features, crashType report.Type) csource.Options {
+func createStartOptions(cfg *mgrconfig.Config, features *host.Features,
+	crashType crash.Type) csource.Options {
 	opts := csource.DefaultOpts(cfg)
-	if crashType == report.MemoryLeak {
+	if crashType == crash.MemoryLeak {
 		opts.Leak = true
 	}
 	if features != nil {
@@ -207,15 +209,18 @@ func createStartOptions(cfg *mgrconfig.Config, features *host.Features, crashTyp
 		if !features[host.Feature802154Emulation].Enabled {
 			opts.IEEE802154 = false
 		}
+		if !features[host.FeatureSwap].Enabled {
+			opts.Swap = false
+		}
 	}
 	return opts
 }
 
-func (ctx *context) repro(entries []*prog.LogEntry, crashStart int) (*Result, error) {
+func (ctx *context) repro() (*Result, error) {
 	// Cut programs that were executed after crash.
-	for i, ent := range entries {
-		if ent.Start > crashStart {
-			entries = entries[:i]
+	for i, ent := range ctx.entries {
+		if ent.Start > ctx.crashStart {
+			ctx.entries = ctx.entries[:i]
 			break
 		}
 	}
@@ -225,7 +230,7 @@ func (ctx *context) repro(entries []*prog.LogEntry, crashStart int) (*Result, er
 		ctx.reproLogf(3, "reproducing took %s", time.Since(reproStart))
 	}()
 
-	res, err := ctx.extractProg(entries)
+	res, err := ctx.extractProg(ctx.entries)
 	if err != nil {
 		return nil, err
 	}
@@ -520,14 +525,22 @@ func (ctx *context) testProg(p *prog.Prog, duration time.Duration, opts csource.
 	return ctx.testProgs([]*prog.LogEntry{&entry}, duration, opts)
 }
 
-func (ctx *context) testWithInstance(callback func(inst *instance.ExecProgInstance) (rep *instance.RunResult,
+func (ctx *context) testWithInstance(callback func(execInterface) (rep *instance.RunResult,
 	err error)) (bool, error) {
-	inst := <-ctx.instances
-	if inst == nil {
-		return false, fmt.Errorf("all VMs failed to boot")
+	var result *instance.RunResult
+	var err error
+
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		// It's hard to classify all kinds of errors into the one worth repeating
+		// and not. So let's just retry runs for all errors.
+		// If the problem is transient, it will likely go away.
+		// If the problem is permanent, it will just be the same.
+		result, err = ctx.runOnInstance(callback)
+		if err == nil {
+			break
+		}
 	}
-	defer ctx.returnInstance(inst)
-	result, err := callback(inst.execProg)
 	if err != nil {
 		return false, err
 	}
@@ -539,12 +552,25 @@ func (ctx *context) testWithInstance(callback func(inst *instance.ExecProgInstan
 		ctx.reproLogf(2, "suppressed program crash: %v", rep.Title)
 		return false, nil
 	}
-	if ctx.crashType == report.MemoryLeak && rep.Type != report.MemoryLeak {
+	if ctx.crashType == crash.MemoryLeak && rep.Type != crash.MemoryLeak {
 		ctx.reproLogf(2, "not a leak crash: %v", rep.Title)
 		return false, nil
 	}
 	ctx.report = rep
 	return true, nil
+}
+
+var ErrNoVMs = errors.New("all VMs failed to boot")
+
+// A helper method for testWithInstance.
+func (ctx *context) runOnInstance(callback func(execInterface) (rep *instance.RunResult,
+	err error)) (*instance.RunResult, error) {
+	inst := <-ctx.instances
+	if inst == nil {
+		return nil, ErrNoVMs
+	}
+	defer ctx.returnInstance(inst)
+	return callback(inst.execProg)
 }
 
 func encodeEntries(entries []*prog.LogEntry) []byte {
@@ -574,23 +600,26 @@ func (ctx *context) testProgs(entries []*prog.LogEntry, duration time.Duration, 
 	}
 	ctx.reproLogf(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
 	ctx.reproLogf(3, "detailed listing:\n%s", pstr)
-	return ctx.testWithInstance(func(inst *instance.ExecProgInstance) (*instance.RunResult, error) {
-		return inst.RunSyzProg(pstr, duration, opts)
+	return ctx.testWithInstance(func(exec execInterface) (*instance.RunResult, error) {
+		return exec.RunSyzProg(pstr, duration, opts)
 	})
 }
 
 func (ctx *context) testCProg(p *prog.Prog, duration time.Duration, opts csource.Options) (crashed bool, err error) {
-	return ctx.testWithInstance(func(inst *instance.ExecProgInstance) (*instance.RunResult, error) {
-		return inst.RunCProg(p, duration, opts)
+	return ctx.testWithInstance(func(exec execInterface) (*instance.RunResult, error) {
+		return exec.RunCProg(p, duration, opts)
 	})
 }
 
 func (ctx *context) returnInstance(inst *reproInstance) {
 	ctx.bootRequests <- inst.index
-	inst.execProg.VMInstance.Close()
+	inst.execProg.Close()
 }
 
 func (ctx *context) reproLogf(level int, format string, args ...interface{}) {
+	if ctx.logf != nil {
+		ctx.logf(format, args...)
+	}
 	prefix := fmt.Sprintf("reproducing crash '%v': ", ctx.crashTitle)
 	log.Logf(level, prefix+format, args...)
 	ctx.stats.Log = append(ctx.stats.Log, []byte(fmt.Sprintf(format, args...)+"\n")...)
@@ -598,119 +627,69 @@ func (ctx *context) reproLogf(level int, format string, args ...interface{}) {
 
 func (ctx *context) bisectProgs(progs []*prog.LogEntry, pred func([]*prog.LogEntry) (bool, error)) (
 	[]*prog.LogEntry, error) {
+	// Set up progs bisection.
 	ctx.reproLogf(3, "bisect: bisecting %d programs", len(progs))
-
-	ctx.reproLogf(3, "bisect: executing all %d programs", len(progs))
-	crashed, err := pred(progs)
-	if err != nil {
-		return nil, err
+	minimizePred := func(progs []*prog.LogEntry) (bool, error) {
+		// Don't waste time testing empty crash log.
+		if len(progs) == 0 {
+			return false, nil
+		}
+		return pred(progs)
 	}
-	if !crashed {
-		ctx.reproLogf(3, "bisect: didn't crash")
-		return nil, nil
-	}
-
-	guilty := [][]*prog.LogEntry{progs}
-again:
-	if len(guilty) > 8 {
-		// This is usually the case for flaky crashes. Continuing bisection at this
-		// point would just take a lot of time and likely produce no result.
+	ret, err := minimize.Slice(minimize.Config[*prog.LogEntry]{
+		Pred: minimizePred,
+		// For flaky crashes we usually end up with too many chunks.
+		// Continuing bisection would just take a lot of time and likely produce no result.
+		MaxChunks: 8,
+		Logf: func(msg string, args ...interface{}) {
+			ctx.reproLogf(3, "bisect: "+msg, args...)
+		},
+	}, progs)
+	if err == minimize.ErrTooManyChunks {
 		ctx.reproLogf(3, "bisect: too many guilty chunks, aborting")
 		return nil, nil
 	}
-	ctx.reproLogf(3, "bisect: guilty chunks: %v", chunksToStr(guilty))
-	for i, chunk := range guilty {
-		if len(chunk) == 1 {
-			continue
-		}
-
-		guilty1 := guilty[:i]
-		guilty2 := guilty[i+1:]
-		ctx.reproLogf(3, "bisect: guilty chunks split: %v, <%v>, %v",
-			chunksToStr(guilty1), len(chunk), chunksToStr(guilty2))
-
-		chunk1 := chunk[0 : len(chunk)/2]
-		chunk2 := chunk[len(chunk)/2:]
-		ctx.reproLogf(3, "bisect: chunk split: <%v> => <%v>, <%v>",
-			len(chunk), len(chunk1), len(chunk2))
-
-		ctx.reproLogf(3, "bisect: triggering crash without chunk #1")
-		progs = flatenChunks(guilty1, guilty2, chunk2)
-		crashed, err := pred(progs)
-		if err != nil {
-			return nil, err
-		}
-
-		if crashed {
-			guilty = nil
-			guilty = append(guilty, guilty1...)
-			guilty = append(guilty, chunk2)
-			guilty = append(guilty, guilty2...)
-			ctx.reproLogf(3, "bisect: crashed, chunk #1 evicted")
-			goto again
-		}
-
-		ctx.reproLogf(3, "bisect: triggering crash without chunk #2")
-		progs = flatenChunks(guilty1, guilty2, chunk1)
-		crashed, err = pred(progs)
-		if err != nil {
-			return nil, err
-		}
-
-		if crashed {
-			guilty = nil
-			guilty = append(guilty, guilty1...)
-			guilty = append(guilty, chunk1)
-			guilty = append(guilty, guilty2...)
-			ctx.reproLogf(3, "bisect: crashed, chunk #2 evicted")
-			goto again
-		}
-
-		guilty = nil
-		guilty = append(guilty, guilty1...)
-		guilty = append(guilty, chunk1)
-		guilty = append(guilty, chunk2)
-		guilty = append(guilty, guilty2...)
-
-		ctx.reproLogf(3, "bisect: not crashed, both chunks required")
-
-		goto again
-	}
-
-	progs = nil
-	for _, chunk := range guilty {
-		if len(chunk) != 1 {
-			return nil, fmt.Errorf("bad bisect result: %v", guilty)
-		}
-		progs = append(progs, chunk[0])
-	}
-
-	ctx.reproLogf(3, "bisect: success, %d programs left", len(progs))
-	return progs, nil
+	return ret, err
 }
 
-func flatenChunks(guilty1, guilty2 [][]*prog.LogEntry, chunk []*prog.LogEntry) []*prog.LogEntry {
-	var progs []*prog.LogEntry
-	for _, c := range guilty1 {
-		progs = append(progs, c...)
-	}
-	progs = append(progs, chunk...)
-	for _, c := range guilty2 {
-		progs = append(progs, c...)
-	}
-	return progs
-}
+func (ctx *context) createInstances(cfg *mgrconfig.Config, vmPool *vm.Pool) {
+	var wg sync.WaitGroup
+	for vmIndex := range ctx.bootRequests {
+		wg.Add(1)
+		vmIndex := vmIndex
+		go func() {
+			defer wg.Done()
 
-func chunksToStr(chunks [][]*prog.LogEntry) string {
-	log := "["
-	for i, chunk := range chunks {
-		log += fmt.Sprintf("<%d>", len(chunk))
-		if i != len(chunks)-1 {
-			log += ", "
-		}
+			var inst *instance.ExecProgInstance
+			maxTry := 3
+			for try := 0; try < maxTry; try++ {
+				select {
+				case <-vm.Shutdown:
+					try = maxTry
+					continue
+				default:
+				}
+				var err error
+				inst, err = instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
+					ctx.reporter, &instance.OptionalConfig{Logf: ctx.reproLogf})
+				if err != nil {
+					ctx.reproLogf(0, "failed to init instance: %v", err)
+					time.Sleep(10 * time.Second)
+					continue
+				}
+				break
+			}
+			if inst != nil {
+				ctx.instances <- &reproInstance{execProg: inst, index: vmIndex}
+			}
+		}()
 	}
-	log += "]"
-	return log
+	wg.Wait()
+	// Clean up.
+	close(ctx.instances)
+	for inst := range ctx.instances {
+		inst.execProg.Close()
+	}
 }
 
 type Simplify func(opts *csource.Options) bool
@@ -766,6 +745,7 @@ var cSimplifies = append(progSimplifies, []Simplify{
 		opts.USB = false
 		opts.VhciInjection = false
 		opts.Wifi = false
+		opts.Swap = false
 		return true
 	},
 	func(opts *csource.Options) bool {
@@ -873,6 +853,13 @@ var cSimplifies = append(progSimplifies, []Simplify{
 			return false
 		}
 		opts.Sysctl = false
+		return true
+	},
+	func(opts *csource.Options) bool {
+		if !opts.Swap {
+			return false
+		}
+		opts.Swap = false
 		return true
 	},
 }...)

@@ -181,6 +181,11 @@ func createArches(OS string, archArray, files []string) ([]*Arch, int, error) {
 	if allFiles == nil {
 		return nil, 0, fmt.Errorf("%v", errBuf.String())
 	}
+	if len(files) == 0 {
+		for file := range allFiles {
+			files = append(files, file)
+		}
+	}
 	nfiles := 0
 	var arches []*Arch
 	for _, archStr := range archArray {
@@ -188,7 +193,7 @@ func createArches(OS string, archArray, files []string) ([]*Arch, int, error) {
 		if *flagBuild {
 			dir, err := os.MkdirTemp("", "syzkaller-kernel-build")
 			if err != nil {
-				return nil, 0, fmt.Errorf("failed to create temp dir: %v", err)
+				return nil, 0, fmt.Errorf("failed to create temp dir: %w", err)
 			}
 			buildDir = dir
 		} else if *flagBuildDir != "" {
@@ -210,14 +215,16 @@ func createArches(OS string, archArray, files []string) ([]*Arch, int, error) {
 			build:       *flagBuild,
 			done:        make(chan bool),
 		}
-		archFiles := files
-		if len(archFiles) == 0 {
-			for file, meta := range allFiles {
-				if meta.NoExtract || !meta.SupportsArch(archStr) {
-					continue
-				}
-				archFiles = append(archFiles, file)
+		var archFiles []string
+		for _, file := range files {
+			meta, ok := allFiles[file]
+			if !ok {
+				return nil, 0, fmt.Errorf("unknown file: %v", file)
 			}
+			if meta.NoExtract || !meta.SupportsArch(archStr) {
+				continue
+			}
+			archFiles = append(archFiles, file)
 		}
 		sort.Strings(archFiles)
 		for _, f := range archFiles {

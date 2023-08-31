@@ -50,7 +50,8 @@ func handleContext(fn contextHandler) http.Handler {
 				http.Error(w, "403 Forbidden", http.StatusForbidden)
 				return
 			}
-			if redir, ok := err.(ErrRedirect); ok {
+			var redir *ErrRedirect
+			if errors.As(err, &redir) {
 				http.Redirect(w, r, redir.Error(), http.StatusFound)
 				return
 			}
@@ -129,6 +130,7 @@ type uiHeader struct {
 	Namespace           string
 	ContactEmail        string
 	BugCounts           *CachedBugStats
+	MissingBackports    int
 	Namespaces          []uiNamespace
 	ShowSubsystems      bool
 }
@@ -177,11 +179,11 @@ func commonHeader(c context.Context, r *http.Request, w http.ResponseWriter, ns 
 			}
 			continue
 		}
-		if cfg.Decommissioned {
-			continue
-		}
 		if ns1 == ns {
 			found = true
+		}
+		if isDecommissioned(c, ns1) {
+			continue
 		}
 		h.Namespaces = append(h.Namespaces, uiNamespace{
 			Name:    ns1,
@@ -201,7 +203,7 @@ func commonHeader(c context.Context, r *http.Request, w http.ResponseWriter, ns 
 			ns = adminPage
 		}
 		if ns != adminPage || !isAdminPage {
-			return nil, ErrRedirect{fmt.Errorf("/%v", ns)}
+			return nil, &ErrRedirect{fmt.Errorf("/%v", ns)}
 		}
 	}
 	if ns != adminPage {
@@ -214,6 +216,7 @@ func commonHeader(c context.Context, r *http.Request, w http.ResponseWriter, ns 
 			return nil, err
 		}
 		h.BugCounts = &cached.Total
+		h.MissingBackports = cached.MissingBackports
 	}
 	return h, nil
 }

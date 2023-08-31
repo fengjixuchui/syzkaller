@@ -194,12 +194,12 @@ Please visit the new discussion thread.`
 			dbSubsystem := new(Subsystem)
 			err := db.Get(c, subsystemKey, dbSubsystem)
 			if err != nil {
-				return fmt.Errorf("failed to get subsystem: %s", err)
+				return fmt.Errorf("failed to get subsystem: %w", err)
 			}
 			dbSubsystem.LastBugList = time.Time{}
 			_, err = db.Put(c, subsystemKey, dbSubsystem)
 			if err != nil {
-				return fmt.Errorf("failed to save subsystem: %s", err)
+				return fmt.Errorf("failed to save subsystem: %w", err)
 			}
 		}
 		_, err = db.Put(c, reportKey, report)
@@ -249,7 +249,7 @@ func querySubsystemReport(c context.Context, subsystem *Subsystem, reporting *Re
 	}
 	withRepro, noRepro := []*Bug{}, []*Bug{}
 	for _, bug := range rawOpenBugs {
-		currReporting, _, _, _, _ := currentReporting(c, bug)
+		currReporting, _, _, _, _ := currentReporting(bug)
 		if reporting.Name != currReporting.Name {
 			// The big is not at the expected reporting stage.
 			continue
@@ -262,6 +262,17 @@ func querySubsystemReport(c context.Context, subsystem *Subsystem, reporting *Re
 		}
 		if bug.FirstTime.After(timeNow(c).Add(-config.MinBugAge)) {
 			// Don't take bugs which are too new -- they're still fresh in memory.
+			continue
+		}
+		discussions := bug.discussionSummary()
+		if discussions.ExternalMessages > 0 &&
+			discussions.LastMessage.After(timeNow(c).Add(-config.UserReplyFrist)) {
+			// Don't take bugs with recent user replies.
+			// As we don't keep exactly the date of the last user message, approximate it.
+			continue
+		}
+		if bug.HasLabel(NoRemindersLabel, "") {
+			// The bug was intentionally excluded from monthly reminders.
 			continue
 		}
 		if bug.ReproLevel == dashapi.ReproLevelNone {
@@ -289,6 +300,10 @@ func querySubsystemReport(c context.Context, subsystem *Subsystem, reporting *Re
 	})
 	takeBugs := append(withRepro, noRepro[:takeNoRepro]...)
 	sort.Slice(takeBugs, func(i, j int) bool {
+		firstPrio, secondPrio := takeBugs[i].prio(), takeBugs[j].prio()
+		if firstPrio != secondPrio {
+			return !firstPrio.LessThan(secondPrio)
+		}
 		if takeBugs[i].NumCrashes != takeBugs[j].NumCrashes {
 			return takeBugs[i].NumCrashes > takeBugs[j].NumCrashes
 		}
@@ -333,7 +348,8 @@ func queryMatchingBugs(c context.Context, ns, name string, accessLevel AccessLev
 	allOpenBugs, _, err := loadAllBugs(c, func(query *db.Query) *db.Query {
 		return query.Filter("Namespace=", ns).
 			Filter("Status=", BugStatusOpen).
-			Filter("Tags.Subsystems.Name=", name)
+			Filter("Labels.Label=", SubsystemLabel).
+			Filter("Labels.Value=", name)
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to query open bugs for subsystem: %w", err)
@@ -341,7 +357,8 @@ func queryMatchingBugs(c context.Context, ns, name string, accessLevel AccessLev
 	allFixedBugs, _, err := loadAllBugs(c, func(query *db.Query) *db.Query {
 		return query.Filter("Namespace=", ns).
 			Filter("Status=", BugStatusFixed).
-			Filter("Tags.Subsystems.Name=", name)
+			Filter("Labels.Label=", SubsystemLabel).
+			Filter("Labels.Value=", name)
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to query fixed bugs for subsystem: %w", err)
@@ -353,7 +370,7 @@ func queryMatchingBugs(c context.Context, ns, name string, accessLevel AccessLev
 			fixed = append(fixed, bug)
 			continue
 		}
-		currReporting, _, _, _, err := currentReporting(c, bug)
+		currReporting, _, _, _, err := currentReporting(bug)
 		if err != nil {
 			continue
 		}
@@ -418,6 +435,7 @@ func reportingBugListReport(c context.Context, subsystemReport *SubsystemReport,
 		}
 		ret := &dashapi.BugListReport{
 			ID:          stage.ID,
+			Created:     subsystemReport.Created,
 			Config:      configJSON,
 			Link:        fmt.Sprintf("%v/%s/s/%s", appURL(c), ns, name),
 			Subsystem:   name,

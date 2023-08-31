@@ -147,7 +147,7 @@ var archConfigs = map[string]*archConfig{
 	},
 	"linux/arm64": {
 		Qemu:     "qemu-system-aarch64",
-		QemuArgs: "-machine virt,virtualization=on -cpu cortex-a57",
+		QemuArgs: "-machine virt,virtualization=on -cpu cortex-a57 -accel tcg,thread=multi",
 		NetDev:   "virtio-net-pci",
 		RngDev:   "virtio-rng-pci",
 		CmdLine: []string{
@@ -157,7 +157,7 @@ var archConfigs = map[string]*archConfig{
 	},
 	"linux/arm": {
 		Qemu:                   "qemu-system-arm",
-		QemuArgs:               "-machine vexpress-a15 -cpu max",
+		QemuArgs:               "-machine vexpress-a15 -cpu max -accel tcg,thread=multi",
 		NetDev:                 "virtio-net-device",
 		RngDev:                 "virtio-rng-device",
 		UseNewQemuImageOptions: true,
@@ -275,7 +275,7 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		Snapshot:    true,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse qemu vm config: %v", err)
+		return nil, fmt.Errorf("failed to parse qemu vm config: %w", err)
 	}
 	if cfg.Count < 1 || cfg.Count > 128 {
 		return nil, fmt.Errorf("invalid config param count: %v, want [1, 128]", cfg.Count)
@@ -340,7 +340,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		}
 		initFile := filepath.Join(workdir, "init.sh")
 		if err := osutil.WriteExecFile(initFile, []byte(strings.Replace(initScript, "{{KEY}}", sshkey, -1))); err != nil {
-			return nil, fmt.Errorf("failed to create init file: %v", err)
+			return nil, fmt.Errorf("failed to create init file: %w", err)
 		}
 	}
 
@@ -513,7 +513,7 @@ func (inst *instance) boot() error {
 	qemu.Stdout = inst.wpipe
 	qemu.Stderr = inst.wpipe
 	if err := qemu.Start(); err != nil {
-		return fmt.Errorf("failed to start %v %+v: %v", inst.cfg.Qemu, args, err)
+		return fmt.Errorf("failed to start %v %+v: %w", inst.cfg.Qemu, args, err)
 	}
 	inst.wpipe.Close()
 	inst.wpipe = nil

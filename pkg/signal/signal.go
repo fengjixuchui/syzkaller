@@ -79,6 +79,11 @@ func (s Signal) Serialize() Serial {
 	return res
 }
 
+func (ser *Serial) AddElem(elem uint32, prio prioType) {
+	ser.Elems = append(ser.Elems, elemType(elem))
+	ser.Prios = append(ser.Prios, prio)
+}
+
 func (ser Serial) Deserialize() Signal {
 	if len(ser.Elems) != len(ser.Prios) {
 		panic("corrupted Serial")

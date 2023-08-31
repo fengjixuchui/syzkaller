@@ -57,13 +57,18 @@ type Instance struct {
 }
 
 var (
-	Shutdown               = vmimpl.Shutdown
-	ErrTimeout             = vmimpl.ErrTimeout
-	_          BootErrorer = vmimpl.BootError{}
+	Shutdown                = vmimpl.Shutdown
+	ErrTimeout              = vmimpl.ErrTimeout
+	_          BootErrorer  = vmimpl.BootError{}
+	_          InfraErrorer = vmimpl.InfraError{}
 )
 
 type BootErrorer interface {
 	BootError() (string, []byte)
+}
+
+type InfraErrorer interface {
+	InfraError() (string, []byte)
 }
 
 // vmType splits the VM type from any suffix (separated by ":"). This is mostly
@@ -127,7 +132,7 @@ func (pool *Pool) Create(index int) (*Instance, error) {
 	}
 	workdir, err := osutil.ProcessTempDir(pool.workdir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create instance temp dir: %v", err)
+		return nil, fmt.Errorf("failed to create instance temp dir: %w", err)
 	}
 	if pool.template != "" {
 		if err := osutil.CopyDirRecursively(pool.template, filepath.Join(workdir, "template")); err != nil {

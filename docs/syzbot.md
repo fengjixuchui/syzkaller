@@ -149,6 +149,51 @@ You can also manually override the automatic guess by replying to the `syzbot` e
 Names of subsystems must be taken from the subsystem list page on the syzbot web
 dashboard.
 
+<div id="labels"/>
+
+## Bug labels
+
+It is possible to assign labels to syzkaller-reported bugs. These labels
+are displayed near bug titles on the bug lists and on individual bug pages.
+
+There are two types of labels:
+* Flags
+  * Send `#syz set <label>` to set the flag.
+  * Send `#syz unset <label>` to drop the flag.
+* Label with values
+  * Send `#syz set <label>: <value>[, <value2> ...]`  to overwrite the value list.
+  * `#syz unset <label>` would drop the label with all its values.
+
+There's a fixed list of supported labels (*). Most important ones:
+| Key | Description | Values | Example |
+| - | - | - | - |
+| `subsystems` | A comma-separated list of subsystems of the bug | See [the list](https://syzkaller.appspot.com/upstream/subsystems) on the syzbot dashboard | `#syz set subsystems: mm, reiserfs` |
+| `prio` | The priority of the bug | One of `low`, `normal`, `high` | `#syz set prio: low`<br>`#syz unset prio` |
+| `no-reminders` | Don't include the bug into monthly reminders | No values, just a flag |  `#syz set no-reminders`<br>`#syz unset no-reminders` |
+
+It is also possible to set and unset labels for individual bugs from a monthly
+subsystem report. Let's consider an example.
+
+```
+Some of the still happening issues:
+
+Ref Crashes Repro Title
+<1> 10      No    WARNING in __brelse (2)
+                  https://syzkaller.appspot.com/bug?id=cd9cb7a620dcfbf46a5eaf201031acaf3aeda28e
+<2> 3       No    WARNING in kernfs_get (4)
+                  https://syzkaller.appspot.com/bug?id=b4278401038872458a20f08210e46f3ab519b786
+```
+
+One can send the following email to disable reminders for the first bug and to
+change the subsystem of the second bug:
+
+```
+#syz set <1> no-reminders
+#syz set <2> subsystems: kernfs
+```
+
+(*) If you need other labels to facilitate your work, feel free to contact us.
+
 <div id="amend"/>
 <div id="linux-next"/>
 
@@ -187,7 +232,7 @@ using `#syz fix: commit-title` commands.
 can reproduce the bug and then goes back release-by-release to find the first
 release where kernel does not crash. Once such release is found, `syzbot` starts
 bisection on that range. `syzbot` has limitation of how far back in time it can
-go (currently `v4.1`), going back in time is [very hard](/pkg/vcs/linux.go)
+go (currently `v4.19`), going back in time is [very hard](/pkg/vcs/linux.go)
 because of incompatible compiler/linker/asm/perl/make/libc/etc, kernel
 build/boot breakages and large amounts of bugs.
 
@@ -269,6 +314,13 @@ syz-prog2c -prog repro.syz.txt -enable=all -threaded -repeat -procs=8 -sandbox=n
 ```
 
 However, note that if `syzbot` did not provide a C reproducer, it wasn't able to trigger the bug using the C program (though, it can be just because the bug is triggered by a subtle race condition).
+
+## Downloadable assets
+
+Syzbot shares links to the bootable disk image, kernel object file and other
+relevant files that can be used to reproduce and debug the issue locally.
+
+See [this tutorial](/docs/syzbot_assets.md) on how to use them.
 
 ## Crash does not reproduce?
 
@@ -370,7 +422,7 @@ propagation of uninitialized values through memory and registers and only flags
 actual eventual uses of uninitialized values. For example, `KMSAN` will detect
 a branch on or a `copy_to_user()` of values that transitively come from
 uninitialized memory created by heap/stack allocations. This ensures
-/theoretical/ absense of both false positives and false negatives (with some
+/theoretical/ absence of both false positives and false negatives (with some
 implementation limitations of course). Note that `KMSAN` requires `clang` compiler.
 
 `KMSAN` is not upstream yet, though, we want to upstream it later. For now,
@@ -388,7 +440,7 @@ and attach/inline your test patch in the same email.
 Report explanation. The first call trace points to the `use` of the uninit value
 (which is usually a branching or copying it to userspace). Then there are 0 or
 more "Uninit was stored to memory at:" stacks which denote how the unint value
-travelled through memory. Finally there is a "Uninit was created at:"
+traveled through memory. Finally there is a "Uninit was created at:"
 section which points either to a heap allocation or a stack variable which
 is the original source of uninitialized-ness.
 
@@ -454,11 +506,11 @@ There are several reasons for this:
 - custom patches may not apply tomorrow
 - custom patches may not apply to all of the tested git trees
 - it's hard to communicate exact state of the code with bug reports (not just hash anymore)
-- line numbers won't match in reports (which always brings suspecion as to the quality of reports)
+- line numbers won't match in reports (which always brings suspicion as to the quality of reports)
 - custom patches can also introduce bugs, and even if they don't a developer may (rightfully)
   question validity of and may not want to spend time on reports obtained
   with a number of out-of-tree patches
-- order of patch application generatelly matters, and at some point patches
+- order of patch application generally matters, and at some point patches
   need to be removed, there is nobody to manage this
 
 We've experimented with application of custom patches in the past and it lead

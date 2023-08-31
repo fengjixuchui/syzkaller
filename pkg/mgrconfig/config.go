@@ -41,9 +41,8 @@ type Config struct {
 	// Directory with kernel object files (e.g. `vmlinux` for linux)
 	// (used for report symbolization, coverage reports and in tree modules finding, optional).
 	KernelObj string `json:"kernel_obj"`
-	// Directories with out-of-free kernel module object files (optional).
+	// Directories with out-of-tree kernel module object files for coverage report generation (optional).
 	// KernelObj is also scanned for in-tree kernel modules and does not need to be duplicated here.
-	// Note: KASLR needs to be disabled and modules need to be pre-loaded at fixed addressses by init process.
 	// Note: the modules need to be unstripped and contain debug info.
 	ModuleObj []string `json:"module_obj,omitempty"`
 	// Kernel source directory (if not set defaults to KernelObj).
@@ -153,7 +152,7 @@ type Config struct {
 	Reproduce bool `json:"reproduce"`
 
 	// The number of VMs that are reserved to only perform fuzzing and nothing else.
-	// Can be helpful e.g. to ensure that the pool of fuzzing VMs is never exhaused and
+	// Can be helpful e.g. to ensure that the pool of fuzzing VMs is never exhausted and
 	// the manager continues fuzzing no matter how many new bugs are encountered.
 	// By default the value is 0, i.e. all VMs can be used for all purposes.
 	FuzzingVMs int `json:"fuzzing_vms,omitempty"`

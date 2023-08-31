@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,19 +18,22 @@ import (
 	"golang.org/x/net/context"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
+	"google.golang.org/appengine/v2/user"
 )
 
 type testReqArgs struct {
-	bug          *Bug
-	bugKey       *db.Key
-	bugReporting *BugReporting
-	user         string
-	extID        string
-	link         string
-	patch        []byte
-	repo         string
-	branch       string
-	jobCC        []string
+	bug             *Bug
+	bugKey          *db.Key
+	bugReporting    *BugReporting
+	user            string
+	extID           string
+	link            string
+	patch           []byte
+	repo            string
+	branch          string
+	jobCC           []string
+	mergeBaseRepo   string
+	mergeBaseBranch string
 }
 
 // handleTestRequest added new job to db.
@@ -47,15 +51,14 @@ func handleTestRequest(c context.Context, args *testReqArgs) error {
 			}
 		}
 	}
-	now := timeNow(c)
 	crash, crashKey, err := findCrashForBug(c, args.bug)
 	if err != nil {
-		return fmt.Errorf("failed to find a crash: %v", err)
+		return fmt.Errorf("failed to find a crash: %w", err)
 	}
-	err = addTestJob(c, &testJobArgs{
+	_, _, err = addTestJob(c, &testJobArgs{
 		testReqArgs: *args,
 		crash:       crash, crashKey: crashKey,
-	}, now)
+	})
 	if err != nil {
 		return err
 	}
@@ -65,14 +68,14 @@ func handleTestRequest(c context.Context, args *testReqArgs) error {
 		if err := db.Get(c, args.bugKey, bug); err != nil {
 			return err
 		}
-		bug.LastActivity = now
+		bug.LastActivity = timeNow(c)
 		bugReporting := args.bugReporting
 		bugReporting = bugReportingByName(bug, bugReporting.Name)
 		bugCC := strings.Split(bugReporting.CC, "|")
 		merged := email.MergeEmailLists(bugCC, args.jobCC)
 		bugReporting.CC = strings.Join(merged, "|")
 		if _, err := db.Put(c, args.bugKey, bug); err != nil {
-			return fmt.Errorf("failed to put bug: %v", err)
+			return fmt.Errorf("failed to put bug: %w", err)
 		}
 		return nil
 	}
@@ -84,48 +87,68 @@ func handleTestRequest(c context.Context, args *testReqArgs) error {
 }
 
 type testJobArgs struct {
-	crash     *Crash
-	crashKey  *db.Key
-	configRef int64
+	crash         *Crash
+	crashKey      *db.Key
+	configRef     int64
+	configAppend  string
+	treeOrigin    bool
+	inTransaction bool
 	testReqArgs
 }
 
-func addTestJob(c context.Context, args *testJobArgs, now time.Time) error {
+func addTestJob(c context.Context, args *testJobArgs) (*Job, *db.Key, error) {
+	now := timeNow(c)
 	if reason := checkTestJob(c, args.bug, args.bugReporting, args.crash,
 		args.repo, args.branch); reason != "" {
-		return &BadTestRequestError{reason}
+		return nil, nil, &BadTestRequestError{reason}
 	}
 	manager, mgrConfig := activeManager(args.crash.Manager, args.bug.Namespace)
 	if mgrConfig != nil && mgrConfig.RestrictedTestingRepo != "" &&
 		args.repo != mgrConfig.RestrictedTestingRepo {
-		return &BadTestRequestError{mgrConfig.RestrictedTestingReason}
+		return nil, nil, &BadTestRequestError{mgrConfig.RestrictedTestingReason}
 	}
 	patchID, err := putText(c, args.bug.Namespace, textPatch, args.patch, false)
 	if err != nil {
-		return err
+		return nil, nil, err
+	}
+	configRef := args.configRef
+	if args.configAppend != "" {
+		kernelConfig, _, err := getText(c, textKernelConfig, configRef)
+		if err != nil {
+			return nil, nil, err
+		}
+		configRef, err = putText(c, args.bug.Namespace, textKernelConfig,
+			append(kernelConfig, []byte(args.configAppend)...), true)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	reportingName := ""
 	if args.bugReporting != nil {
 		reportingName = args.bugReporting.Name
 	}
 	job := &Job{
-		Type:         JobTestPatch,
-		Created:      now,
-		User:         args.user,
-		CC:           args.jobCC,
-		Reporting:    reportingName,
-		ExtID:        args.extID,
-		Link:         args.link,
-		Namespace:    args.bug.Namespace,
-		Manager:      manager,
-		BugTitle:     args.bug.displayTitle(),
-		CrashID:      args.crashKey.IntID(),
-		KernelRepo:   args.repo,
-		KernelBranch: args.branch,
-		Patch:        patchID,
-		KernelConfig: args.configRef,
+		Type:            JobTestPatch,
+		Created:         now,
+		User:            args.user,
+		CC:              args.jobCC,
+		Reporting:       reportingName,
+		ExtID:           args.extID,
+		Link:            args.link,
+		Namespace:       args.bug.Namespace,
+		Manager:         manager,
+		BugTitle:        args.bug.displayTitle(),
+		CrashID:         args.crashKey.IntID(),
+		KernelRepo:      args.repo,
+		KernelBranch:    args.branch,
+		MergeBaseRepo:   args.mergeBaseRepo,
+		MergeBaseBranch: args.mergeBaseBranch,
+		Patch:           patchID,
+		KernelConfig:    configRef,
+		TreeOrigin:      args.treeOrigin,
 	}
 
+	var jobKey *db.Key
 	deletePatch := false
 	tx := func(c context.Context) error {
 		deletePatch = false
@@ -140,40 +163,49 @@ func addTestJob(c context.Context, args *testJobArgs, now time.Time) error {
 				Filter("ExtID=", args.extID).
 				GetAll(c, &jobs)
 			if len(jobs) > 1 || err != nil {
-				return fmt.Errorf("failed to query jobs: jobs=%v err=%v", len(jobs), err)
+				return fmt.Errorf("failed to query jobs: jobs=%v err=%w", len(jobs), err)
 			}
 		}
 		if len(jobs) != 0 {
 			// The job is already present, update link.
 			deletePatch = true
-			existingJob, jobKey := jobs[0], keys[0]
-			if existingJob.Link != "" || args.link == "" {
+			job, jobKey = jobs[0], keys[0]
+			if job.Link != "" || args.link == "" {
 				return nil
 			}
-			existingJob.Link = args.link
-			if _, err := db.Put(c, jobKey, existingJob); err != nil {
-				return fmt.Errorf("failed to put job: %v", err)
+			job.Link = args.link
+			if jobKey, err = db.Put(c, jobKey, job); err != nil {
+				return fmt.Errorf("failed to put job: %w", err)
 			}
 			return nil
 		}
-		// Create a new job.
-		jobKey := db.NewIncompleteKey(c, "Job", args.bugKey)
-		if _, err := db.Put(c, jobKey, job); err != nil {
-			return fmt.Errorf("failed to put job: %v", err)
-		}
-		return addCrashReference(c, job.CrashID, args.bugKey,
-			CrashReference{CrashReferenceJob, extJobID(jobKey), now})
+		jobKey, err = saveJob(c, job, args.bugKey)
+		return err
 	}
-	err = db.RunInTransaction(c, tx, &db.TransactionOptions{XG: true, Attempts: 30})
-	if patchID != 0 && deletePatch || err != nil {
+	if args.inTransaction {
+		err = tx(c)
+	} else {
+		err = db.RunInTransaction(c, tx, &db.TransactionOptions{XG: true, Attempts: 30})
+	}
+	if patchID != 0 && (deletePatch || err != nil) {
 		if err := db.Delete(c, db.NewKey(c, textPatch, "", patchID, nil)); err != nil {
 			log.Errorf(c, "failed to delete patch for dup job: %v", err)
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("job tx failed: %v", err)
+		return nil, nil, fmt.Errorf("job tx failed: %w", err)
 	}
-	return nil
+	return job, jobKey, nil
+}
+
+func saveJob(c context.Context, job *Job, bugKey *db.Key) (*db.Key, error) {
+	jobKey := db.NewIncompleteKey(c, "Job", bugKey)
+	var err error
+	if jobKey, err = db.Put(c, jobKey, job); err != nil {
+		return nil, fmt.Errorf("failed to put job: %w", err)
+	}
+	return jobKey, addCrashReference(c, job.CrashID, bugKey,
+		CrashReference{CrashReferenceJob, extJobID(jobKey), timeNow(c)})
 }
 
 func checkTestJob(c context.Context, bug *Bug, bugReporting *BugReporting, crash *Crash,
@@ -197,6 +229,52 @@ func checkTestJob(c context.Context, bug *Bug, bugReporting *BugReporting, crash
 		return "This bug is already upstreamed. Please test upstream."
 	}
 	return ""
+}
+
+// Mark bisection job as invalid and, if restart=true, reset bisection state of the related bug.
+func invalidateBisection(c context.Context, jobKey *db.Key, restart bool) error {
+	u := user.Current(c)
+	tx := func(c context.Context) error {
+		job := new(Job)
+		if err := db.Get(c, jobKey, job); err != nil {
+			return fmt.Errorf("failed to get job: %w", err)
+		}
+
+		if job.Type != JobBisectCause && job.Type != JobBisectFix {
+			return fmt.Errorf("can only invalidate bisection jobs")
+		}
+
+		// Update the job.
+		job.InvalidatedBy = u.Email
+		if _, err := db.Put(c, jobKey, job); err != nil {
+			return fmt.Errorf("failed to put job: %w", err)
+		}
+
+		if restart {
+			// Update the bug.
+			bug := new(Bug)
+			bugKey := jobKey.Parent()
+			if err := db.Get(c, bugKey, bug); err != nil {
+				return fmt.Errorf("failed to get bug: %w", err)
+			}
+			if job.Type == JobBisectCause {
+				bug.BisectCause = BisectNot
+			} else if job.IsCrossTree() {
+				bug.FixCandidateJob = ""
+			} else if job.Type == JobBisectFix {
+				bug.BisectFix = BisectNot
+			}
+			if _, err := db.Put(c, bugKey, bug); err != nil {
+				return fmt.Errorf("failed to put bug: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := db.RunInTransaction(c, tx, &db.TransactionOptions{XG: true, Attempts: 10}); err != nil {
+		return fmt.Errorf("update failed: %w", err)
+	}
+
+	return nil
 }
 
 type BadTestRequestError struct {
@@ -238,65 +316,262 @@ func getNextJob(c context.Context, managers map[string]dashapi.ManagerJobs) (*Jo
 	if job != nil || err != nil {
 		return job, jobKey, err
 	}
-	// We need both C and syz repros, but the crazy datastore query restrictions
-	// do not allow to use ReproLevel>ReproLevelNone in the query. So we do 2 separate queries.
-	// C repros tend to be of higher reliability so maybe it's not bad.
-	job, jobKey, err = createBisectJob(c, managers, ReproLevelC)
-	if job != nil || err != nil {
-		return job, jobKey, err
+	// Each syz-ci polls dashboard every 10 seconds. At the times when there are no
+	// matching jobs, it just doesn't make much sense to execute heavy algorithms that
+	// try to generate them too often.
+	// Note that it won't affect user-created jobs as they are not auto-generated.
+	if err := throttleJobGeneration(c, managers); err != nil {
+		return nil, nil, err
 	}
-	return createBisectJob(c, managers, ReproLevelSyz)
+	var handlers []func(context.Context, map[string]dashapi.ManagerJobs) (*Job, *db.Key, error)
+	// Let's alternate handlers, so that neither patch tests nor bisections overrun one another.
+	if timeNow(c).UnixMilli()%2 == 0 {
+		handlers = append(handlers, jobFromBugSample, createBisectJob)
+	} else {
+		handlers = append(handlers, createBisectJob, jobFromBugSample)
+	}
+	for _, f := range handlers {
+		job, jobKey, err := f(c, managers)
+		if job != nil || err != nil {
+			return job, jobKey, err
+		}
+	}
+	return nil, nil, nil
 }
 
-// Ensure that for each manager there's one pending retest repro job.
-func updateRetestReproJobs(c context.Context, ns string) error {
-	if config.Obsoleting.ReproRetestPeriod == 0 {
-		return nil
-	}
-	var jobs []*Job
-	_, err := db.NewQuery("Job").
-		Filter("Finished=", time.Time{}).
-		GetAll(c, &jobs)
-	if err != nil {
-		return fmt.Errorf("failed to query jobs: %w", err)
-	}
-	managerHasJob := map[string]bool{}
-	for _, job := range jobs {
-		if job.User == "" && job.Type == JobTestPatch {
-			managerHasJob[job.Manager] = true
-		}
-	}
-	// Let's save resources and only re-check repros for bugs with no recent crashes.
-	now := timeNow(c)
-	maxLastTime := now.Add(-config.Obsoleting.ReproRetestPeriod)
-	bugs, keys, err := loadAllBugs(c, func(query *db.Query) *db.Query {
-		return query.Filter("Status=", BugStatusOpen).
-			Filter("Namespace=", ns).
-			Filter("LastTime<", maxLastTime)
-	})
-	if err != nil {
-		return fmt.Errorf("failed to query bugs: %w", err)
-	}
-	for id, bug := range bugs {
-		err := handleRetestForBug(c, now, bug, keys[id], managerHasJob)
+const jobGenerationPeriod = time.Minute
+
+func throttleJobGeneration(c context.Context, managers map[string]dashapi.ManagerJobs) error {
+	drop := map[string]struct{}{}
+	for name := range managers {
+		// Technically the key is Namespace+Manager, so it's not guaranteed
+		// that there'll be only one.
+		// But for throttling purposes any single entity will do.
+		// Also note that we do the query outside of the transaction as
+		// datastore prohibits non-ancestor queries.
+		keys, err := db.NewQuery("Manager").
+			Filter("Name=", name).
+			Limit(1).
+			KeysOnly().
+			GetAll(c, nil)
 		if err != nil {
-			return fmt.Errorf("bug %v repro retesting failed: %w", keys[id], err)
+			return err
 		}
+		if len(keys) == 0 {
+			drop[name] = struct{}{}
+			continue
+		}
+		tx := func(c context.Context) error {
+			manager := new(Manager)
+			if err := db.Get(c, keys[0], manager); err != nil {
+				return fmt.Errorf("failed to get %v", keys[0])
+			}
+			if timeNow(c).Sub(manager.LastGeneratedJob) < jobGenerationPeriod {
+				drop[name] = struct{}{}
+				return nil
+			}
+			manager.LastGeneratedJob = timeNow(c)
+			if _, err = db.Put(c, keys[0], manager); err != nil {
+				return fmt.Errorf("failed to put Manager: %w", err)
+			}
+			return nil
+		}
+		if err := db.RunInTransaction(c, tx, &db.TransactionOptions{}); err != nil {
+			return fmt.Errorf("failed to throttle: %w", err)
+		}
+	}
+	for name := range drop {
+		delete(managers, name)
 	}
 	return nil
 }
 
-func handleRetestForBug(c context.Context, now time.Time, bug *Bug, bugKey *db.Key,
-	managerHasJob map[string]bool) error {
-	if len(bug.Commits) > 0 {
-		// Let's save resources -- there's no point in retesting repros for bugs
-		// for which we were already given fixing commits.
-		return nil
+// Randomly sample a subset of open bugs with reproducers and try to generate
+// a job for them.
+// Suitable for cases when we must look deeper than just into Bug fields.
+// Sampling allows to evenly spread the load over time.
+func jobFromBugSample(c context.Context, managers map[string]dashapi.ManagerJobs) (*Job,
+	*db.Key, error) {
+	var managersList []string
+	for name, jobs := range managers {
+		if !jobs.Any() {
+			continue
+		}
+		managersList = append(managersList, name)
+		managersList = append(managersList, decommissionedInto(name)...)
 	}
+	managersList = unique(managersList)
+
+	var allBugs []*Bug
+	var allBugKeys []*db.Key
+	for _, mgrName := range managersList {
+		bugs, bugKeys, err := loadAllBugs(c, func(query *db.Query) *db.Query {
+			return query.Filter("Status=", BugStatusOpen).
+				Filter("HappenedOn=", mgrName).
+				Filter("HeadReproLevel>", 0)
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		bugs, bugKeys = filterBugs(bugs, bugKeys, func(bug *Bug) bool {
+			if len(bug.Commits) > 0 {
+				// Let's save resources -- there's no point in doing analysis for bugs
+				// for which we were already given fixing commits.
+				return false
+			}
+			if isDecommissioned(c, bug.Namespace) {
+				return false
+			}
+			return true
+		})
+		allBugs = append(allBugs, bugs...)
+		allBugKeys = append(allBugKeys, bugKeys...)
+	}
+	r := rand.New(rand.NewSource(timeNow(c).UnixNano()))
+	// Bugs often happen on multiple instances, so let's filter out duplicates.
+	allBugs, allBugKeys = uniqueBugs(allBugs, allBugKeys)
+	r.Shuffle(len(allBugs), func(i, j int) {
+		allBugs[i], allBugs[j] = allBugs[j], allBugs[i]
+		allBugKeys[i], allBugKeys[j] = allBugKeys[j], allBugKeys[i]
+	})
+	// Also shuffle the creator functions.
+	funcs := []func(context.Context, []*Bug, []*db.Key,
+		map[string]dashapi.ManagerJobs) (*Job, *db.Key, error){
+		createPatchRetestingJobs,
+		createTreeTestJobs,
+		createTreeBisectionJobs,
+	}
+	r.Shuffle(len(funcs), func(i, j int) { funcs[i], funcs[j] = funcs[j], funcs[i] })
+	for _, f := range funcs {
+		job, jobKey, err := f(c, allBugs, allBugKeys, managers)
+		if job != nil || err != nil {
+			return job, jobKey, err
+		}
+	}
+	return nil, nil, nil
+}
+
+func createTreeBisectionJobs(c context.Context, bugs []*Bug, bugKeys []*db.Key,
+	managers map[string]dashapi.ManagerJobs) (*Job, *db.Key, error) {
+	log.Infof(c, "createTreeBisectionJobs is called for %d bugs", len(bugs))
+	const maxProcess = 5
+	processed := 0
+	for _, bug := range bugs {
+		if bug.FixCandidateJob != "" {
+			continue
+		}
+		if processed >= maxProcess {
+			break
+		}
+		any := false
+		for _, mgr := range bug.HappenedOn {
+			newMgr, _ := activeManager(mgr, bug.Namespace)
+			any = any || managers[newMgr].BisectFix
+		}
+		if !any {
+			continue
+		}
+		job, key, expensive, err := crossTreeBisection(c, bug, managers)
+		if job != nil || err != nil {
+			return job, key, err
+		}
+		if expensive {
+			// Only count expensive lookups.
+			// If we didn't have to query anything from the DB, it's not a problem to
+			// examine more bugs.
+			processed++
+		}
+	}
+	return nil, nil, nil
+}
+
+func createTreeTestJobs(c context.Context, bugs []*Bug, bugKeys []*db.Key,
+	managers map[string]dashapi.ManagerJobs) (*Job, *db.Key, error) {
+	takeBugs := 5
+	prio, next := []int{}, []int{}
+	for i, bug := range bugs {
+		if !config.Namespaces[bug.Namespace].FindBugOriginTrees {
+			continue
+		}
+		if timeNow(c).Before(bug.TreeTests.NextPoll) {
+			continue
+		}
+		if bug.TreeTests.NeedPoll {
+			prio = append(prio, i)
+		} else {
+			next = append(next, i)
+		}
+		if len(prio) >= takeBugs {
+			prio = prio[:takeBugs]
+			break
+		} else if len(prio)+len(next) > takeBugs {
+			next = next[:takeBugs-len(prio)]
+		}
+	}
+	for _, i := range append(prio, next...) {
+		job, jobKey, err := generateTreeOriginJobs(c, bugKeys[i], managers)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bug %v job creation failed: %w", bugKeys[i], err)
+		} else if job != nil {
+			return job, jobKey, nil
+		}
+	}
+	return nil, nil, nil
+}
+
+func createPatchRetestingJobs(c context.Context, bugs []*Bug, bugKeys []*db.Key,
+	managers map[string]dashapi.ManagerJobs) (*Job, *db.Key, error) {
+	takeBugs := 5
+	for i, bug := range bugs {
+		if !config.Namespaces[bug.Namespace].RetestRepros {
+			// Repro retesting is disabled for the namespace.
+			continue
+		}
+		if config.Obsoleting.ReproRetestPeriod == 0 ||
+			timeNow(c).Sub(bug.LastTime) < config.Obsoleting.ReproRetestStart {
+			// Don't retest reproducers if crashes are still happening.
+			continue
+		}
+		takeBugs--
+		if takeBugs == 0 {
+			break
+		}
+		job, jobKey, err := handleRetestForBug(c, bug, bugKeys[i], managers)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bug %v repro retesting failed: %w", bugKeys[i], err)
+		} else if job != nil {
+			return job, jobKey, nil
+		}
+	}
+	return nil, nil, nil
+}
+
+func decommissionedInto(jobMgr string) []string {
+	var ret []string
+	for _, nsConfig := range config.Namespaces {
+		for name, mgr := range nsConfig.Managers {
+			if mgr.DelegatedTo == jobMgr {
+				ret = append(ret, name)
+			}
+		}
+	}
+	return ret
+}
+
+// There are bugs with dozens of reproducer.
+// Let's spread the load more evenly by limiting the number of jobs created at a time.
+const maxRetestJobsAtOnce = 5
+
+func handleRetestForBug(c context.Context, bug *Bug, bugKey *db.Key,
+	managers map[string]dashapi.ManagerJobs) (*Job, *db.Key, error) {
 	crashes, crashKeys, err := queryCrashesForBug(c, bugKey, maxCrashes())
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+	var job *Job
+	var jobKey *db.Key
+	now := timeNow(c)
+	jobsLeft := maxRetestJobsAtOnce
 	for crashID, crash := range crashes {
 		if crash.ReproSyz == 0 && crash.ReproC == 0 {
 			continue
@@ -308,22 +583,22 @@ func handleRetestForBug(c context.Context, now time.Time, bug *Bug, bugKey *db.K
 			// No sense in retesting the already revoked repro.
 			continue
 		}
-		// TODO: check if the manager can do such jobs.
-		if managerHasJob[crash.Manager] {
-			continue
-		}
 		// We could have decommissioned the original manager since then.
 		manager, _ := activeManager(crash.Manager, bug.Namespace)
-		if manager == "" {
+		if manager == "" || !managers[manager].TestPatches {
 			continue
 		}
+		if jobsLeft == 0 {
+			break
+		}
+		jobsLeft--
 		// Take the last successful build -- the build on which this crash happened
 		// might contain already obsolete repro and branch values.
 		build, err := lastManagerBuild(c, bug.Namespace, manager)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		err = addTestJob(c, &testJobArgs{
+		job, jobKey, err = addTestJob(c, &testJobArgs{
 			crash:     crash,
 			crashKey:  crashKeys[crashID],
 			configRef: build.KernelConfig,
@@ -333,16 +608,26 @@ func handleRetestForBug(c context.Context, now time.Time, bug *Bug, bugKey *db.K
 				repo:   build.KernelRepo,
 				branch: build.KernelBranch,
 			},
-		}, now)
+		})
 		if err != nil {
-			return fmt.Errorf("failed to add job: %w", err)
+			return nil, nil, fmt.Errorf("failed to add job: %w", err)
 		}
-		managerHasJob[crash.Manager] = true
 	}
-	return nil
+	return job, jobKey, nil
 }
 
-func createBisectJob(c context.Context, managers map[string]dashapi.ManagerJobs,
+func createBisectJob(c context.Context, managers map[string]dashapi.ManagerJobs) (*Job, *db.Key, error) {
+	// We need both C and syz repros, but the crazy datastore query restrictions
+	// do not allow to use ReproLevel>ReproLevelNone in the query. So we do 2 separate queries.
+	// C repros tend to be of higher reliability so maybe it's not bad.
+	job, jobKey, err := createBisectJobRepro(c, managers, ReproLevelC)
+	if job != nil || err != nil {
+		return job, jobKey, err
+	}
+	return createBisectJobRepro(c, managers, ReproLevelSyz)
+}
+
+func createBisectJobRepro(c context.Context, managers map[string]dashapi.ManagerJobs,
 	reproLevel dashapi.ReproLevel) (*Job, *db.Key, error) {
 	causeManagers := make(map[string]bool)
 	fixManagers := make(map[string]bool)
@@ -388,10 +673,10 @@ func findBugsForBisection(c context.Context, managers map[string]bool,
 		return query
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query bugs: %v", err)
+		return nil, nil, fmt.Errorf("failed to query bugs: %w", err)
 	}
 	for bi, bug := range bugs {
-		if !shouldBisectBug(bug, managers) {
+		if !shouldBisectBug(c, bug, managers, jobType) {
 			continue
 		}
 		crash, crashKey, err := bisectCrashForBug(c, bug, keys[bi], managers, jobType)
@@ -401,18 +686,33 @@ func findBugsForBisection(c context.Context, managers map[string]bool,
 		if crash == nil {
 			continue
 		}
-		if jobType == JobBisectFix && timeSince(c, bug.LastTime) < 24*30*time.Hour {
-			continue
-		}
 		return createBisectJobForBug(c, bug, crash, keys[bi], crashKey, jobType)
 	}
 	return nil, nil, nil
 }
 
-func shouldBisectBug(bug *Bug, managers map[string]bool) bool {
+func shouldBisectBug(c context.Context, bug *Bug, managers map[string]bool, jobType JobType) bool {
+	// We already have a fixing commit, no need to bisect.
 	if len(bug.Commits) != 0 {
 		return false
 	}
+
+	if isDecommissioned(c, bug.Namespace) {
+		return false
+	}
+
+	// There likely is no fix yet, as the bug recently reproduced.
+	const fixJobRepeat = 24 * 30 * time.Hour
+	if jobType == JobBisectFix && timeSince(c, bug.LastTime) < fixJobRepeat {
+		return false
+	}
+	// Likely to find the same (invalid) result without admin intervention, don't try too often.
+	const causeJobRepeat = 24 * 7 * time.Hour
+	if jobType == JobBisectCause && timeSince(c, bug.LastCauseBisect) < causeJobRepeat {
+		return false
+	}
+
+	// Ensure one of the managers the bug reproduced on is taking bisection jobs.
 	for _, mgr := range bug.HappenedOn {
 		if managers[mgr] {
 			return true
@@ -462,7 +762,7 @@ func createBisectJobForBug(c context.Context, bug0 *Bug, crash *Crash, bugKey, c
 		jobKey = nil
 		bug := new(Bug)
 		if err := db.Get(c, bugKey, bug); err != nil {
-			return fmt.Errorf("failed to get bug %v: %v", bugKey.StringID(), err)
+			return fmt.Errorf("failed to get bug %v: %w", bugKey.StringID(), err)
 		}
 		if jobType == JobBisectFix && bug.BisectFix != BisectNot ||
 			jobType == JobBisectCause && bug.BisectCause != BisectNot {
@@ -475,23 +775,17 @@ func createBisectJobForBug(c context.Context, bug0 *Bug, crash *Crash, bugKey, c
 		} else {
 			bug.BisectFix = BisectPending
 		}
-		// Create a new job.
-		var err error
-		jobKey = db.NewIncompleteKey(c, "Job", bugKey)
-		if jobKey, err = db.Put(c, jobKey, job); err != nil {
-			return fmt.Errorf("failed to put job: %v", err)
-		}
 		if _, err := db.Put(c, bugKey, bug); err != nil {
-			return fmt.Errorf("failed to put bug: %v", err)
+			return fmt.Errorf("failed to put bug: %w", err)
 		}
-		return addCrashReference(c, job.CrashID, bugKey,
-			CrashReference{CrashReferenceJob, extJobID(jobKey), now})
+		jobKey, err = saveJob(c, job, bugKey)
+		return err
 	}
 	if err := db.RunInTransaction(c, tx, &db.TransactionOptions{
 		// We're accessing two different kinds in addCrashReference.
 		XG: true,
 	}); err != nil {
-		return nil, nil, fmt.Errorf("create bisect job tx failed: %v", err)
+		return nil, nil, fmt.Errorf("create bisect job tx failed: %w", err)
 	}
 	return job, jobKey, nil
 }
@@ -506,7 +800,7 @@ func createJobResp(c context.Context, job *Job, jobKey *db.Key) (*dashapi.JobPol
 	crashKey := db.NewKey(c, "Crash", "", job.CrashID, bugKey)
 	crash := new(Crash)
 	if err := db.Get(c, crashKey, crash); err != nil {
-		return nil, false, fmt.Errorf("job %v: failed to get crash: %v", jobID, err)
+		return nil, false, fmt.Errorf("job %v: failed to get crash: %w", jobID, err)
 	}
 
 	build, err := loadBuild(c, job.Namespace, crash.BuildID)
@@ -538,7 +832,7 @@ func createJobResp(c context.Context, job *Job, jobKey *db.Key) (*dashapi.JobPol
 		stale = false
 		job = new(Job)
 		if err := db.Get(c, jobKey, job); err != nil {
-			return fmt.Errorf("job %v: failed to get in tx: %v", jobID, err)
+			return fmt.Errorf("job %v: failed to get in tx: %w", jobID, err)
 		}
 		if !job.Finished.IsZero() {
 			// This happens sometimes due to inconsistent db.
@@ -549,7 +843,7 @@ func createJobResp(c context.Context, job *Job, jobKey *db.Key) (*dashapi.JobPol
 		job.IsRunning = true
 		job.LastStarted = now
 		if _, err := db.Put(c, jobKey, job); err != nil {
-			return fmt.Errorf("job %v: failed to put: %v", jobID, err)
+			return fmt.Errorf("job %v: failed to put: %w", jobID, err)
 		}
 		return nil
 	}
@@ -560,19 +854,23 @@ func createJobResp(c context.Context, job *Job, jobKey *db.Key) (*dashapi.JobPol
 		return nil, true, nil
 	}
 	resp := &dashapi.JobPollResp{
-		ID:                jobID,
-		Manager:           job.Manager,
-		KernelRepo:        job.KernelRepo,
-		KernelBranch:      job.KernelBranch,
-		KernelCommit:      build.KernelCommit,
-		KernelCommitTitle: build.KernelCommitTitle,
-		KernelCommitDate:  build.KernelCommitDate,
-		KernelConfig:      kernelConfig,
-		SyzkallerCommit:   build.SyzkallerCommit,
-		Patch:             patch,
-		ReproOpts:         crash.ReproOpts,
-		ReproSyz:          reproSyz,
-		ReproC:            reproC,
+		ID:              jobID,
+		Manager:         job.Manager,
+		KernelRepo:      job.KernelRepo,
+		KernelBranch:    job.KernelBranch,
+		MergeBaseRepo:   job.MergeBaseRepo,
+		MergeBaseBranch: job.MergeBaseBranch,
+		KernelCommit:    job.BisectFrom,
+		KernelConfig:    kernelConfig,
+		SyzkallerCommit: build.SyzkallerCommit,
+		Patch:           patch,
+		ReproOpts:       crash.ReproOpts,
+		ReproSyz:        reproSyz,
+		ReproC:          reproC,
+	}
+	if resp.KernelCommit == "" {
+		resp.KernelCommit = build.KernelCommit
+		resp.KernelCommitTitle = build.KernelCommitTitle
 	}
 	switch job.Type {
 	case JobTestPatch:
@@ -598,16 +896,18 @@ func isRetestReproJob(job *Job, build *Build) bool {
 }
 
 func handleRetestedRepro(c context.Context, now time.Time, job *Job, jobKey *db.Key,
-	lastBuild *Build, req *dashapi.JobDoneReq) error {
+	bug *Bug, lastBuild *Build, req *dashapi.JobDoneReq) (*Bug, error) {
 	bugKey := jobKey.Parent()
+	if bug == nil {
+		bug = new(Bug)
+		if err := db.Get(c, bugKey, bug); err != nil {
+			return nil, fmt.Errorf("failed to get bug: %v", bugKey)
+		}
+	}
 	crashKey := db.NewKey(c, "Crash", "", job.CrashID, bugKey)
 	crash := new(Crash)
 	if err := db.Get(c, crashKey, crash); err != nil {
-		return fmt.Errorf("failed to get crash: %v", crashKey)
-	}
-	bug := new(Bug)
-	if err := db.Get(c, bugKey, bug); err != nil {
-		return fmt.Errorf("failed to get bug: %v", bugKey)
+		return nil, fmt.Errorf("failed to get crash: %v", crashKey)
 	}
 	allTitles := gatherCrashTitles(req)
 	// Update the crash.
@@ -622,13 +922,13 @@ func handleRetestedRepro(c context.Context, now time.Time, job *Job, jobKey *db.
 			crash.ReproIsRevoked = len(req.Commits) > 0
 		}
 	}
-	crash.UpdateReportingPriority(lastBuild, bug)
+	crash.UpdateReportingPriority(c, lastBuild, bug)
 	if _, err := db.Put(c, crashKey, crash); err != nil {
-		return fmt.Errorf("failed to put crash: %v", err)
+		return nil, fmt.Errorf("failed to put crash: %w", err)
 	}
 	reproCrashes, crashKeys, err := queryCrashesForBug(c, bugKey, 2)
 	if err != nil {
-		return fmt.Errorf("failed to fetch crashes with repro: %v", err)
+		return nil, fmt.Errorf("failed to fetch crashes with repro: %w", err)
 	}
 	// Now we can update the bug.
 	bug.HeadReproLevel = ReproLevelNone
@@ -651,10 +951,7 @@ func handleRetestedRepro(c context.Context, now time.Time, job *Job, jobKey *db.
 		// really relates to the existing bug.
 		bug.LastTime = now
 	}
-	if _, err := db.Put(c, bugKey, bug); err != nil {
-		return fmt.Errorf("failed to put bug: %v", err)
-	}
-	return nil
+	return bug, nil
 }
 
 func gatherCrashTitles(req *dashapi.JobDoneReq) []string {
@@ -688,7 +985,7 @@ func resetJobs(c context.Context, req *dashapi.JobResetReq) error {
 		tx := func(c context.Context) error {
 			job = new(Job)
 			if err := db.Get(c, jobKey, job); err != nil {
-				return fmt.Errorf("job %v: failed to get in tx: %v", jobKey, err)
+				return fmt.Errorf("job %v: failed to get in tx: %w", jobKey, err)
 			}
 			if job.IsFinished() {
 				// Just in case.
@@ -696,7 +993,7 @@ func resetJobs(c context.Context, req *dashapi.JobResetReq) error {
 			}
 			job.IsRunning = false
 			if _, err := db.Put(c, jobKey, job); err != nil {
-				return fmt.Errorf("job %v: failed to put: %v", jobKey, err)
+				return fmt.Errorf("job %v: failed to put: %w", jobKey, err)
 			}
 			return nil
 		}
@@ -708,6 +1005,7 @@ func resetJobs(c context.Context, req *dashapi.JobResetReq) error {
 }
 
 // doneJob is called by syz-ci to mark completion of a job.
+// nolint: gocyclo
 func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 	jobID := req.ID
 	jobKey, err := jobID2Key(c, req.ID)
@@ -718,7 +1016,7 @@ func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 	// So we have to query last build for the manager before the transaction.
 	job := new(Job)
 	if err := db.Get(c, jobKey, job); err != nil {
-		return fmt.Errorf("job %v: failed to get job: %v", jobID, err)
+		return fmt.Errorf("job %v: failed to get job: %w", jobID, err)
 	}
 	lastBuild, err := lastManagerBuild(c, job.Namespace, job.Manager)
 	if err != nil {
@@ -726,15 +1024,17 @@ func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 	}
 	now := timeNow(c)
 	tx := func(c context.Context) error {
-		job := new(Job)
+		job = new(Job)
 		if err := db.Get(c, jobKey, job); err != nil {
-			return fmt.Errorf("job %v: failed to get job: %v", jobID, err)
+			return fmt.Errorf("job %v: failed to get job: %w", jobID, err)
 		}
 		if !job.Finished.IsZero() {
 			return fmt.Errorf("job %v: already finished", jobID)
 		}
+		var bug *Bug
 		if isRetestReproJob(job, lastBuild) {
-			err := handleRetestedRepro(c, now, job, jobKey, lastBuild, req)
+			var err error
+			bug, err = handleRetestedRepro(c, now, job, jobKey, bug, lastBuild, req)
 			if err != nil {
 				return fmt.Errorf("job %v: failed to handle retested repro, %w", jobID, err)
 			}
@@ -776,27 +1076,54 @@ func doneJob(c context.Context, req *dashapi.JobDoneReq) error {
 		job.CrashTitle = req.CrashTitle
 		job.Finished = now
 		job.IsRunning = false
-		job.Flags = JobFlags(req.Flags)
+		job.Flags = req.Flags
 		if job.Type == JobBisectCause || job.Type == JobBisectFix {
 			// Update bug.BisectCause/Fix status and also remember current bug reporting to send results.
-			if err := updateBugBisection(c, job, jobKey, req, now); err != nil {
+			var err error
+			bug, err = updateBugBisection(c, job, jobKey, req, bug, now)
+			if err != nil {
 				return err
 			}
 		}
-		if _, err := db.Put(c, jobKey, job); err != nil {
-			return fmt.Errorf("failed to put job: %v", err)
+		if jobKey, err = db.Put(c, jobKey, job); err != nil {
+			return fmt.Errorf("failed to put job: %w", err)
+		}
+		if bug != nil {
+			if _, err := db.Put(c, jobKey.Parent(), bug); err != nil {
+				return fmt.Errorf("failed to put bug: %w", err)
+			}
 		}
 		log.Infof(c, "DONE JOB %v: reported=%v reporting=%v", jobID, job.Reported, job.Reporting)
 		return nil
 	}
-	return db.RunInTransaction(c, tx, &db.TransactionOptions{XG: true, Attempts: 30})
+	err = db.RunInTransaction(c, tx, &db.TransactionOptions{XG: true, Attempts: 30})
+	if err != nil {
+		return err
+	}
+	return postJob(c, jobKey, job)
 }
 
-func updateBugBisection(c context.Context, job *Job, jobKey *db.Key, req *dashapi.JobDoneReq, now time.Time) error {
-	bug := new(Bug)
-	bugKey := jobKey.Parent()
-	if err := db.Get(c, bugKey, bug); err != nil {
-		return fmt.Errorf("job %v: failed to get bug: %v", req.ID, err)
+func postJob(c context.Context, jobKey *db.Key, job *Job) error {
+	if job.TreeOrigin {
+		err := treeOriginJobDone(c, jobKey, job)
+		if err != nil {
+			return fmt.Errorf("job %v: failed to execute tree origin handlers: %w", jobKey, err)
+		}
+	}
+	err := doneCrossTreeBisection(c, jobKey, job)
+	if err != nil {
+		return fmt.Errorf("job %s: cross tree bisection handlers failed: %w", jobKey, err)
+	}
+	return nil
+}
+
+func updateBugBisection(c context.Context, job *Job, jobKey *db.Key, req *dashapi.JobDoneReq,
+	bug *Bug, now time.Time) (*Bug, error) {
+	if bug == nil {
+		bug = new(Bug)
+		if err := db.Get(c, jobKey.Parent(), bug); err != nil {
+			return nil, fmt.Errorf("failed to get bug: %v", jobKey.Parent())
+		}
 	}
 	result := BisectYes
 	if len(req.Error) != 0 {
@@ -810,19 +1137,26 @@ func updateBugBisection(c context.Context, job *Job, jobKey *db.Key, req *dashap
 	}
 	if job.Type == JobBisectCause {
 		bug.BisectCause = result
+		bug.LastCauseBisect = now
 	} else {
 		bug.BisectFix = result
 	}
+	infraError := (req.Flags & dashapi.BisectResultInfraError) == dashapi.BisectResultInfraError
+	if infraError {
+		log.Errorf(c, "bisection of %q failed due to infra errors", job.BugTitle)
+	}
 	// If the crash still occurs on HEAD, update the bug's LastTime so that it will be
 	// retried after 30 days.
-	if job.Type == JobBisectFix && req.Error == nil && len(req.Commits) == 0 && len(req.CrashLog) != 0 {
+	if job.Type == JobBisectFix && (result != BisectError || infraError) &&
+		len(req.Commits) == 0 && len(req.CrashLog) != 0 {
 		bug.BisectFix = BisectNot
 		bug.LastTime = now
 	}
-	if _, err := db.Put(c, bugKey, bug); err != nil {
-		return fmt.Errorf("failed to put bug: %v", err)
+	// If the cause bisection failed due to infrastructure problems, also repeat it.
+	if job.Type == JobBisectCause && infraError {
+		bug.BisectCause = BisectNot
 	}
-	_, bugReporting, _, _, _ := currentReporting(c, bug)
+	_, bugReporting, _, _, _ := currentReporting(bug)
 	// The bug is either already closed or not yet reported in the current reporting,
 	// either way we don't need to report it. If it wasn't reported, it will be reported
 	// with the bisection results.
@@ -835,7 +1169,7 @@ func updateBugBisection(c context.Context, job *Job, jobKey *db.Key, req *dashap
 	} else {
 		job.Reporting = bugReporting.Name
 	}
-	return nil
+	return bug, nil
 }
 
 // TODO: this is temporal for gradual bisection rollout.
@@ -850,7 +1184,7 @@ func pollCompletedJobs(c context.Context, typ string) ([]*dashapi.BugReport, err
 		Filter("Reported=", false).
 		GetAll(c, &jobs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query jobs: %v", err)
+		return nil, fmt.Errorf("failed to query jobs: %w", err)
 	}
 	var reports []*dashapi.BugReport
 	for i, job := range jobs {
@@ -877,7 +1211,7 @@ func pollCompletedJobs(c context.Context, typ string) ([]*dashapi.BugReport, err
 			bug := new(Bug)
 			bugKey := keys[i].Parent()
 			if err := db.Get(c, bugKey, bug); err != nil {
-				return nil, fmt.Errorf("job %v: failed to get bug: %v", extJobID(keys[i]), err)
+				return nil, fmt.Errorf("job %v: failed to get bug: %w", extJobID(keys[i]), err)
 			}
 			if len(bug.Commits) != 0 || bug.Status != BugStatusOpen {
 				jobReported(c, extJobID(keys[i]))
@@ -923,17 +1257,17 @@ func createBugReportForJob(c context.Context, job *Job, jobKey *db.Key, config i
 	crashKey := db.NewKey(c, "Crash", "", job.CrashID, bugKey)
 	crash := new(Crash)
 	if err := db.Get(c, crashKey, crash); err != nil {
-		return nil, fmt.Errorf("failed to get crash: %v", err)
+		return nil, fmt.Errorf("failed to get crash: %w", err)
 	}
 	bug := new(Bug)
 	if err := db.Get(c, bugKey, bug); err != nil {
-		return nil, fmt.Errorf("failed to load job parent bug: %v", err)
+		return nil, fmt.Errorf("failed to load job parent bug: %w", err)
 	}
 	bugReporting := bugReportingByName(bug, job.Reporting)
 	if bugReporting == nil {
 		return nil, fmt.Errorf("job bug has no reporting %q", job.Reporting)
 	}
-	kernelRepo := kernelRepoInfo(build)
+	kernelRepo := kernelRepoInfo(c, build)
 	rep := &dashapi.BugReport{
 		Type:            job.Type.toDashapiReportType(),
 		Config:          reportingConfig,
@@ -991,6 +1325,7 @@ func bisectFromJob(c context.Context, job *Job) (*dashapi.BisectResult, []string
 		CrashLogLink:    externalLink(c, textCrashLog, job.CrashLog),
 		CrashReportLink: externalLink(c, textCrashReport, job.CrashReport),
 		Fix:             job.Type == JobBisectFix,
+		CrossTree:       job.IsCrossTree(),
 	}
 	for _, com := range job.Commits {
 		bisect.Commits = append(bisect.Commits, &dashapi.Commit{
@@ -1021,28 +1356,29 @@ func jobReported(c context.Context, jobID string) error {
 	tx := func(c context.Context) error {
 		job := new(Job)
 		if err := db.Get(c, jobKey, job); err != nil {
-			return fmt.Errorf("job %v: failed to get job: %v", jobID, err)
+			return fmt.Errorf("job %v: failed to get job: %w", jobID, err)
 		}
 		job.Reported = true
 		// Auto-mark the bug as fixed by the result of fix bisection,
 		// if the setting is enabled for the namespace.
 		if job.Type == JobBisectFix &&
 			config.Namespaces[job.Namespace].FixBisectionAutoClose &&
+			!job.IsCrossTree() &&
 			len(job.Commits) == 1 {
 			bug := new(Bug)
 			bugKey := jobKey.Parent()
 			if err := db.Get(c, bugKey, bug); err != nil {
-				return fmt.Errorf("failed to get bug: %v", err)
+				return fmt.Errorf("failed to get bug: %w", err)
 			}
 			if bug.Status == BugStatusOpen && len(bug.Commits) == 0 {
 				bug.updateCommits([]string{job.Commits[0].Title}, now)
 				if _, err := db.Put(c, bugKey, bug); err != nil {
-					return fmt.Errorf("failed to put bug: %v", err)
+					return fmt.Errorf("failed to put bug: %w", err)
 				}
 			}
 		}
 		if _, err := db.Put(c, jobKey, job); err != nil {
-			return fmt.Errorf("failed to put job: %v", err)
+			return fmt.Errorf("failed to put job: %w", err)
 		}
 		return nil
 	}
@@ -1060,7 +1396,7 @@ func handleExternalTestRequest(c context.Context, req *dashapi.TestPatchRequest)
 	}
 	crash, crashKey, err := findCrashForBug(c, bug)
 	if err != nil {
-		return fmt.Errorf("failed to find a crash: %v", err)
+		return fmt.Errorf("failed to find a crash: %w", err)
 	}
 	if req.Branch == "" && req.Repo == "" {
 		build, err := loadBuild(c, bug.Namespace, crash.BuildID)
@@ -1072,8 +1408,7 @@ func handleExternalTestRequest(c context.Context, req *dashapi.TestPatchRequest)
 	} else if req.Branch == "" || req.Repo == "" {
 		return fmt.Errorf("branch and repo should be either both set or both empty")
 	}
-	now := timeNow(c)
-	return addTestJob(c, &testJobArgs{
+	_, _, err = addTestJob(c, &testJobArgs{
 		crash:    crash,
 		crashKey: crashKey,
 		testReqArgs: testReqArgs{
@@ -1086,7 +1421,8 @@ func handleExternalTestRequest(c context.Context, req *dashapi.TestPatchRequest)
 			link:         req.Link,
 			patch:        req.Patch,
 		},
-	}, now)
+	})
+	return err
 }
 
 type jobSorter struct {
@@ -1113,7 +1449,7 @@ func loadPendingJob(c context.Context, managers map[string]dashapi.ManagerJobs) 
 		Order("Created").
 		GetAll(c, &jobs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query jobs: %v", err)
+		return nil, nil, fmt.Errorf("failed to query jobs: %w", err)
 	}
 	sort.Stable(&jobSorter{jobs: jobs, keys: keys})
 	for i, job := range jobs {
@@ -1175,4 +1511,226 @@ func jobID2Key(c context.Context, id string) (*db.Key, error) {
 	bugKey := db.NewKey(c, "Bug", keyStr[0], 0, nil)
 	jobKey := db.NewKey(c, "Job", "", jobKeyID, bugKey)
 	return jobKey, nil
+}
+
+func fetchJob(c context.Context, key string) (*Job, *db.Key, error) {
+	jobKey, err := db.DecodeKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	job := new(Job)
+	if err := db.Get(c, jobKey, job); err != nil {
+		return nil, nil, fmt.Errorf("failed to get job: %w", err)
+	}
+	return job, jobKey, nil
+}
+
+func makeJobInfo(c context.Context, job *Job, jobKey *db.Key, bug *Bug, build *Build,
+	crash *Crash) *dashapi.JobInfo {
+	kernelRepo, kernelCommit := job.KernelRepo, job.KernelBranch
+	if build != nil {
+		kernelCommit = build.KernelCommit
+	}
+	info := &dashapi.JobInfo{
+		JobKey:           jobKey.Encode(),
+		Type:             dashapi.JobType(job.Type),
+		Flags:            job.Flags,
+		Created:          job.Created,
+		BugLink:          bugLink(jobKey.Parent().StringID()),
+		ExternalLink:     job.Link,
+		User:             job.User,
+		Reporting:        job.Reporting,
+		Namespace:        job.Namespace,
+		Manager:          job.Manager,
+		BugTitle:         job.BugTitle,
+		KernelRepo:       job.KernelRepo,
+		KernelBranch:     job.KernelBranch,
+		KernelAlias:      kernelRepoInfoRaw(c, job.Namespace, job.KernelRepo, job.KernelBranch).Alias,
+		KernelLink:       vcs.CommitLink(job.KernelRepo, job.KernelBranch),
+		KernelCommit:     kernelCommit,
+		KernelCommitLink: vcs.CommitLink(kernelRepo, kernelCommit),
+		PatchLink:        textLink(textPatch, job.Patch),
+		Attempts:         job.Attempts,
+		Started:          job.LastStarted,
+		Finished:         job.Finished,
+		CrashTitle:       job.CrashTitle,
+		CrashLogLink:     externalLink(c, textCrashLog, job.CrashLog),
+		CrashReportLink:  externalLink(c, textCrashReport, job.CrashReport),
+		LogLink:          externalLink(c, textLog, job.Log),
+		ErrorLink:        externalLink(c, textError, job.Error),
+		Reported:         job.Reported,
+		InvalidatedBy:    job.InvalidatedBy,
+		TreeOrigin:       job.TreeOrigin,
+		OnMergeBase:      job.MergeBaseRepo != "",
+	}
+	if !job.Finished.IsZero() {
+		info.Duration = job.Finished.Sub(job.LastStarted)
+	}
+	if job.Type == JobBisectCause || job.Type == JobBisectFix {
+		// We don't report these yet (or at all), see pollCompletedJobs.
+		if len(job.Commits) != 1 ||
+			bug != nil && (len(bug.Commits) != 0 || bug.Status != BugStatusOpen) {
+			info.Reported = true
+		}
+	}
+	for _, com := range job.Commits {
+		info.Commits = append(info.Commits, &dashapi.Commit{
+			Hash:   com.Hash,
+			Title:  com.Title,
+			Author: fmt.Sprintf("%v <%v>", com.AuthorName, com.Author),
+			CC:     strings.Split(com.CC, "|"),
+			Date:   com.Date,
+			Link:   vcs.CommitLink(kernelRepo, com.Hash),
+		})
+	}
+	if len(info.Commits) == 1 {
+		info.Commit = info.Commits[0]
+		info.Commits = nil
+	}
+	if crash != nil {
+		info.ReproCLink = externalLink(c, textReproC, crash.ReproC)
+		info.ReproSyzLink = externalLink(c, textReproSyz, crash.ReproSyz)
+	}
+	return info
+}
+
+func uniqueBugs(inBugs []*Bug, inKeys []*db.Key) ([]*Bug, []*db.Key) {
+	var bugs []*Bug
+	var keys []*db.Key
+
+	dups := map[string]bool{}
+	for i, bug := range inBugs {
+		hash := bug.keyHash()
+		if dups[hash] {
+			continue
+		}
+		dups[hash] = true
+		bugs = append(bugs, bug)
+		keys = append(keys, inKeys[i])
+	}
+	return bugs, keys
+}
+
+type bugJobs struct {
+	list []*bugJob
+}
+
+type bugJob struct {
+	bug      *Bug
+	job      *Job
+	key      *db.Key
+	crash    *Crash
+	crashKey *db.Key
+	build    *Build
+}
+
+func queryBugJobs(c context.Context, bug *Bug, jobType JobType) (*bugJobs, error) {
+	// Just in case.
+	const limitJobs = 25
+	var jobs []*Job
+	jobKeys, err := db.NewQuery("Job").
+		Ancestor(bug.key(c)).
+		Filter("Type=", jobType).
+		Order("-Finished").
+		Limit(limitJobs).
+		GetAll(c, &jobs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch bug jobs: %w", err)
+	}
+	bugKey := bug.key(c)
+	ret := &bugJobs{}
+	for i := range jobs {
+		job := jobs[i]
+		var crashKey *db.Key
+		if job.CrashID != 0 {
+			crashKey = db.NewKey(c, "Crash", "", job.CrashID, bugKey)
+		}
+		ret.list = append(ret.list, &bugJob{
+			bug:      bug,
+			job:      job,
+			key:      jobKeys[i],
+			crashKey: crashKey,
+		})
+	}
+	return ret, nil
+}
+
+func queryBestBisection(c context.Context, bug *Bug, jobType JobType) (*bugJob, error) {
+	jobs, err := queryBugJobs(c, bug, jobType)
+	if err != nil {
+		return nil, err
+	}
+	return jobs.bestBisection(), nil
+}
+
+// Find the most representative bisection result.
+func (b *bugJobs) bestBisection() *bugJob {
+	// Let's take the most recent finished one.
+	for _, j := range b.list {
+		if !j.job.IsFinished() {
+			continue
+		}
+		if j.job.InvalidatedBy != "" {
+			continue
+		}
+		if j.job.MergeBaseRepo != "" {
+			// It was a cross-tree bisection.
+			continue
+		}
+		return j
+	}
+	return nil
+}
+
+// Find the most representative fix candidate bisection result.
+func (b *bugJobs) bestFixCandidate() *bugJob {
+	// Let's take the most recent finished one.
+	for _, j := range b.list {
+		if !j.job.IsFinished() {
+			continue
+		}
+		if j.job.InvalidatedBy != "" {
+			continue
+		}
+		if !j.job.IsCrossTree() {
+			continue
+		}
+		return j
+	}
+	return nil
+}
+
+func (b *bugJobs) all() []*bugJob {
+	return b.list
+}
+
+func (j *bugJob) load(c context.Context) error {
+	err := j.loadCrash(c)
+	if err != nil {
+		return fmt.Errorf("failed to load crash: %w", err)
+	}
+	return j.loadBuild(c)
+}
+
+func (j *bugJob) loadCrash(c context.Context) error {
+	if j.crash != nil {
+		return nil
+	}
+	j.crash = new(Crash)
+	return db.Get(c, j.crashKey, j.crash)
+}
+
+func (j *bugJob) loadBuild(c context.Context) error {
+	if j.build != nil {
+		return nil
+	}
+	err := j.loadCrash(c)
+	if err != nil {
+		return fmt.Errorf("failed to load crash: %w", err)
+	}
+	j.build, err = loadBuild(c, j.bug.Namespace, j.crash.BuildID)
+	if err != nil {
+		return err
+	}
+	return nil
 }

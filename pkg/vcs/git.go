@@ -6,6 +6,7 @@ package vcs
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"net/mail"
 	"os"
@@ -114,10 +115,16 @@ func (git *git) CheckoutBranch(repo, branch string) (*Commit, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := git.git("checkout", "FETCH_HEAD"); err != nil {
+	if _, err := git.git("checkout", "FETCH_HEAD", "--force"); err != nil {
 		return nil, err
 	}
 	if _, err := git.git("submodule", "update", "--init"); err != nil {
+		return nil, err
+	}
+	// If the branch checkout had to be "forced" the directory may
+	// contain remaining untracked files.
+	// Clean again to ensure the new branch is in a clean state.
+	if err := git.repair(); err != nil {
 		return nil, err
 	}
 	return git.HeadCommit()
@@ -138,6 +145,18 @@ func (git *git) fetchRemote(repo string) error {
 	// Ignore error as we can double add the same remote and that will fail.
 	git.git("remote", "add", repoHash, repo)
 	_, err := git.git("fetch", "--force", "--tags", repoHash)
+	if err != nil {
+		var verbose *osutil.VerboseError
+		if errors.As(err, &verbose) &&
+			bytes.Contains(verbose.Output, []byte("error: cannot lock ref")) {
+			// It can happen that the fetched repo has tags names that conflict
+			// with the ones already present in the repository.
+			// Try to fetch more, but this time prune tags, it should help.
+			// The --prune-tags option will remove all tags that are not present
+			// in this remote repo, so don't do it always. Only when necessary.
+			_, err = git.git("fetch", "--force", "--tags", "--prune", "--prune-tags", repoHash)
+		}
+	}
 	return err
 }
 
@@ -177,8 +196,8 @@ func (git *git) reset() error {
 		return nil
 	}
 	git.git("reset", "--hard", "--recurse-submodules")
-	git.git("clean", "-fdx")
-	git.git("submodule", "foreach", "--recursive", "git", "clean", "-fdx")
+	git.git("clean", "-xfdf")
+	git.git("submodule", "foreach", "--recursive", "git", "clean", "-xfdf")
 	git.git("bisect", "reset")
 	_, err := git.git("reset", "--hard", "--recurse-submodules")
 	return err
@@ -196,10 +215,10 @@ func (git *git) initRepo(reason error) error {
 		log.Logf(1, "git: initializing repo at %v: %v", git.dir, reason)
 	}
 	if err := os.RemoveAll(git.dir); err != nil {
-		return fmt.Errorf("failed to remove repo dir: %v", err)
+		return fmt.Errorf("failed to remove repo dir: %w", err)
 	}
 	if err := osutil.MkdirAll(git.dir); err != nil {
-		return fmt.Errorf("failed to create repo dir: %v", err)
+		return fmt.Errorf("failed to create repo dir: %w", err)
 	}
 	if git.sandbox {
 		if err := osutil.SandboxChown(git.dir); err != nil {
@@ -237,11 +256,11 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 	const dateFormat = "Mon Jan 2 15:04:05 2006 -0700"
 	date, err := time.Parse(dateFormat, string(lines[4]))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse date in git log output: %v\n%q", err, output)
+		return nil, fmt.Errorf("failed to parse date in git log output: %w\n%q", err, output)
 	}
 	commitDate, err := time.Parse(dateFormat, string(lines[6]))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse date in git log output: %v\n%q", err, output)
+		return nil, fmt.Errorf("failed to parse date in git log output: %w\n%q", err, output)
 	}
 	recipients := make(map[string]bool)
 	recipients[strings.ToLower(string(lines[2]))] = true
@@ -369,7 +388,7 @@ func (git *git) ListCommitHashes(baseCommit string) ([]string, error) {
 func (git *git) ExtractFixTagsFromCommits(baseCommit, email string) ([]*Commit, error) {
 	user, domain, err := splitEmail(email)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse email %q: %v", email, err)
+		return nil, fmt.Errorf("failed to parse email %q: %w", email, err)
 	}
 	grep := user + "+.*" + domain
 	since := time.Now().Add(-time.Hour * 24 * 365 * fetchCommitsMaxAgeInYears).Format("01-02-2006")
@@ -587,4 +606,20 @@ func (git *git) IsRelease(commit string) (bool, error) {
 
 func (git *git) Object(name, commit string) ([]byte, error) {
 	return git.git("show", fmt.Sprintf("%s:%s", commit, name))
+}
+
+func (git *git) MergeBases(firstCommit, secondCommit string) ([]*Commit, error) {
+	output, err := git.git("merge-base", firstCommit, secondCommit)
+	if err != nil {
+		return nil, err
+	}
+	ret := []*Commit{}
+	for _, hash := range strings.Fields(string(output)) {
+		commit, err := git.getCommit(hash)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, commit)
+	}
+	return ret, nil
 }

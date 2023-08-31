@@ -6,6 +6,7 @@ package build
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,10 +35,46 @@ func (c cuttlefish) runBuild(kernelDir, buildConfig string) error {
 }
 
 func (c cuttlefish) runBazel(kernelDir string) error {
-	cmd := osutil.Command("tools/bazel", "run", "--kasan", bazelTarget, "--", "--dist_dir=dist")
+	cmd := osutil.Command("tools/bazel", "run", bazelTarget, "--", "--dist_dir=dist")
+	if err := osutil.Sandbox(cmd, true, false); err != nil {
+		return fmt.Errorf("failed to sandbox build command: %w", err)
+	}
 	cmd.Dir = kernelDir
 	_, err := osutil.Run(time.Hour, cmd)
 	return err
+}
+
+func (c cuttlefish) createDefconfig(commonDir string, config []byte) error {
+	configFile := filepath.Join(commonDir, ".config")
+	if err := osutil.WriteFile(configFile, config); err != nil {
+		return fmt.Errorf("writing config failed: %w", err)
+	}
+	if err := osutil.SandboxChown(configFile); err != nil {
+		return fmt.Errorf("error changing config owner: %w", err)
+	}
+
+	// Create a 'defconfig' file from full '.config'.
+	cmd := osutil.Command("make", "savedefconfig")
+	cmd.Dir = commonDir
+	if err := osutil.Sandbox(cmd, true, false); err != nil {
+		return fmt.Errorf("failed to sandbox defconfig creation: %w", err)
+	}
+	if _, err := osutil.Run(time.Hour, cmd); err != nil {
+		return fmt.Errorf("failed to create defconfig: %w", err)
+	}
+
+	// Copy defconfig to expected config directory.
+	defconfigFile := filepath.Join(commonDir, "arch", "x86", "configs", "gki_defconfig")
+	if err := os.Rename(filepath.Join(commonDir, "defconfig"), defconfigFile); err != nil {
+		return fmt.Errorf("writing config failed: %w", err)
+	}
+	if err := osutil.SandboxChown(defconfigFile); err != nil {
+		return fmt.Errorf("error changing defconfig owner: %w", err)
+	}
+	if err := os.Remove(configFile); err != nil {
+		return fmt.Errorf("failure removing temp config: %w", err)
+	}
+	return nil
 }
 
 func (c cuttlefish) readCompiler(archivePath string) (string, error) {
@@ -88,27 +125,33 @@ func (c cuttlefish) build(params Params) (ImageDetails, error) {
 	var err error
 	// Clean output directory if it exists.
 	if err := osutil.RemoveAll(filepath.Join(params.KernelDir, "out")); err != nil {
-		return details, fmt.Errorf("failed to clean before kernel build: %v", err)
+		return details, fmt.Errorf("failed to clean before kernel build: %w", err)
 	}
 	// Default to build.sh if compiler is not specified.
 	if params.Compiler == "bazel" {
+		if params.Config == nil {
+			return details, errors.New("kernel config was not provided for build")
+		}
+		if err := c.createDefconfig(filepath.Join(params.KernelDir, "common"), params.Config); err != nil {
+			return details, fmt.Errorf("failed to create defconfig file: %w", err)
+		}
 		if err := c.runBazel(params.KernelDir); err != nil {
-			return details, fmt.Errorf("failed to build kernel: %s", err)
+			return details, fmt.Errorf("failed to build kernel: %w", err)
 		}
 		// Find the .config file; it is placed in a temporary output directory during the build.
-		cmd := osutil.Command("find", ".", "-wholename", "*virtual_device_x86_64_config/out_dir/.config")
+		cmd := osutil.Command("find", ".", "-regex", ".*virtual_device_x86_64_config.*/\\.config")
 		cmd.Dir = params.KernelDir
 		configBytes, err := osutil.Run(time.Minute, cmd)
 		if err != nil {
-			return details, fmt.Errorf("failed to find build config: %v", err)
+			return details, fmt.Errorf("failed to find build config: %w", err)
 		}
 		config = filepath.Join(params.KernelDir, strings.TrimSpace(string(configBytes)))
 	} else {
 		if err := c.runBuild(params.KernelDir, kernelConfig); err != nil {
-			return details, fmt.Errorf("failed to build kernel: %s", err)
+			return details, fmt.Errorf("failed to build kernel: %w", err)
 		}
 		if err := c.runBuild(params.KernelDir, moduleConfig); err != nil {
-			return details, fmt.Errorf("failed to build modules: %s", err)
+			return details, fmt.Errorf("failed to build modules: %w", err)
 		}
 		config = filepath.Join(params.KernelDir, "out", "common", ".config")
 	}
@@ -153,12 +196,15 @@ func (c cuttlefish) build(params Params) (ImageDetails, error) {
 
 	details.Signature, err = elfBinarySignature(vmlinux, params.Tracer)
 	if err != nil {
-		return details, fmt.Errorf("failed to generate signature: %s", err)
+		return details, fmt.Errorf("failed to generate signature: %w", err)
 	}
 
 	return details, nil
 }
 
 func (c cuttlefish) clean(kernelDir, targetArch string) error {
-	return osutil.RemoveAll(filepath.Join(kernelDir, "out"))
+	if err := osutil.RemoveAll(filepath.Join(kernelDir, "out")); err != nil {
+		return err
+	}
+	return osutil.RemoveAll(filepath.Join(kernelDir, "dist"))
 }

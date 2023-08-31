@@ -980,8 +980,8 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 		exitf("out of threads");
 	thread_t* th = &threads[i];
 	if (event_isset(&th->ready) || !event_isset(&th->done) || th->executing)
-		failmsg("bad thread state in schedule", "ready=%d done=%d executing=%d",
-			event_isset(&th->ready), event_isset(&th->done), th->executing);
+		exitf("bad thread state in schedule: ready=%d done=%d executing=%d",
+		      event_isset(&th->ready), event_isset(&th->done), th->executing);
 	last_scheduled = th;
 	th->copyout_pos = pos;
 	th->copyout_index = copyout_index;
@@ -1011,9 +1011,12 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 		bool prev_filter = true;
 		for (uint32 i = 0; i < cov->size; i++) {
 			cover_data_t pc = cover_data[i] + cov->pc_offset;
-			uint32 sig = pc;
-			if (use_cover_edges(pc))
-				sig ^= hash(prev_pc);
+			uint32 sig = pc & 0xFFFFF000;
+			if (use_cover_edges(pc)) {
+				// Only hash the lower 12 bits so the hash is
+				// independent of any module offsets.
+				sig |= (pc & 0xFFF) ^ (hash(prev_pc & 0xFFF) & 0xFFF);
+			}
 			bool filter = coverage_filter(pc);
 			// Ignore the edge only if both current and previous PCs are filtered out
 			// to capture all incoming and outcoming edges into the interesting code.
@@ -1051,8 +1054,8 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 void handle_completion(thread_t* th)
 {
 	if (event_isset(&th->ready) || !event_isset(&th->done) || !th->executing)
-		failmsg("bad thread state in completion", "ready=%d done=%d executing=%d",
-			event_isset(&th->ready), event_isset(&th->done), th->executing);
+		exitf("bad thread state in completion: ready=%d done=%d executing=%d",
+		      event_isset(&th->ready), event_isset(&th->done), th->executing);
 	if (th->res != (intptr_t)-1)
 		copyout_call_results(th);
 
@@ -1635,13 +1638,13 @@ void setup_features(char** enable, int n)
 	// This does any one-time setup for the requested features on the machine.
 	// Note: this can be called multiple times and must be idempotent.
 	flag_debug = true;
-#if SYZ_HAVE_SETUP_EXT
-	// This can be defined in common_ext.h.
-	setup_ext();
-#endif
 #if SYZ_HAVE_FEATURES
 	setup_sysctl();
 	setup_cgroups();
+#endif
+#if SYZ_HAVE_SETUP_EXT
+	// This can be defined in common_ext.h.
+	setup_ext();
 #endif
 	for (int i = 0; i < n; i++) {
 		bool found = false;

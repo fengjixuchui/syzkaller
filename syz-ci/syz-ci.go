@@ -61,6 +61,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,7 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/vcs"
 )
 
 var (
@@ -83,7 +85,9 @@ type Config struct {
 	Name string `json:"name"`
 	HTTP string `json:"http"`
 	// If manager http address is not specified, give it an address starting from this port. Optional.
-	ManagerPort     int    `json:"manager_port_start"`
+	ManagerPort int `json:"manager_port_start"`
+	// If manager rpc address is not specified, give it addresses starting from this port. By default 30000.
+	RPCPort         int    `json:"rpc_port_start"`
 	DashboardAddr   string `json:"dashboard_addr"`   // Optional.
 	DashboardClient string `json:"dashboard_client"` // Optional.
 	DashboardKey    string `json:"dashboard_key"`    // Optional.
@@ -103,12 +107,21 @@ type Config struct {
 	// Path to upload corpus.db from managers (optional).
 	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
 	CorpusUploadPath string `json:"corpus_upload_path"`
+	// Make files uploaded via CoverUploadPath and CorpusUploadPath public.
+	PublishGCS bool `json:"publish_gcs"`
 	// BinDir must point to a dir that contains compilers required to build
 	// older versions of the kernel. For linux, it needs to include several
 	// compiler versions.
-	BisectBinDir string           `json:"bisect_bin_dir"`
-	Ccache       string           `json:"ccache"`
-	Managers     []*ManagerConfig `json:"managers"`
+	BisectBinDir string `json:"bisect_bin_dir"`
+	// Keys of BisectIgnore are full commit hashes that should never be reported
+	// in bisection results.
+	// Values of the map are ignored and can e.g. serve as comments.
+	BisectIgnore map[string]string `json:"bisect_ignore"`
+	// Extra commits to cherry-pick to older kernel revisions.
+	// The list is concatenated with the similar parameter from ManagerConfig.
+	BisectBackports []vcs.BackportCommit `json:"bisect_backports"`
+	Ccache          string               `json:"ccache"`
+	Managers        []*ManagerConfig     `json:"managers"`
 	// Poll period for jobs in seconds (optional, defaults to 10 seconds)
 	JobPollPeriod int `json:"job_poll_period"`
 	// Set up a second (parallel) job processor to speed up processing.
@@ -169,12 +182,16 @@ type ManagerConfig struct {
 	// Parameters for concrete types are in Config type in pkg/build/TYPE.go, e.g. pkg/build/android.go.
 	Build json.RawMessage `json:"build"`
 	// Baseline config for bisection, see pkg/bisect.KernelConfig.BaselineConfig.
+	// If not specified, syz-ci generates a `-base.config` path counterpart for `kernel_config` and,
+	// if it exists, uses it as default.
 	KernelBaselineConfig string `json:"kernel_baseline_config"`
 	// File with kernel cmdline values (optional).
 	KernelCmdline string `json:"kernel_cmdline"`
 	// File with sysctl values (e.g. output of sysctl -a, optional).
 	KernelSysctl string      `json:"kernel_sysctl"`
 	Jobs         ManagerJobs `json:"jobs"`
+	// Extra commits to cherry pick to older kernel revisions.
+	BisectBackports []vcs.BackportCommit `json:"bisect_backports"`
 
 	ManagerConfig json.RawMessage `json:"manager_config"`
 	managercfg    *mgrconfig.Config
@@ -207,6 +224,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
+	log.SetName(cfg.Name)
 
 	shutdownPending := make(chan struct{})
 	osutil.HandleInterrupts(shutdownPending)
@@ -235,7 +253,7 @@ func main() {
 	for _, mgrcfg := range cfg.Managers {
 		mgr, err := createManager(cfg, mgrcfg, stop, *flagDebug)
 		if err != nil {
-			log.Logf(0, "failed to create manager %v: %v", mgrcfg.Name, err)
+			log.Errorf("failed to create manager %v: %v", mgrcfg.Name, err)
 			continue
 		}
 		managers = append(managers, mgr)
@@ -302,8 +320,7 @@ func deprecateAssets(cfg *Config, stop chan struct{}, wg *sync.WaitGroup) {
 	}
 	storage, err := asset.StorageFromConfig(cfg.AssetStorage, dash)
 	if err != nil {
-		dash.LogError("syz-ci",
-			"failed to create asset storage during asset deprecation: %v", err)
+		log.Errorf("failed to create asset storage during asset deprecation: %v", err)
 		return
 	}
 loop:
@@ -317,7 +334,7 @@ loop:
 		log.Logf(0, "deprecating assets")
 		err := storage.DeprecateAssets()
 		if err != nil {
-			dash.LogError("syz-ci", "asset deprecation failed: %v", err)
+			log.Errorf("asset deprecation failed: %v", err)
 		}
 	}
 }
@@ -339,6 +356,7 @@ func loadConfig(filename string) (*Config, error) {
 		SyzkallerRepo:    "https://github.com/google/syzkaller.git",
 		SyzkallerBranch:  "master",
 		ManagerPort:      10000,
+		RPCPort:          30000,
 		Goroot:           os.Getenv("GOROOT"),
 		JobPollPeriod:    10,
 		CommitPollPeriod: 3600,
@@ -380,7 +398,7 @@ func loadConfig(filename string) (*Config, error) {
 func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	managercfg, err := mgrconfig.LoadPartialData(mgr.ManagerConfig)
 	if err != nil {
-		return fmt.Errorf("manager config: %v", err)
+		return fmt.Errorf("manager config: %w", err)
 	}
 	if managercfg.Name != "" && mgr.Name != "" {
 		return fmt.Errorf("both managercfg.Name=%q and mgr.Name=%q are specified", managercfg.Name, mgr.Name)
@@ -419,6 +437,10 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 		managercfg.HTTP = fmt.Sprintf(":%v", cfg.ManagerPort)
 		cfg.ManagerPort++
 	}
+	if managercfg.RPC == ":0" {
+		managercfg.RPC = fmt.Sprintf(":%v", cfg.RPCPort)
+		cfg.RPCPort++
+	}
 	// Note: we don't change Compiler/Ccache because it may be just "gcc" referring
 	// to the system binary, or pkg/build/netbsd.go uses "g++" and "clang++" as special marks.
 	mgr.Userspace = osutil.Abs(mgr.Userspace)
@@ -426,5 +448,21 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	mgr.KernelBaselineConfig = osutil.Abs(mgr.KernelBaselineConfig)
 	mgr.KernelCmdline = osutil.Abs(mgr.KernelCmdline)
 	mgr.KernelSysctl = osutil.Abs(mgr.KernelSysctl)
+
+	if mgr.KernelConfig != "" && mgr.KernelBaselineConfig == "" {
+		mgr.KernelBaselineConfig = inferBaselineConfig(mgr.KernelConfig)
+	}
 	return nil
+}
+
+func inferBaselineConfig(kernelConfig string) string {
+	suffixPos := strings.LastIndex(kernelConfig, ".config")
+	if suffixPos < 0 {
+		return ""
+	}
+	candidate := kernelConfig[:suffixPos] + "-base.config"
+	if !osutil.IsExist(candidate) {
+		return ""
+	}
+	return candidate
 }

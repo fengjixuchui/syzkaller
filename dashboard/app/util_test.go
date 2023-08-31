@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,7 +50,8 @@ type Ctx struct {
 var skipDevAppserverTests = func() bool {
 	_, err := exec.LookPath("dev_appserver.py")
 	// Don't silently skip tests on CI, we should have gcloud sdk installed there.
-	return err != nil && os.Getenv("SYZ_BIG_ENV") == ""
+	return err != nil && os.Getenv("SYZ_ENV") == "" ||
+		os.Getenv("SYZ_SKIP_DASHBOARD") != ""
 }()
 
 func NewCtx(t *testing.T) *Ctx {
@@ -106,8 +108,8 @@ func (c *Ctx) expectFailureStatus(err error, code int) {
 	if err == nil {
 		c.t.Fatalf("expected to fail as %d, but it does not", code)
 	}
-	httpErr, ok := err.(HTTPError)
-	if !ok || httpErr.Code != code {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Code != code {
 		c.t.Fatalf("expected to fail as %d, but it failed as %v", code, err)
 	}
 }
@@ -217,6 +219,24 @@ func (c *Ctx) setSubsystems(ns string, list []*subsystem.Subsystem, rev int) {
 	}
 }
 
+func (c *Ctx) setKernelRepos(list []KernelRepo) {
+	c.transformContext = func(c context.Context) context.Context {
+		return contextWithRepos(c, list)
+	}
+}
+
+func (c *Ctx) setNoObsoletions() {
+	c.transformContext = func(c context.Context) context.Context {
+		return contextWithNoObsoletions(c)
+	}
+}
+
+func (c *Ctx) decommission(ns string) {
+	c.transformContext = func(c context.Context) context.Context {
+		return contextWithDecommission(c, ns, true)
+	}
+}
+
 // GET sends admin-authorized HTTP GET request to the app.
 func (c *Ctx) GET(url string) ([]byte, error) {
 	return c.AuthGET(AccessAdmin, url)
@@ -275,7 +295,7 @@ func (c *Ctx) httpRequest(method, url, body string, access AccessLevel) (*httpte
 	http.DefaultServeMux.ServeHTTP(w, r)
 	c.t.Logf("REPLY: %v", w.Code)
 	if w.Code != http.StatusOK {
-		return nil, HTTPError{w.Code, w.Body.String(), w.Result().Header}
+		return nil, &HTTPError{w.Code, w.Body.String(), w.Result().Header}
 	}
 	return w, nil
 }
@@ -286,7 +306,7 @@ type HTTPError struct {
 	Headers http.Header
 }
 
-func (err HTTPError) Error() string {
+func (err *HTTPError) Error() string {
 	return fmt.Sprintf("%v: %v", err.Code, err.Body)
 }
 
@@ -345,6 +365,24 @@ func (c *Ctx) loadManager(ns, name string) (*Manager, *Build) {
 	return mgr, build
 }
 
+func (c *Ctx) loadSingleBug() (*Bug, *db.Key) {
+	var bugs []*Bug
+	keys, err := db.NewQuery("Bug").GetAll(c.ctx, &bugs)
+	c.expectEQ(err, nil)
+	c.expectEQ(len(bugs), 1)
+
+	return bugs[0], keys[0]
+}
+
+func (c *Ctx) loadSingleJob() (*Job, *db.Key) {
+	var jobs []*Job
+	keys, err := db.NewQuery("Job").GetAll(c.ctx, &jobs)
+	c.expectEQ(err, nil)
+	c.expectEQ(len(jobs), 1)
+
+	return jobs[0], keys[0]
+}
+
 func (c *Ctx) checkURLContents(url string, want []byte) {
 	c.t.Helper()
 	got, err := c.AuthGET(AccessAdmin, url)
@@ -368,12 +406,18 @@ func (c *Ctx) pollEmailBug() *aemail.Message {
 
 func (c *Ctx) pollEmailExtID() string {
 	c.t.Helper()
+	_, extBugID := c.pollEmailAndExtID()
+	return extBugID
+}
+
+func (c *Ctx) pollEmailAndExtID() (string, string) {
+	c.t.Helper()
 	msg := c.pollEmailBug()
 	_, extBugID, err := email.RemoveAddrContext(msg.Sender)
 	if err != nil {
 		c.t.Fatalf("failed to remove addr context: %v", err)
 	}
-	return extBugID
+	return msg.Sender, extBugID
 }
 
 func (c *Ctx) expectNoEmail() {
@@ -384,11 +428,6 @@ func (c *Ctx) expectNoEmail() {
 		c.t.Helper()
 		c.t.Fatalf("got unexpected email: %v\n%s", msg.Subject, msg.Body)
 	}
-}
-
-func (c *Ctx) updRetestReproJobs() {
-	_, err := c.GET("/cron/retest_repros")
-	c.expectOK(err)
 }
 
 type apiClient struct {

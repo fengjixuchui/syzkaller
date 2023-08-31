@@ -35,7 +35,7 @@ static void event_reset(event_t* ev)
 static void event_set(event_t* ev)
 {
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	__atomic_store_n(&ev->state, 1, __ATOMIC_RELEASE);
 	syscall(SYS_futex, &ev->state, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1000000);
 }
@@ -111,6 +111,7 @@ static bool write_file(const char* file, const char* what, ...)
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154 || \
     __NR_syz_genetlink_get_family_id || __NR_syz_80211_inject_frame || __NR_syz_80211_join_ibss || SYZ_NIC_VF
 #include <arpa/inet.h>
+#include <errno.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -1152,6 +1153,18 @@ static void initialize_wifi_devices(void)
 }
 #endif
 
+#if SYZ_EXECUTOR || (SYZ_NET_DEVICES && SYZ_NIC_VF) || SYZ_SWAP
+static int runcmdline(char* cmdline)
+{
+	debug("%s\n", cmdline);
+	int ret = system(cmdline);
+	if (ret) {
+		debug("FAIL: %s\n", cmdline);
+	}
+	return ret;
+}
+#endif
+
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 #include <arpa/inet.h>
 #include <errno.h>
@@ -1427,15 +1440,6 @@ error:
 }
 
 #if SYZ_EXECUTOR || SYZ_NIC_VF
-static int runcmdline(char* cmdline)
-{
-	debug("%s\n", cmdline);
-	int ret = system(cmdline);
-	if (ret) {
-		debug("FAIL: %s\n", cmdline);
-	}
-	return ret;
-}
 
 static void netlink_nicvf_setup(void)
 {
@@ -1927,18 +1931,16 @@ struct io_uring_params {
 #include <unistd.h>
 
 // Wrapper for io_uring_setup and the subsequent mmap calls that map the ring and the sqes
-static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5)
+static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
-	// syzlang: syz_io_uring_setup(entries int32[1:IORING_MAX_ENTRIES], params ptr[inout, io_uring_params], addr_ring vma, addr_sqes vma, ring_ptr ptr[out, ring_ptr], sqes_ptr ptr[out, sqes_ptr]) fd_io_uring
-	// C:       syz_io_uring_setup(uint32 entries, struct io_uring_params* params, void* mmap_addr_ring, void* mmap_addr_sqes, void** ring_ptr_out, void** sqes_ptr_out) // returns uint32 fd_io_uring
+	// syzlang: syz_io_uring_setup(entries int32[1:IORING_MAX_ENTRIES], params ptr[inout, io_uring_params], ring_ptr ptr[out, ring_ptr], sqes_ptr ptr[out, sqes_ptr]) fd_io_uring
+	// C:       syz_io_uring_setup(uint32 entries, struct io_uring_params* params, void** ring_ptr_out, void** sqes_ptr_out) // returns uint32 fd_io_uring
 
 	// Cast to original
 	uint32 entries = (uint32)a0;
 	struct io_uring_params* setup_params = (struct io_uring_params*)a1;
-	void* vma1 = (void*)a2;
-	void* vma2 = (void*)a3;
-	void** ring_ptr_out = (void**)a4;
-	void** sqes_ptr_out = (void**)a5;
+	void** ring_ptr_out = (void**)a2;
+	void** sqes_ptr_out = (void**)a3;
 
 	uint32 fd_io_uring = syscall(__NR_io_uring_setup, entries, setup_params);
 
@@ -1950,10 +1952,14 @@ static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long
 	// The implication is that the sq_ring_ptr and the cq_ring_ptr are the same but the
 	// difference is in the offsets to access the fields of these rings.
 	uint32 ring_sz = sq_ring_sz > cq_ring_sz ? sq_ring_sz : cq_ring_sz;
-	*ring_ptr_out = mmap(vma1, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE | MAP_FIXED, fd_io_uring, IORING_OFF_SQ_RING);
+	*ring_ptr_out = mmap(0, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_io_uring, IORING_OFF_SQ_RING);
 
 	uint32 sqes_sz = setup_params->sq_entries * SIZEOF_IO_URING_SQE;
-	*sqes_ptr_out = mmap(vma2, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE | MAP_FIXED, fd_io_uring, IORING_OFF_SQES);
+	*sqes_ptr_out = mmap(0, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_io_uring, IORING_OFF_SQES);
+
+	uint32* array = (uint32*)((uintptr_t)*ring_ptr_out + setup_params->sq_off.array);
+	for (uint32 index = 0; index < entries; index++)
+		array[index] = index;
 
 	return fd_io_uring;
 }
@@ -1962,40 +1968,31 @@ static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long
 
 #if SYZ_EXECUTOR || __NR_syz_io_uring_submit
 
-static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile long a2)
 {
-	// syzlang: syz_io_uring_submit(ring_ptr ring_ptr, sqes_ptr sqes_ptr, 		sqe ptr[in, io_uring_sqe],   sqes_index int32)
-	// C:       syz_io_uring_submit(char* ring_ptr,       io_uring_sqe* sqes_ptr,    io_uring_sqe* sqe,           uint32 sqes_index)
+	// syzlang: syz_io_uring_submit(ring_ptr ring_ptr, sqes_ptr sqes_ptr, 		sqe ptr[in, io_uring_sqe])
+	// C:       syz_io_uring_submit(char* ring_ptr,       io_uring_sqe* sqes_ptr,    io_uring_sqe* sqe)
 
 	// It is not checked if the ring is full
 
 	// Cast to original
 	char* ring_ptr = (char*)a0; // This will be exposed to offsets in bytes
 	char* sqes_ptr = (char*)a1;
+
 	char* sqe = (char*)a2;
-	uint32 sqes_index = (uint32)a3;
 
-	uint32 sq_ring_entries = *(uint32*)(ring_ptr + SQ_RING_ENTRIES_OFFSET);
-	uint32 cq_ring_entries = *(uint32*)(ring_ptr + CQ_RING_ENTRIES_OFFSET);
-
-	// Compute the sq_array offset
-	uint32 sq_array_off = (CQ_CQES_OFFSET + cq_ring_entries * SIZEOF_IO_URING_CQE + 63) & ~63;
+	uint32 sq_ring_mask = *(uint32*)(ring_ptr + SQ_RING_MASK_OFFSET);
+	uint32* sq_tail_ptr = (uint32*)(ring_ptr + SQ_TAIL_OFFSET);
+	uint32 sq_tail = *sq_tail_ptr & sq_ring_mask;
 
 	// Get the ptr to the destination for the sqe
-	if (sq_ring_entries)
-		sqes_index %= sq_ring_entries;
-	char* sqe_dest = sqes_ptr + sqes_index * SIZEOF_IO_URING_SQE;
+	char* sqe_dest = sqes_ptr + sq_tail * SIZEOF_IO_URING_SQE;
 
 	// Write the sqe entry to its destination in sqes
 	memcpy(sqe_dest, sqe, SIZEOF_IO_URING_SQE);
 
 	// Write the index to the sqe array
-	uint32 sq_ring_mask = *(uint32*)(ring_ptr + SQ_RING_MASK_OFFSET);
-	uint32* sq_tail_ptr = (uint32*)(ring_ptr + SQ_TAIL_OFFSET);
-	uint32 sq_tail = *sq_tail_ptr & sq_ring_mask;
 	uint32 sq_tail_next = *sq_tail_ptr + 1;
-	uint32* sq_array = (uint32*)(ring_ptr + sq_array_off);
-	*(sq_array + sq_tail) = sqes_index;
 
 	// Advance the tail. Tail is a free-flowing integer and relies on natural wrapping.
 	// Ensure that the kernel will never see a tail update without the preceeding SQE
@@ -2364,7 +2361,9 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
 #define MAX_FDS 30
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k ||       \
+    __NR_syz_usb_ep_write || __NR_syz_usb_ep_read || __NR_syz_usb_control_io || \
+    __NR_syz_usb_disconnect
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/usb/ch9.h>
@@ -2889,6 +2888,7 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/loop.h>
+#include <stdbool.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -3683,9 +3683,9 @@ static void setup_cgroups()
 	// Note: we need to enable controllers one-by-one for both cgroup and cgroup2.
 	// If we enable all at the same time and one of them fails (b/c of older kernel
 	// or not enabled configs), then all will fail.
-	const char* unified_controllers[] = {"+cpu", "+memory", "+io", "+pids"};
+	const char* unified_controllers[] = {"+cpu", "+io", "+pids"};
 	const char* net_controllers[] = {"net", "net_prio", "devices", "blkio", "freezer"};
-	const char* cpu_controllers[] = {"cpuset", "cpuacct", "hugetlb", "rlimit"};
+	const char* cpu_controllers[] = {"cpuset", "cpuacct", "hugetlb", "rlimit", "memory"};
 	if (mkdir("/syzcgroup", 0777)) {
 		// Can happen due to e.g. read-only file system (EROFS).
 		debug("mkdir(/syzcgroup) failed: %d\n", errno);
@@ -3717,23 +3717,6 @@ static void setup_cgroups_loop()
 	// 32 pids should be enough for everyone.
 	snprintf(file, sizeof(file), "%s/pids.max", cgroupdir);
 	write_file(file, "32");
-	// Restrict memory consumption.
-	// We have some syscalls that inherently consume lots of memory,
-	// e.g. mounting some filesystem images requires at least 128MB
-	// image in memory. We restrict RLIMIT_AS to 200MB. Here we gradually
-	// increase low/high/max limits to make things more interesting.
-	// Also this takes into account KASAN quarantine size.
-	// If the limit is lower than KASAN quarantine size, then it can happen
-	// so that we kill the process, but all of its memory is in quarantine
-	// and is still accounted against memcg. As the result memcg won't
-	// allow to allocate any memory in the parent and in the new test process.
-	// The current limit of 300MB supports up to 9.6GB RAM (quarantine is 1/32).
-	snprintf(file, sizeof(file), "%s/memory.low", cgroupdir);
-	write_file(file, "%d", 298 << 20);
-	snprintf(file, sizeof(file), "%s/memory.high", cgroupdir);
-	write_file(file, "%d", 299 << 20);
-	snprintf(file, sizeof(file), "%s/memory.max", cgroupdir);
-	write_file(file, "%d", 300 << 20);
 	// Setup some v1 groups to make things more interesting.
 	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
 	write_file(file, "%d", pid);
@@ -3743,6 +3726,21 @@ static void setup_cgroups_loop()
 	}
 	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
 	write_file(file, "%d", pid);
+	// Restrict memory consumption.
+	// We have some syscalls that inherently consume lots of memory,
+	// e.g. mounting some filesystem images requires at least 128MB
+	// image in memory. We restrict RLIMIT_AS to 200MB. Here we gradually
+	// increase memory limits to make things more interesting.
+	// Also this takes into account KASAN quarantine size.
+	// If the limit is lower than KASAN quarantine size, then it can happen
+	// so that we kill the process, but all of its memory is in quarantine
+	// and is still accounted against memcg. As the result memcg won't
+	// allow to allocate any memory in the parent and in the new test process.
+	// The current limit of 300MB supports up to 9.6GB RAM (quarantine is 1/32).
+	snprintf(file, sizeof(file), "%s/memory.soft_limit_in_bytes", cgroupdir);
+	write_file(file, "%d", 299 << 20);
+	snprintf(file, sizeof(file), "%s/memory.limit_in_bytes", cgroupdir);
+	write_file(file, "%d", 300 << 20);
 	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
 	if (mkdir(cgroupdir, 0777)) {
 		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
@@ -5314,6 +5312,7 @@ static volatile long syz_fuse_handle_req(volatile long a0, // /dev/fuse fd.
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_80211_inject_frame
+#include <errno.h>
 #include <linux/genetlink.h>
 #include <linux/if_ether.h>
 #include <linux/nl80211.h>
@@ -5570,4 +5569,45 @@ static long syz_pkey_set(volatile long pkey, volatile long val)
 #endif
 	return 0;
 }
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SWAP
+#include <fcntl.h>
+#include <linux/falloc.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/swap.h>
+#include <sys/types.h>
+
+#define SWAP_FILE "./swap-file"
+#define SWAP_FILE_SIZE (128 * 1000 * 1000) // 128 MB.
+
+static void setup_swap()
+{
+	// The call must be idempotent, so first disable swap and remove the swap file.
+	swapoff(SWAP_FILE);
+	unlink(SWAP_FILE);
+	// Zero-fill the file.
+	int fd = open(SWAP_FILE, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+	if (fd == -1) {
+		failmsg("swap file open failed", "file: %s", SWAP_FILE);
+		return;
+	}
+	// We cannot do ftruncate -- swapon complains about this. Do fallocate instead.
+	fallocate(fd, FALLOC_FL_ZERO_RANGE, 0, SWAP_FILE_SIZE);
+	close(fd);
+	// Set up the swap file.
+	char cmdline[64];
+	sprintf(cmdline, "mkswap %s", SWAP_FILE);
+	if (runcmdline(cmdline)) {
+		fail("mkswap failed");
+		return;
+	}
+	if (swapon(SWAP_FILE, SWAP_FLAG_PREFER) == 1) {
+		failmsg("swapon failed", "file: %s", SWAP_FILE);
+		return;
+	}
+}
+
 #endif

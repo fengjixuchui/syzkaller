@@ -10,12 +10,14 @@ import (
 	"net/mail"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -67,6 +69,9 @@ type Repo interface {
 
 	// Object returns the contents of a git repository object at the particular moment in history.
 	Object(name, commit string) ([]byte, error)
+
+	// MergeBases returns good common ancestors of the two commits.
+	MergeBases(firstCommit, secondCommit string) ([]*Commit, error)
 }
 
 // Bisecter may be optionally implemented by Repo.
@@ -89,12 +94,13 @@ type Bisecter interface {
 
 	IsRelease(commit string) (bool, error)
 
-	EnvForCommit(defaultCompiler, compilerType, binDir, commit string, kernelConfig []byte) (*BisectEnv, error)
+	EnvForCommit(defaultCompiler, compilerType, binDir, commit string,
+		kernelConfig []byte, backports []BackportCommit) (*BisectEnv, error)
 }
 
 type ConfigMinimizer interface {
-	Minimize(target *targets.Target, original, baseline []byte, dt debugtracer.DebugTracer,
-		pred func(test []byte) (BisectResult, error)) ([]byte, error)
+	Minimize(target *targets.Target, original, baseline []byte, types []crash.Type,
+		dt debugtracer.DebugTracer, pred func(test []byte) (BisectResult, error)) ([]byte, error)
 }
 
 type Commit struct {
@@ -261,6 +267,31 @@ func CheckBranch(branch string) bool {
 
 func CheckCommitHash(hash string) bool {
 	return gitHashRe.MatchString(hash)
+}
+
+func ParseReleaseTag(tag string) (v1, v2, rc, v3 int) {
+	invalid := func() {
+		v1, v2, rc, v3 = -1, -1, -1, -1
+	}
+	invalid()
+	matches := releaseTagRe.FindStringSubmatch(tag)
+	if matches == nil {
+		return
+	}
+	for ptr, idx := range map[*int]int{
+		&v1: 1, &v2: 2, &rc: 3, &v3: 4,
+	} {
+		if matches[idx] == "" {
+			continue
+		}
+		var err error
+		*ptr, err = strconv.Atoi(matches[idx])
+		if err != nil {
+			invalid()
+			return
+		}
+	}
+	return
 }
 
 func runSandboxed(dir, command string, args ...string) ([]byte, error) {

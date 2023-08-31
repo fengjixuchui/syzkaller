@@ -66,9 +66,9 @@ NORETURN void doexit_thread(int status)
 #endif
 #endif
 
-#if SYZ_EXECUTOR || SYZ_MULTI_PROC || SYZ_REPEAT && SYZ_CGROUPS ||         \
-    SYZ_NET_DEVICES || __NR_syz_mount_image || __NR_syz_read_part_table || \
-    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k ||                  \
+#if SYZ_EXECUTOR || SYZ_MULTI_PROC || SYZ_REPEAT && SYZ_CGROUPS ||                      \
+    SYZ_NET_DEVICES || __NR_syz_mount_image || __NR_syz_read_part_table ||              \
+    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_usbip_server_init || \
     (GOOS_freebsd || GOOS_darwin || GOOS_openbsd || GOOS_netbsd) && SYZ_NET_INJECTION
 static unsigned long long procid;
 #endif
@@ -192,7 +192,9 @@ static void kill_and_wait(int pid, int* status)
 
 #if !GOOS_windows
 #if SYZ_EXECUTOR || SYZ_THREADED || SYZ_REPEAT && SYZ_EXECUTOR_USES_FORK_SERVER || \
-    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_sleep_ms
+    __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_sleep_ms ||     \
+    __NR_syz_usb_control_io || __NR_syz_usb_ep_read || __NR_syz_usb_ep_write ||    \
+    __NR_syz_usb_disconnect
 static void sleep_ms(uint64 ms)
 {
 	usleep(ms * 1000);
@@ -406,7 +408,7 @@ static void event_set(event_t* ev)
 {
 	pthread_mutex_lock(&ev->mu);
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	ev->state = 1;
 	pthread_mutex_unlock(&ev->mu);
 	pthread_cond_broadcast(&ev->cv);
@@ -493,8 +495,10 @@ static uint16 csum_inet_digest(struct csum_inet* csum)
 
 #if GOOS_akaros
 #include "common_akaros.h"
-#elif GOOS_freebsd || GOOS_darwin || GOOS_netbsd || GOOS_openbsd
+#elif GOOS_freebsd || GOOS_darwin || GOOS_netbsd
 #include "common_bsd.h"
+#elif GOOS_openbsd
+#include "common_openbsd.h"
 #elif GOOS_fuchsia
 #include "common_fuchsia.h"
 #elif GOOS_linux
@@ -811,9 +815,6 @@ int main(void)
 	/*{{{MMAP_DATA}}}*/
 #endif
 
-#if SYZ_HAVE_SETUP_EXT
-	setup_ext();
-#endif
 #if SYZ_SYSCTL
 	setup_sysctl();
 #endif
@@ -838,9 +839,14 @@ int main(void)
 #if SYZ_802154
 	setup_802154();
 #endif
-
+#if SYZ_SWAP
+	setup_swap();
+#endif
 #if SYZ_HANDLE_SEGV
 	install_segv_handler();
+#endif
+#if SYZ_HAVE_SETUP_EXT
+	setup_ext();
 #endif
 #if SYZ_MULTI_PROC
 	for (procid = 0; procid < /*{{{PROCS}}}*/; procid++) {

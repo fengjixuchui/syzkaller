@@ -15,6 +15,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestReportBug(t *testing.T) {
@@ -55,6 +56,7 @@ func TestReportBug(t *testing.T) {
 		OS:                targets.Linux,
 		Arch:              targets.AMD64,
 		VMArch:            targets.AMD64,
+		UserSpaceArch:     targets.AMD64,
 		First:             true,
 		Moderation:        true,
 		Title:             "title1",
@@ -84,6 +86,7 @@ func TestReportBug(t *testing.T) {
 		CrashID:           rep.CrashID,
 		CrashTime:         timeNow(c.ctx),
 		NumCrashes:        1,
+		Manager:           "manager1",
 		HappenedOn:        []string{"repo1 branch1"},
 		Assets:            []dashapi.Asset{},
 		ReportElements:    &dashapi.ReportElements{GuiltyFiles: []string{"a.c"}},
@@ -227,6 +230,7 @@ func TestInvalidBug(t *testing.T) {
 		OS:                targets.Linux,
 		Arch:              targets.AMD64,
 		VMArch:            targets.AMD64,
+		UserSpaceArch:     targets.AMD64,
 		First:             true,
 		Moderation:        true,
 		Title:             "title1 (2)",
@@ -254,6 +258,7 @@ func TestInvalidBug(t *testing.T) {
 		CrashID:           rep.CrashID,
 		CrashTime:         timeNow(c.ctx),
 		NumCrashes:        1,
+		Manager:           "manager1",
 		HappenedOn:        []string{"repo1 branch1"},
 		Assets:            []dashapi.Asset{},
 		ReportElements:    &dashapi.ReportElements{},
@@ -524,7 +529,7 @@ func TestMachineInfo(t *testing.T) {
 	// and the content is correct.
 	indexPage, err := c.AuthGET(AccessAdmin, "/test1")
 	c.expectOK(err)
-	bugLinkRegex := regexp.MustCompile(`<a href="(/bug\?id=[^"]+)">title1</a>`)
+	bugLinkRegex := regexp.MustCompile(`<a href="(/bug\?extid=[^"]+)">title1</a>`)
 	bugLinkSubmatch := bugLinkRegex.FindSubmatch(indexPage)
 	c.expectEQ(len(bugLinkSubmatch), 2)
 	bugURL := html.UnescapeString(string(bugLinkSubmatch[1]))
@@ -1095,10 +1100,74 @@ func TestReportDecommissionedBugs(t *testing.T) {
 	c.expectEQ(len(closed), 0)
 
 	// And now let's decommission the namespace.
-	config.Namespaces[rep.Namespace].Decommissioned = true
-	defer func() { config.Namespaces[rep.Namespace].Decommissioned = false }()
+	c.decommission(rep.Namespace)
 
 	closed, _ = client.ReportingPollClosed([]string{rep.ID})
 	c.expectEQ(len(closed), 1)
 	c.expectEQ(closed[0], rep.ID)
+}
+
+func TestObsoletePeriod(t *testing.T) {
+	base := time.Now()
+	tests := []struct {
+		name   string
+		bug    *Bug
+		period time.Duration
+	}{
+		{
+			name: "frequent final bug",
+			bug: &Bug{
+				// Once in a day.
+				NumCrashes: 30,
+				FirstTime:  base,
+				LastTime:   base.Add(time.Hour * 24 * 30),
+				Reporting:  []BugReporting{{Reported: base}},
+			},
+			// 80 days are definitely enough.
+			period: config.Obsoleting.MinPeriod,
+		},
+		{
+			name: "very short-living final bug",
+			bug: &Bug{
+				NumCrashes: 5,
+				FirstTime:  base,
+				LastTime:   base.Add(time.Hour * 24),
+				Reporting:  []BugReporting{{Reported: base}},
+			},
+			// Too few crashes, wait max time.
+			period: config.Obsoleting.MaxPeriod,
+		},
+		{
+			name: "rare stable final bug",
+			bug: &Bug{
+				// Once in 20 days.
+				NumCrashes: 20,
+				FirstTime:  base,
+				LastTime:   base.Add(time.Hour * 24 * 400),
+				Reporting:  []BugReporting{{Reported: base}},
+			},
+			// Wait max time.
+			period: config.Obsoleting.MaxPeriod,
+		},
+		{
+			name: "frequent non-final bug",
+			bug: &Bug{
+				// Once in a day.
+				NumCrashes: 10,
+				FirstTime:  base,
+				LastTime:   base.Add(time.Hour * 24 * 10),
+				Reporting:  []BugReporting{{}},
+			},
+			// 40 days are also enough.
+			period: config.Obsoleting.NonFinalMinPeriod,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			ret := test.bug.obsoletePeriod()
+			assert.Equal(t, test.period, ret)
+		})
+	}
 }

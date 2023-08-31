@@ -5,6 +5,8 @@ package host
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -37,6 +39,7 @@ func init() {
 	checkFeature[FeatureVhciInjection] = checkVhciInjection
 	checkFeature[FeatureWifiEmulation] = checkWifiEmulation
 	checkFeature[Feature802154Emulation] = check802154Emulation
+	checkFeature[FeatureSwap] = checkSwap
 }
 
 func checkCoverage() string {
@@ -283,6 +286,32 @@ func checkWifiEmulation() string {
 func check802154Emulation() string {
 	if err := osutil.IsAccessible("/sys/bus/platform/devices/mac802154_hwsim"); err != nil {
 		return err.Error()
+	}
+	return ""
+}
+
+func checkSwap() string {
+	if err := osutil.IsAccessible("/proc/swaps"); err != nil {
+		return err.Error()
+	}
+	if _, err := exec.LookPath("mkswap"); err != nil {
+		return "mkswap is not available"
+	}
+	// We use fallocate in syz-executor, so let's check if the filesystem supports it.
+	// /tmp might not always be the best choice for this
+	// (on some systems, a different filesystem might be used for /tmp).
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Sprintf("failed to get home dir: %v", err)
+	}
+	f, err := os.CreateTemp(dir, "any-file")
+	if err != nil {
+		return fmt.Sprintf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	err = syscall.Fallocate(int(f.Fd()), unix.FALLOC_FL_ZERO_RANGE, 0, 2048)
+	if err != nil {
+		return fmt.Sprintf("fallocate failed: %v", err)
 	}
 	return ""
 }

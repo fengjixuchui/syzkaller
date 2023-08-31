@@ -5,7 +5,10 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/stretchr/testify/assert"
@@ -110,7 +113,7 @@ func TestSubsystemFilterMain(t *testing.T) {
 		}
 	}
 	// Check that filtering on the main page works.
-	reply, err = c.AuthGET(AccessAdmin, "/test1?subsystem="+subsystemA)
+	reply, err = c.AuthGET(AccessAdmin, "/test1?label=subsystems:"+subsystemA)
 	c.expectOK(err)
 	for _, title := range []string{crash2.Title} {
 		if bytes.Contains(reply, []byte(title)) {
@@ -147,7 +150,7 @@ func TestSubsystemFilterTerminal(t *testing.T) {
 	}
 
 	// Verify that the filtering works on the invalid bugs page.
-	reply, err := c.AuthGET(AccessAdmin, "/test1/invalid?subsystem="+subsystemB)
+	reply, err := c.AuthGET(AccessAdmin, "/test1/invalid?label=subsystems:"+subsystemB)
 	c.expectOK(err)
 	for _, title := range []string{crash1.Title} {
 		if bytes.Contains(reply, []byte(title)) {
@@ -179,7 +182,7 @@ func TestMainBugFilters(t *testing.T) {
 	assert.Contains(t, string(reply), build1.Manager)
 	assert.NotContains(t, string(reply), "Applied filters")
 
-	reply, err = c.AuthGET(AccessAdmin, "/test1?subsystem=abcd")
+	reply, err = c.AuthGET(AccessAdmin, "/test1?label=subsystems:abcd")
 	c.expectOK(err)
 	assert.NotContains(t, string(reply), build1.Manager) // managers are hidden
 	assert.Contains(t, string(reply), "Applied filters") // we're seeing a prompt to disable the filter
@@ -246,4 +249,108 @@ func TestSubsystemPage(t *testing.T) {
 	c.expectOK(err)
 	assert.Contains(t, string(reply), crash1.Title)
 	assert.NotContains(t, string(reply), crash2.Title)
+}
+
+func TestMultiLabelFilter(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.makeClient(clientPublicEmail, keyPublicEmail, true)
+	mailingList := config.Namespaces["access-public-email"].Reporting[0].Config.(*EmailConfig).Email
+
+	build1 := testBuild(1)
+	build1.Manager = "manager-name-123"
+	client.UploadBuild(build1)
+
+	crash1 := testCrash(build1, 1)
+	crash1.GuiltyFiles = []string{"a.c"}
+	crash1.Title = "crash-with-subsystem-A"
+	client.ReportCrash(crash1)
+	c.pollEmailBug()
+
+	crash2 := testCrash(build1, 2)
+	crash2.GuiltyFiles = []string{"a.c"}
+	crash2.Title = "prio-crash-subsystem-A"
+	client.ReportCrash(crash2)
+
+	c.incomingEmail(c.pollEmailBug().Sender, "#syz set prio: low\n",
+		EmailOptFrom("test@requester.com"), EmailOptCC([]string{mailingList}))
+
+	// The normal main page.
+	reply, err := c.AuthGET(AccessAdmin, "/access-public-email")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), build1.Manager)
+	assert.NotContains(t, string(reply), "Applied filters")
+
+	reply, err = c.AuthGET(AccessAdmin, "/access-public-email?label=subsystems:subsystemA")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), "Applied filters") // we're seeing a prompt to disable the filter
+	assert.Contains(t, string(reply), crash1.Title)
+	assert.Contains(t, string(reply), crash2.Title)
+
+	// Test filters together.
+	reply, err = c.AuthGET(AccessAdmin, "/access-public-email?label=subsystems:subsystemA&&label=prio:low")
+	c.expectOK(err)
+	assert.NotContains(t, string(reply), crash1.Title)
+	assert.Contains(t, string(reply), crash2.Title)
+
+	// Ensure we provide links that drop labels.
+	assert.NotContains(t, string(reply), "/access-public-email?label=subsystems:subsystemA\"")
+	assert.NotContains(t, string(reply), "/access-public-email?label=prop:low\"")
+}
+
+func TestAdminJobList(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.client2
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	crash := testCrash(build, 1)
+	crash.Title = "some bug title"
+	crash.GuiltyFiles = []string{"a.c"}
+	crash.ReproOpts = []byte("repro opts")
+	crash.ReproSyz = []byte("repro syz")
+	crash.ReproC = []byte("repro C")
+	client.ReportCrash(crash)
+	client.pollEmailBug()
+
+	c.advanceTime(24 * time.Hour)
+
+	pollResp := client.pollSpecificJobs(build.Manager, dashapi.ManagerJobs{BisectCause: true})
+	c.expectNE(pollResp.ID, "")
+
+	causeJobsLink := "/admin?job_type=1"
+	fixJobsLink := "/admin?job_type=2"
+	reply, err := c.AuthGET(AccessAdmin, "/admin")
+	c.expectOK(err)
+	assert.Contains(t, string(reply), causeJobsLink)
+	assert.Contains(t, string(reply), fixJobsLink)
+
+	// Verify the bug is in the bisect cause jobs list.
+	reply, err = c.AuthGET(AccessAdmin, causeJobsLink)
+	c.expectOK(err)
+	assert.Contains(t, string(reply), crash.Title)
+
+	// Verify the bug is NOT in the fix jobs list.
+	reply, err = c.AuthGET(AccessAdmin, fixJobsLink)
+	c.expectOK(err)
+	assert.NotContains(t, string(reply), crash.Title)
+}
+
+func TestSubsystemsPageRedirect(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	// Verify that the normal subsystem page works.
+	_, err := c.AuthGET(AccessAdmin, "/access-public-email/s/subsystemA")
+	c.expectOK(err)
+
+	// Verify that the old subsystem name points to the new one.
+	_, err = c.AuthGET(AccessAdmin, "/access-public-email/s/oldSubsystem")
+	var httpErr *HTTPError
+	c.expectTrue(errors.As(err, &httpErr))
+	c.expectEQ(httpErr.Code, http.StatusMovedPermanently)
+	c.expectEQ(httpErr.Headers["Location"], []string{"/access-public-email/s/subsystemA"})
 }

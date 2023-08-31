@@ -28,6 +28,7 @@ type RPCServer struct {
 	coverFilter           map[uint32]uint32
 	stats                 *Stats
 	batchSize             int
+	canonicalModules      *cover.Canonicalizer
 
 	mu            sync.Mutex
 	fuzzers       map[string]*Fuzzer
@@ -47,6 +48,7 @@ type Fuzzer struct {
 	newMaxSignal  signal.Signal
 	rotatedSignal signal.Signal
 	machineInfo   []byte
+	instModules   *cover.CanonicalizerInstance
 }
 
 type BugFrames struct {
@@ -57,7 +59,7 @@ type BugFrames struct {
 // RPCManagerView restricts interface between RPCServer and Manager.
 type RPCManagerView interface {
 	fuzzerConnect([]host.KernelModule) (
-		[]rpctype.Input, BugFrames, map[uint32]uint32, []byte, error)
+		[]rpctype.Input, BugFrames, map[uint32]uint32, map[uint32]uint32, error)
 	machineChecked(result *rpctype.CheckArgs, enabledSyscalls map[*prog.Syscall]bool)
 	newInput(inp rpctype.Input, sign signal.Signal) bool
 	candidateBatch(size int) []rpctype.Candidate
@@ -90,12 +92,15 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	log.Logf(1, "fuzzer %v connected", a.Name)
 	serv.stats.vmRestarts.inc()
 
-	corpus, bugFrames, coverFilter, coverBitmap, err := serv.mgr.fuzzerConnect(a.Modules)
+	if serv.canonicalModules == nil {
+		serv.canonicalModules = cover.NewCanonicalizer(a.Modules, serv.cfg.Cover)
+		serv.modules = a.Modules
+	}
+	corpus, bugFrames, coverFilter, execCoverFilter, err := serv.mgr.fuzzerConnect(serv.modules)
 	if err != nil {
 		return err
 	}
 	serv.coverFilter = coverFilter
-	serv.modules = a.Modules
 
 	serv.mu.Lock()
 	defer serv.mu.Unlock()
@@ -103,11 +108,14 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	f := &Fuzzer{
 		name:        a.Name,
 		machineInfo: a.MachineInfo,
+		instModules: serv.canonicalModules.NewInstance(a.Modules),
 	}
 	serv.fuzzers[a.Name] = f
 	r.MemoryLeakFrames = bugFrames.memoryLeaks
 	r.DataRaceFrames = bugFrames.dataRaces
-	r.CoverFilterBitmap = coverBitmap
+
+	instCoverFilter := f.instModules.DecanonicalizeFilter(execCoverFilter)
+	r.CoverFilterBitmap = createCoverageBitmap(serv.cfg.SysTarget, instCoverFilter)
 	r.EnabledCalls = serv.cfg.Syscalls
 	r.NoMutateCalls = serv.cfg.NoMutateCalls
 	r.GitRevision = prog.GitRevision
@@ -248,9 +256,6 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
 }
 
 func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
-	inputSignal := a.Signal.Deserialize()
-	log.Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",
-		a.Name, a.Call, inputSignal.Len(), len(a.Cover))
 	bad, disabled := checkProgram(serv.cfg.Target, serv.targetEnabledSyscalls, a.Input.Prog)
 	if bad || disabled {
 		log.Logf(0, "rejecting program from fuzzer (bad=%v, disabled=%v):\n%s", bad, disabled, a.Input.Prog)
@@ -260,6 +265,12 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 	defer serv.mu.Unlock()
 
 	f := serv.fuzzers[a.Name]
+	if f != nil {
+		a.Cover, a.Signal = f.instModules.Canonicalize(a.Cover, a.Signal)
+	}
+	inputSignal := a.Signal.Deserialize()
+	log.Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",
+		a.Name, a.Call, inputSignal.Len(), len(a.Cover))
 	// Note: f may be nil if we called shutdownInstance,
 	// but this request is already in-flight.
 	genuine := !serv.corpusSignal.Diff(inputSignal).Empty()
@@ -365,6 +376,9 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 		if len(f.inputs) == 0 {
 			f.inputs = nil
 		}
+	}
+	for _, inp := range r.NewInputs {
+		inp.Cover, inp.Signal = f.instModules.Decanonicalize(inp.Cover, inp.Signal)
 	}
 	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v",
 		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems))

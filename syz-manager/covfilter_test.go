@@ -51,3 +51,12 @@ func TestCreateBitmap(t *testing.T) {
 	}
 	createCoverageBitmap(target, pcs)
 }
+
+func TestNilCoverageBitmap(t *testing.T) {
+	pcs := map[uint32]uint32(nil)
+	target := targets.Get("test", "64")
+	bitmap := createCoverageBitmap(target, pcs)
+	if bitmap != nil {
+		t.Errorf("created a bitmap on nil pcs")
+	}
+}

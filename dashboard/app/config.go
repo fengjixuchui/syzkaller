@@ -16,6 +16,7 @@ import (
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vcs"
+	"golang.org/x/net/context"
 )
 
 // There are multiple configurable aspects of the app (namespaces, reporting, API clients, etc).
@@ -90,6 +91,8 @@ type Config struct {
 	FixBisectionAutoClose bool
 	// If set, dashboard will periodically request repros and revoke no longer working ones.
 	RetestRepros bool
+	// If set, dashboard will create patch testing jobs to determine bug origin trees.
+	FindBugOriginTrees bool
 	// Managers contains some special additional info about syz-manager instances.
 	Managers map[string]ConfigManager
 	// Reporting config.
@@ -128,6 +131,8 @@ type SubsystemsConfig struct {
 	Revision int
 	// Periodic per-subsystem reminders about open bugs.
 	Reminder *BugListReportingConfig
+	// Maps old subsystem names to new ones.
+	Redirect map[string]string
 }
 
 // BugListReportingConfig describes how aggregated reminders about open bugs should be processed.
@@ -137,8 +142,12 @@ type BugListReportingConfig struct {
 	// Reports will include details about BugsInReport bugs (10 by default).
 	BugsInReport int
 	// Bugs that were first discovered less than MinBugAge ago, will not be included.
-	// The default value is 2 weeks.
+	// The default value is 1 weeks.
 	MinBugAge time.Duration
+	// Don't include a bug in the report if there has been a human reply to one of the
+	// discussions involving the bug during the last UserReplyFrist units of time.
+	// The default value is 2 weeks.
+	UserReplyFrist time.Duration
 	// Reports will only be sent if there are at least MinBugsCount bugs to notify about.
 	// The default value is 2.
 	MinBugsCount int
@@ -152,7 +161,7 @@ type BugListReportingConfig struct {
 	Config ReportingType
 }
 
-// ObsoletingConfig describes how bugs without reproducer should be obsoleted.
+// ObsoletingConfig describes how bugs should be obsoleted.
 // First, for each bug we conservatively estimate period since the last crash
 // when we consider it stopped happenning. This estimation is based on the first/last time
 // and number and rate of crashes. Then this period is capped by MinPeriod/MaxPeriod.
@@ -166,7 +175,13 @@ type ObsoletingConfig struct {
 	MaxPeriod         time.Duration
 	NonFinalMinPeriod time.Duration
 	NonFinalMaxPeriod time.Duration
+	// Reproducers are retested every ReproRetestPeriod.
+	// If the period is zero, not retesting is performed.
 	ReproRetestPeriod time.Duration
+	// Reproducer retesting begins after there have been no crashes during
+	// the ReproRetestStart period.
+	// By default, it's 14 days.
+	ReproRetestStart time.Duration
 }
 
 // ConfigManager describes a single syz-manager instance.
@@ -189,7 +204,15 @@ type ConfigManager struct {
 	FixBisectionDisabled bool
 	// CC for all bugs that happened only on this manager.
 	CC CCConfig
+	// Other parameters being equal, Priority helps to order bug's crashes.
+	// Priority is an integer in the range [-3;3].
+	Priority int
 }
+
+const (
+	MinManagerPriority = -3
+	MaxManagerPriority = 3
+)
 
 // One reporting stage.
 type Reporting struct {
@@ -209,7 +232,10 @@ type Reporting struct {
 	// The app has one built-in type, EmailConfig, which reports bugs by email.
 	// And ExternalConfig which can be used to attach any external reporting system (e.g. Bugzilla).
 	Config ReportingType
-
+	// List of labels to notify about (keys are strings of form "label:value").
+	// The value is the string that will be included in the notification message.
+	// Notifications will only be sent for automatically assigned labels.
+	Labels map[string]string
 	// Set for all but last reporting stages.
 	moderation bool
 }
@@ -231,9 +257,30 @@ type KernelRepo struct {
 	ReportingPriority int
 	// CC for all bugs reported on this repo.
 	CC CCConfig
-	// This repository is no longer active and should not be polled for commits.
-	// It will only be used to display kernel aliases for older crashes.
-	Obsolete bool
+	// This repository should not be polled for commits, e.g. because it's no longer active.
+	NoPoll bool
+	// LabelIntroduced is assigned to a bug if it was supposedly introduced
+	// in this particular tree (i.e. no other tree from CommitInflow has it).
+	LabelIntroduced string
+	// LabelReached is assiged to a bug if it's the latest tree so far to which
+	// the bug has spread (i.e. no other tree to which commits flow from this one
+	// has this bug).
+	LabelReached string
+	// CommitInflow are the descriptions of commit sources of this tree.
+	CommitInflow []KernelRepoLink
+	// Enable the missing backport tracking feature for this tree.
+	DetectMissingBackports bool
+	// Append this string to the config file before running reproducers on this tree.
+	AppendConfig string
+}
+
+type KernelRepoLink struct {
+	// Alias of the repository from which commits flow into the current one.
+	Alias string
+	// Whether commits from the other repository merged or cherry-picked.
+	Merge bool
+	// Whether syzbot should try to fix bisect the bug in the Alias tree.
+	BisectFixes bool
 }
 
 type CCConfig struct {
@@ -322,7 +369,7 @@ func checkConfig(cfg *GlobalConfig) {
 	clientNames := make(map[string]bool)
 	checkClients(clientNames, cfg.Clients)
 	checkConfigAccessLevel(&cfg.AccessLevel, AccessPublic, "global")
-	checkObsoleting(cfg.Obsoleting)
+	checkObsoleting(&cfg.Obsoleting)
 	if cfg.Namespaces[cfg.DefaultNamespace] == nil {
 		panic(fmt.Sprintf("default namespace %q is not found", cfg.DefaultNamespace))
 	}
@@ -343,7 +390,7 @@ func checkDiscussionEmails(list []DiscussionEmailConfig) {
 	}
 }
 
-func checkObsoleting(o ObsoletingConfig) {
+func checkObsoleting(o *ObsoletingConfig) {
 	if (o.MinPeriod == 0) != (o.MaxPeriod == 0) {
 		panic("obsoleting: both or none of Min/MaxPeriod must be specified")
 	}
@@ -364,6 +411,9 @@ func checkObsoleting(o ObsoletingConfig) {
 	}
 	if o.MinPeriod == 0 && o.NonFinalMinPeriod != 0 {
 		panic("obsoleting: NonFinalMinPeriod without MinPeriod")
+	}
+	if o.ReproRetestStart == 0 {
+		o.ReproRetestStart = time.Hour * 24 * 14
 	}
 }
 
@@ -404,7 +454,7 @@ func checkNamespace(ns string, cfg *Config, namespaces, clientNames map[string]b
 	if cfg.Kcidb != nil {
 		checkKcidb(ns, cfg.Kcidb)
 	}
-	checkKernelRepos(ns, cfg)
+	checkKernelRepos(ns, cfg, cfg.Repos)
 	checkNamespaceReporting(ns, cfg)
 	checkSubsystems(ns, cfg)
 }
@@ -443,7 +493,10 @@ func checkSubsystems(ns string, cfg *Config) {
 		panic(fmt.Sprintf("%v: Reminder.BugsInReport must be > 0", ns))
 	}
 	if reminder.MinBugAge == 0 {
-		reminder.MinBugAge = 24 * time.Hour * 14
+		reminder.MinBugAge = 24 * time.Hour * 7
+	}
+	if reminder.UserReplyFrist == 0 {
+		reminder.UserReplyFrist = 24 * time.Hour * 7 * 2
 	}
 	if reminder.MinBugsCount == 0 {
 		reminder.MinBugsCount = 2
@@ -452,11 +505,14 @@ func checkSubsystems(ns string, cfg *Config) {
 	}
 }
 
-func checkKernelRepos(ns string, cfg *Config) {
-	if len(cfg.Repos) == 0 {
+func checkKernelRepos(ns string, config *Config, repos []KernelRepo) {
+	if len(repos) == 0 {
 		panic(fmt.Sprintf("no repos in namespace %q", ns))
 	}
-	for _, repo := range cfg.Repos {
+	introduced, reached := map[string]bool{}, map[string]bool{}
+	aliasMap := map[string]bool{}
+	canBeLabels := false
+	for _, repo := range repos {
 		if !vcs.CheckRepoAddress(repo.URL) {
 			panic(fmt.Sprintf("%v: bad repo URL %q", ns, repo.URL))
 		}
@@ -466,10 +522,41 @@ func checkKernelRepos(ns string, cfg *Config) {
 		if repo.Alias == "" {
 			panic(fmt.Sprintf("%v: empty repo alias for %q", ns, repo.Alias))
 		}
+		if aliasMap[repo.Alias] {
+			panic(fmt.Sprintf("%v: duplicate alias for %q", ns, repo.Alias))
+		}
+		aliasMap[repo.Alias] = true
 		if prio := repo.ReportingPriority; prio < 0 || prio > 9 {
 			panic(fmt.Sprintf("%v: bad kernel repo reporting priority %v for %q", ns, prio, repo.Alias))
 		}
 		checkCC(&repo.CC)
+		if repo.LabelIntroduced != "" {
+			introduced[repo.LabelIntroduced] = true
+			if reached[repo.LabelIntroduced] {
+				panic(fmt.Sprintf("%v: label %s is used for both introduced and reached", ns, repo.LabelIntroduced))
+			}
+		}
+		if repo.LabelReached != "" {
+			reached[repo.LabelReached] = true
+			if introduced[repo.LabelReached] {
+				panic(fmt.Sprintf("%v: label %s is used for both introduced and reached", ns, repo.LabelReached))
+			}
+		}
+		canBeLabels = canBeLabels || repo.DetectMissingBackports
+	}
+	if len(introduced)+len(reached) > 0 {
+		canBeLabels = true
+	}
+	if canBeLabels && !config.FindBugOriginTrees {
+		panic(fmt.Sprintf("%v: repo labels are set, but FindBugOriginTrees is disabled", ns))
+	}
+	if !canBeLabels && config.FindBugOriginTrees {
+		panic(fmt.Sprintf("%v: FindBugOriginTrees is enabled, but all repo labels are disabled", ns))
+	}
+	// And finally test links.
+	_, err := makeRepoGraph(repos)
+	if err != nil {
+		panic(fmt.Sprintf("%v: %s", ns, err))
 	}
 }
 
@@ -547,6 +634,10 @@ func checkManager(ns, name string, mgr ConfigManager) {
 	if mgr.ObsoletingMinPeriod != 0 && mgr.ObsoletingMinPeriod < 24*time.Hour {
 		panic(fmt.Sprintf("manager %v/%v obsoleting: too low MinPeriod", ns, name))
 	}
+	if mgr.Priority < MinManagerPriority && mgr.Priority > MaxManagerPriority {
+		panic(fmt.Sprintf("manager %v/%v priority is not in the [%d;%d] range",
+			ns, name, MinManagerPriority, MaxManagerPriority))
+	}
 	checkCC(&mgr.CC)
 }
 
@@ -597,4 +688,36 @@ func (cfg *Config) lastActiveReporting() int {
 		last--
 	}
 	return last
+}
+
+var kernelReposKey = "Custom list of kernel repositories"
+
+func contextWithRepos(c context.Context, list []KernelRepo) context.Context {
+	return context.WithValue(c, &kernelReposKey, list)
+}
+
+func getKernelRepos(c context.Context, ns string) []KernelRepo {
+	if val, ok := c.Value(&kernelReposKey).([]KernelRepo); ok {
+		return val
+	}
+	return config.Namespaces[ns].Repos
+}
+
+var decommKey = "Custom decommissioned status"
+
+func contextWithDecommission(c context.Context, ns string, value bool) context.Context {
+	mm, _ := c.Value(&decommKey).(map[string]bool)
+	if mm == nil {
+		mm = map[string]bool{}
+	}
+	mm[ns] = value
+	return context.WithValue(c, &decommKey, mm)
+}
+
+func isDecommissioned(c context.Context, ns string) bool {
+	mm, _ := c.Value(&decommKey).(map[string]bool)
+	if val, set := mm[ns]; set {
+		return val
+	}
+	return config.Namespaces[ns].Decommissioned
 }

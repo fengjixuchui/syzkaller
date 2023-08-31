@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -28,12 +29,16 @@ func (ctx *testos) PreviousReleaseTags(commit, compilerType string) ([]string, e
 
 func (ctx *testos) EnvForCommit(
 	defaultCompiler, compilerType, binDir, commit string, kernelConfig []byte,
+	backports []BackportCommit,
 ) (*BisectEnv, error) {
 	return &BisectEnv{KernelConfig: kernelConfig}, nil
 }
 
-func (ctx *testos) Minimize(target *targets.Target, original, baseline []byte,
+func (ctx *testos) Minimize(target *targets.Target, original, baseline []byte, types []crash.Type,
 	dt debugtracer.DebugTracer, pred func(test []byte) (BisectResult, error)) ([]byte, error) {
+	if len(baseline) == 0 {
+		return original, nil
+	}
 	if res, err := pred(baseline); err != nil {
 		return nil, err
 	} else if res == BisectBad {

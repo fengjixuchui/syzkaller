@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -34,6 +35,7 @@ type Manager struct {
 	FailedSyzBuildBug string
 	LastAlive         time.Time
 	CurrentUpTime     time.Duration
+	LastGeneratedJob  time.Time
 }
 
 // ManagerStats holds per-day manager runtime stats.
@@ -91,95 +93,168 @@ type Bug struct {
 	NumRepro     int64
 	// ReproLevel is the best ever found repro level for this bug.
 	// HeadReproLevel is best known repro level that still works on the HEAD commit.
-	ReproLevel     dashapi.ReproLevel
-	HeadReproLevel dashapi.ReproLevel `datastore:"HeadReproLevel"`
-	BisectCause    BisectStatus
-	BisectFix      BisectStatus
-	HasReport      bool
-	NeedCommitInfo bool
-	FirstTime      time.Time
-	LastTime       time.Time
-	LastSavedCrash time.Time
-	LastReproTime  time.Time
-	FixTime        time.Time // when we become aware of the fixing commit
-	LastActivity   time.Time // last time we observed any activity related to the bug
-	Closed         time.Time
-	SubsystemsTime time.Time // when we have updated subsystems last time
-	SubsystemsRev  int
-	Reporting      []BugReporting
-	Commits        []string // titles of fixing commmits
-	CommitInfo     []Commit // additional info for commits (for historical reasons parallel array to Commits)
-	HappenedOn     []string // list of managers
-	PatchedOn      []string `datastore:",noindex"` // list of managers
-	UNCC           []string // don't CC these emails on this bug
+	ReproLevel      dashapi.ReproLevel
+	HeadReproLevel  dashapi.ReproLevel `datastore:"HeadReproLevel"`
+	BisectCause     BisectStatus
+	BisectFix       BisectStatus
+	HasReport       bool
+	NeedCommitInfo  bool
+	FirstTime       time.Time
+	LastTime        time.Time
+	LastSavedCrash  time.Time
+	LastReproTime   time.Time
+	LastCauseBisect time.Time
+	FixTime         time.Time // when we become aware of the fixing commit
+	LastActivity    time.Time // last time we observed any activity related to the bug
+	Closed          time.Time
+	SubsystemsTime  time.Time // when we have updated subsystems last time
+	SubsystemsRev   int
+	Reporting       []BugReporting
+	Commits         []string // titles of fixing commmits
+	CommitInfo      []Commit // additional info for commits (for historical reasons parallel array to Commits)
+	HappenedOn      []string // list of managers
+	PatchedOn       []string `datastore:",noindex"` // list of managers
+	UNCC            []string // don't CC these emails on this bug
 	// Kcidb publishing status bitmask:
 	// bit 0 - the bug is published
 	// bit 1 - don't want to publish it (syzkaller build/test errors)
 	KcidbStatus    int64
 	DailyStats     []BugDailyStats
-	Tags           BugTags
+	Labels         []BugLabel
 	DiscussionInfo []BugDiscussionInfo
+	TreeTests      BugTreeTestInfo
+	// FixCandidateJob holds the key of the latest successful cross-tree fix bisection job.
+	FixCandidateJob string
+	ReproAttempts   []BugReproAttempt
 }
 
-type BugTags struct {
-	Subsystems []BugSubsystem
+type BugTreeTestInfo struct {
+	// NeedPoll is set to true if this bug needs to be considered ASAP.
+	NeedPoll bool
+	// NextPoll can be used to delay the next inspection of the bug.
+	NextPoll time.Time
+	// List contains latest data about cross-tree patch tests.
+	List []BugTreeTest
 }
 
-type BugSubsystem struct {
-	// For now, let's keep the bare minimum number of fields.
-	// The subsystem names we use now are not stable and should not be relied upon.
-	Name string
+type BugTreeTest struct {
+	CrashID int64
+	Repo    string
+	Branch  string // May be also equal to a commit.
+	// If the values below are set, the testing was done on a merge base.
+	MergeBaseRepo   string
+	MergeBaseBranch string
+	// Below are job keys.
+	First      string // The first job that finished successfully.
+	FirstOK    string
+	FirstCrash string
+	Last       string
+	Error      string // If some job succeeds afterwards, it should be cleared.
+	Pending    string
+}
+
+type BugLabelType string
+
+type BugLabel struct {
+	Label BugLabelType
+	// Either empty (for flags) or contains the value.
+	Value string
 	// The email of the user who manually set this subsystem tag.
-	// If empty, the subsystem was set automatically.
+	// If empty, the label was set automatically.
 	SetBy string
+	// Link to the message.
+	Link string
 }
 
-func (bug *Bug) SetAutoSubsystems(list []*subsystem.Subsystem, now time.Time, rev int) {
-	objects := []BugSubsystem{}
-	for _, item := range list {
-		objects = append(objects, BugSubsystem{Name: item.Name})
+func (label BugLabel) String() string {
+	if label.Value == "" {
+		return string(label.Label)
 	}
+	return string(label.Label) + ":" + label.Value
+}
+
+// BugReproAttempt describes a single attempt to generate a repro for a bug.
+type BugReproAttempt struct {
+	Time    time.Time
+	Manager string
+	Log     int64
+}
+
+func (bug *Bug) SetAutoSubsystems(c context.Context, list []*subsystem.Subsystem, now time.Time, rev int) {
 	bug.SubsystemsRev = rev
-	bug.SetSubsystems(objects, now)
-}
-
-func (bug *Bug) SetUserSubsystems(list []*subsystem.Subsystem, now time.Time, user string) {
-	objects := []BugSubsystem{}
-	for _, item := range list {
-		objects = append(objects, BugSubsystem{
-			Name:  item.Name,
-			SetBy: user,
-		})
-	}
-	bug.SetSubsystems(objects, now)
-}
-
-func (bug *Bug) SetSubsystems(list []BugSubsystem, now time.Time) {
-	bug.Tags.Subsystems = list
 	bug.SubsystemsTime = now
+	var objects []BugLabel
+	for _, item := range list {
+		objects = append(objects, BugLabel{Label: SubsystemLabel, Value: item.Name})
+	}
+	bug.SetLabels(makeLabelSet(c, bug.Namespace), objects)
+}
+
+func updateSingleBug(c context.Context, bugKey *db.Key, transform func(*Bug) error) error {
+	tx := func(c context.Context) error {
+		bug := new(Bug)
+		if err := db.Get(c, bugKey, bug); err != nil {
+			return fmt.Errorf("failed to get bug: %w", err)
+		}
+		err := transform(bug)
+		if err != nil {
+			return err
+		}
+		if _, err := db.Put(c, bugKey, bug); err != nil {
+			return fmt.Errorf("failed to put bug: %w", err)
+		}
+		return nil
+	}
+	return db.RunInTransaction(c, tx, &db.TransactionOptions{Attempts: 10})
 }
 
 func (bug *Bug) hasUserSubsystems() bool {
-	for _, item := range bug.Tags.Subsystems {
-		if item.SetBy != "" {
-			return true
-		}
-	}
-	return false
+	return bug.HasUserLabel(SubsystemLabel)
 }
 
-func (bug *Bug) hasSubsystem(name string) bool {
-	for _, item := range bug.Tags.Subsystems {
-		if item.Name == name {
-			return true
-		}
-	}
-	return false
+// Initially, subsystem labels were stored as Tags.Subsystems, but over time
+// it turned out that we'd better store all labels together.
+// Let's keep this conversion code until "Tags" are removed from all bugs.
+// Then it can be removed.
+
+type Bug202304 struct {
+	Tags BugTags202304
 }
 
-func (bug *Bug) Load(ps []db.Property) error {
+type BugTags202304 struct {
+	Subsystems []BugTag202304
+}
+
+type BugTag202304 struct {
+	Name  string
+	SetBy string
+}
+
+func (bug *Bug) Load(origProps []db.Property) error {
+	// First filer out Tag properties.
+	var tags, ps []db.Property
+	for _, p := range origProps {
+		if strings.HasPrefix(p.Name, "Tags.") {
+			tags = append(tags, p)
+		} else {
+			ps = append(ps, p)
+		}
+	}
 	if err := db.LoadStruct(bug, ps); err != nil {
 		return err
+	}
+	if len(tags) > 0 {
+		old := Bug202304{}
+		if err := db.LoadStruct(&old, tags); err != nil {
+			return err
+		}
+		for _, entry := range old.Tags.Subsystems {
+			bug.Labels = append(bug.Labels, BugLabel{
+				Label: SubsystemLabel,
+				SetBy: entry.SetBy,
+				Value: entry.Name,
+			})
+		}
 	}
 	headReproFound := false
 	for _, p := range ps {
@@ -239,9 +314,19 @@ type BugReporting struct {
 	// it never actually was.
 	Dummy      bool
 	ReproLevel dashapi.ReproLevel // may be less then bug.ReproLevel if repro arrived but we didn't report it yet
+	Labels     string             // a comma-separated string of already reported labels
 	OnHold     time.Time          // if set, the bug must not be upstreamed
 	Reported   time.Time
 	Closed     time.Time
+}
+
+func (r *BugReporting) GetLabels() []string {
+	return strings.Split(r.Labels, ",")
+}
+
+func (r *BugReporting) AddLabel(label string) {
+	newList := unique(append(r.GetLabels(), label))
+	r.Labels = strings.Join(newList, ",")
 }
 
 type Crash struct {
@@ -478,6 +563,15 @@ type Job struct {
 	IsRunning   bool      // the job might have been started, but never finished
 	LastStarted time.Time `datastore:"Started"`
 	Finished    time.Time // if set, job is finished
+	TreeOrigin  bool      // whether the job is related to tree origin detection
+
+	// If patch test should be done on the merge base between two branches.
+	MergeBaseRepo   string
+	MergeBaseBranch string
+
+	// By default, bisection starts from the revision of the associated crash.
+	// The BisectFrom field can override this.
+	BisectFrom string
 
 	// Result of execution:
 	CrashTitle  string // if empty, we did not hit crash during testing
@@ -487,9 +581,14 @@ type Job struct {
 	BuildID     string
 	Log         int64 // reference to Log text entity
 	Error       int64 // reference to Error text entity, if set job failed
-	Flags       JobFlags
+	Flags       dashapi.JobDoneFlags
 
-	Reported bool // have we reported result back to user?
+	Reported      bool   // have we reported result back to user?
+	InvalidatedBy string // user who marked this bug as invalid, empty by default
+}
+
+func (job *Job) IsBisection() bool {
+	return job.Type == JobBisectCause || job.Type == JobBisectFix
 }
 
 func (job *Job) IsFinished() bool {
@@ -517,46 +616,20 @@ func (typ JobType) toDashapiReportType() dashapi.ReportType {
 	}
 }
 
-type JobFlags int64
-
-const (
-	// Parallel to dashapi.JobDoneFlags, see comments there.
-	BisectResultMerge JobFlags = 1 << iota
-	BisectResultNoop
-	BisectResultRelease
-	BisectResultIgnore
-)
-
-func (flags JobFlags) String() string {
-	res := ""
-	if flags&BisectResultMerge != 0 {
-		res += "merge "
-	}
-	if flags&BisectResultNoop != 0 {
-		res += "no-op "
-	}
-	if flags&BisectResultRelease != 0 {
-		res += "release "
-	}
-	if flags&BisectResultIgnore != 0 {
-		res += "ignored "
-	}
-	if res == "" {
-		return res
-	}
-	return "[" + res + "commit]"
-}
-
 func (job *Job) isUnreliableBisect() bool {
 	if job.Type != JobBisectCause && job.Type != JobBisectFix {
 		panic(fmt.Sprintf("bad job type %v", job.Type))
 	}
 	// If a bisection points to a merge or a commit that does not affect the kernel binary,
 	// it is considered an unreliable/wrong result and should not be reported in emails.
-	return job.Flags&BisectResultMerge != 0 ||
-		job.Flags&BisectResultNoop != 0 ||
-		job.Flags&BisectResultRelease != 0 ||
-		job.Flags&BisectResultIgnore != 0
+	return job.Flags&dashapi.BisectResultMerge != 0 ||
+		job.Flags&dashapi.BisectResultNoop != 0 ||
+		job.Flags&dashapi.BisectResultRelease != 0 ||
+		job.Flags&dashapi.BisectResultIgnore != 0
+}
+
+func (job *Job) IsCrossTree() bool {
+	return job.MergeBaseRepo != "" && job.IsBisection()
 }
 
 // Text holds text blobs (crash logs, reports, reproducers, etc).
@@ -575,6 +648,7 @@ const (
 	textPatch        = "Patch"
 	textLog          = "Log"
 	textError        = "Error"
+	textReproLog     = "ReproLog"
 )
 
 const (
@@ -643,7 +717,7 @@ func loadManager(c context.Context, ns, name string) (*Manager, error) {
 	mgr := new(Manager)
 	if err := db.Get(c, mgrKey(c, ns, name), mgr); err != nil {
 		if err != db.ErrNoSuchEntity {
-			return nil, fmt.Errorf("failed to get manager %v/%v: %v", ns, name, err)
+			return nil, fmt.Errorf("failed to get manager %v/%v: %w", ns, name, err)
 		}
 		mgr = &Manager{
 			Namespace: ns,
@@ -666,7 +740,7 @@ func updateManager(c context.Context, ns, name string, fn func(mgr *Manager, sta
 		statsKey := db.NewKey(c, "ManagerStats", "", int64(date), mgrKey)
 		if err := db.Get(c, statsKey, stats); err != nil {
 			if err != db.ErrNoSuchEntity {
-				return fmt.Errorf("failed to get stats %v/%v/%v: %v", ns, name, date, err)
+				return fmt.Errorf("failed to get stats %v/%v/%v: %w", ns, name, date, err)
 			}
 			stats = &ManagerStats{
 				Date: date,
@@ -678,10 +752,10 @@ func updateManager(c context.Context, ns, name string, fn func(mgr *Manager, sta
 		}
 
 		if _, err := db.Put(c, mgrKey, mgr); err != nil {
-			return fmt.Errorf("failed to put manager: %v", err)
+			return fmt.Errorf("failed to put manager: %w", err)
 		}
 		if _, err := db.Put(c, statsKey, stats); err != nil {
-			return fmt.Errorf("failed to put manager stats: %v", err)
+			return fmt.Errorf("failed to put manager stats: %w", err)
 		}
 		return nil
 	}
@@ -696,7 +770,7 @@ func loadAllManagers(c context.Context, ns string) ([]*Manager, []*db.Key, error
 	}
 	keys, err := query.GetAll(c, &managers)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query managers: %v", err)
+		return nil, nil, fmt.Errorf("failed to query managers: %w", err)
 	}
 	var result []*Manager
 	var resultKeys []*db.Key
@@ -724,27 +798,20 @@ func loadBuild(c context.Context, ns, id string) (*Build, error) {
 		if err == db.ErrNoSuchEntity {
 			return nil, fmt.Errorf("unknown build %v/%v", ns, id)
 		}
-		return nil, fmt.Errorf("failed to get build %v/%v: %v", ns, id, err)
+		return nil, fmt.Errorf("failed to get build %v/%v: %w", ns, id, err)
 	}
 	return build, nil
 }
 
 func lastManagerBuild(c context.Context, ns, manager string) (*Build, error) {
-	var builds []*Build
-	_, err := db.NewQuery("Build").
-		Filter("Namespace=", ns).
-		Filter("Manager=", manager).
-		Filter("Type=", BuildNormal).
-		Order("-Time").
-		Limit(1).
-		GetAll(c, &builds)
+	mgr, err := loadManager(c, ns, manager)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch manager build: %v", err)
+		return nil, err
 	}
-	if len(builds) == 0 {
+	if mgr.CurrentBuild == "" {
 		return nil, fmt.Errorf("failed to fetch manager build: no builds")
 	}
-	return builds[0], nil
+	return loadBuild(c, ns, mgr.CurrentBuild)
 }
 
 func (bug *Bug) displayTitle() string {
@@ -765,7 +832,7 @@ func splitDisplayTitle(display string) (string, int64, error) {
 	seqStr := display[match[4]:match[5]]
 	seq, err := strconv.ParseInt(seqStr, 10, 64)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to parse bug title: %v", err)
+		return "", 0, fmt.Errorf("failed to parse bug title: %w", err)
 	}
 	if seq <= 0 || seq > 1e6 {
 		return "", 0, fmt.Errorf("failed to parse bug title: seq=%v", seq)
@@ -781,7 +848,7 @@ func canonicalBug(c context.Context, bug *Bug) (*Bug, error) {
 		canon := new(Bug)
 		bugKey := db.NewKey(c, "Bug", bug.DupOf, 0, nil)
 		if err := db.Get(c, bugKey, canon); err != nil {
-			return nil, fmt.Errorf("failed to get dup bug %q for %q: %v",
+			return nil, fmt.Errorf("failed to get dup bug %q for %q: %w",
 				bug.DupOf, bug.keyHash(), err)
 		}
 		bug = canon
@@ -905,11 +972,11 @@ func addCrashReference(c context.Context, crashID int64, bugKey *db.Key, ref Cra
 	crash := new(Crash)
 	crashKey := db.NewKey(c, "Crash", "", crashID, bugKey)
 	if err := db.Get(c, crashKey, crash); err != nil {
-		return fmt.Errorf("failed to get reported crash %v: %v", crashID, err)
+		return fmt.Errorf("failed to get reported crash %v: %w", crashID, err)
 	}
 	crash.AddReference(ref)
 	if _, err := db.Put(c, crashKey, crash); err != nil {
-		return fmt.Errorf("failed to put reported crash %v: %v", crashID, err)
+		return fmt.Errorf("failed to put reported crash %v: %w", crashID, err)
 	}
 	return nil
 }
@@ -919,22 +986,22 @@ func removeCrashReference(c context.Context, crashID int64, bugKey *db.Key,
 	crash := new(Crash)
 	crashKey := db.NewKey(c, "Crash", "", crashID, bugKey)
 	if err := db.Get(c, crashKey, crash); err != nil {
-		return fmt.Errorf("failed to get reported crash %v: %v", crashID, err)
+		return fmt.Errorf("failed to get reported crash %v: %w", crashID, err)
 	}
 	crash.ClearReference(t, key)
 	if _, err := db.Put(c, crashKey, crash); err != nil {
-		return fmt.Errorf("failed to put reported crash %v: %v", crashID, err)
+		return fmt.Errorf("failed to put reported crash %v: %w", crashID, err)
 	}
 	return nil
 }
 
-func kernelRepoInfo(build *Build) KernelRepo {
-	return kernelRepoInfoRaw(build.Namespace, build.KernelRepo, build.KernelBranch)
+func kernelRepoInfo(c context.Context, build *Build) KernelRepo {
+	return kernelRepoInfoRaw(c, build.Namespace, build.KernelRepo, build.KernelBranch)
 }
 
-func kernelRepoInfoRaw(ns, url, branch string) KernelRepo {
+func kernelRepoInfoRaw(c context.Context, ns, url, branch string) KernelRepo {
 	var info KernelRepo
-	for _, repo := range config.Namespaces[ns].Repos {
+	for _, repo := range getKernelRepos(c, ns) {
 		if repo.URL == url && repo.Branch == branch {
 			info = repo
 			break

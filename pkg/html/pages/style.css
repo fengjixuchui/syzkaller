@@ -151,7 +151,7 @@ table td, table th {
 
 .list_table .result {
 	width: 60pt;
-	max-width: 60pt;
+	max-width: 200pt;
 }
 
 .list_table .stat {
@@ -207,7 +207,31 @@ table td, table th {
 	font-size: 75%;
 }
 
-.subsystem {
+.list_table .status-crashed {
+	background-color: #FF8674;
+}
+
+.list_table tr:hover .status-crashed {
+	background-color: #ffa397;
+}
+
+.list_table .status-ok {
+	background-color: lightgreen;
+}
+
+.list_table tr:hover .status-ok {
+	background-color: palegreen;
+}
+
+.list_table .status-error {
+	background-color: lightgray;
+}
+
+.list_table tr:hover .status-error {
+	background-color: gainsboro;
+}
+
+.bug-label {
 	background: white;
 	border: 1pt solid black;
 	display: inline-block;
@@ -217,7 +241,7 @@ table td, table th {
 	font-size: small;
 }
 
-.subsystem a {
+.bug-label a {
 	text-decoration: none;
 	color: black;
 }
@@ -338,6 +362,11 @@ aside {
 
 .input-group button {
 	width: 20pt;
+}
+
+.fix-candidate-block {
+	background: lightgreen;
+	padding: 5pt;
 }
 
 .bug-bisection-info {

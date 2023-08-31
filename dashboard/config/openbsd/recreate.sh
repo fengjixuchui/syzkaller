@@ -29,7 +29,7 @@ TODAY=$(date -u +%Y-%m-%d)
 SYZ_DIR="$(cd "$(dirname "${0}")"/../../..; pwd -P)"
 [[ -d "${SYZ_DIR}/tools" ]] || { echo "Requires syzkaller dir $SYZ_DIR" ; exit 1; }
 
-ZONE=us-central1-c
+ZONE=us-central1-b
 INSTANCE=ci-openbsd
 IP=$(gcloud compute instances describe "${INSTANCE}" --zone="${ZONE}" --project=syzkaller '--format=text(networkInterfaces[].accessConfigs[].natIP)' | cut -f2 -d' ')
 SERVICE_ACCOUNT=$(gcloud compute instances describe "${INSTANCE}" --zone="${ZONE}" --project=syzkaller  '--format=text(serviceAccounts[].email)' | cut -d' ' -f2)
@@ -72,7 +72,6 @@ mv  ~/.ssh/known_hosts{.new,}
 
 ssh syzkaller@"${INSTANCE}" mkdir -p /syzkaller/userspace
 ssh syzkaller@"${INSTANCE}" ln -sf /syzkaller/{gopath/src/github.com/google/syzkaller/dashboard/,}config
-scp "${SYZ_DIR}"/dashboard/config/openbsd/config.ci "${INSTANCE}":/syzkaller/config-openbsd.ci
 scp worker_key syzkaller@"${INSTANCE}":/syzkaller/userspace/key
 scp -C worker_disk.raw syzkaller@"${INSTANCE}":/syzkaller/userspace/image
 ssh syzkaller@"${INSTANCE}" 'D=/syzkaller/userspace-multicore && mkdir -p $D && ln -sf ../userspace/{image,key} $D && ln -sf ../config/openbsd/overlays/ci-openbsd-multicore $D/overlay'

@@ -13,69 +13,67 @@
 //
 // Usage:
 //
-//	syz-cover [-os=OS -arch=ARCH -kernel_src=. -kernel_obj=.] rawcover.file*
+//	syz-cover -config config_file rawcover.file*
+//
+// or use all pcs in rg.Symbols
+//
+//	syz-cover -config config_file
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
-	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/tool"
-	"github.com/google/syzkaller/sys/targets"
 )
 
 func main() {
 	var (
-		flagOS             = flag.String("os", runtime.GOOS, "target os")
-		flagArch           = flag.String("arch", runtime.GOARCH, "target arch")
-		flagVM             = flag.String("vm", "", "VM type")
-		flagKernelSrc      = flag.String("kernel_src", "", "path to kernel sources")
-		flagKernelBuildSrc = flag.String("kernel_build_src", "", "path to kernel image's build dir (optional)")
-		flagKernelObj      = flag.String("kernel_obj", "", "path to kernel build/obj dir")
+		flagConfig  = flag.String("config", "", "configuration file")
+		flagModules = flag.String("modules", "",
+			"modules info obtained from /modules or file from /proc/modules (optional)")
 		flagExportCSV      = flag.String("csv", "", "export coverage data in csv format (optional)")
 		flagExportLineJSON = flag.String("json", "", "export coverage data with source line info in json format (optional)")
 		flagExportHTML     = flag.String("html", "", "save coverage HTML report to file (optional)")
 	)
 	defer tool.Init()()
 
+	cfg, err := mgrconfig.LoadFile(*flagConfig)
+	if err != nil {
+		tool.Fail(err)
+	}
+	var modules []host.KernelModule
+	if *flagModules != "" {
+		m, err := loadModules(*flagModules)
+		if err != nil {
+			tool.Fail(err)
+		}
+		modules = m
+	}
+	rg, err := cover.MakeReportGenerator(cfg, cfg.KernelSubsystem, modules, false)
+	if err != nil {
+		tool.Fail(err)
+	}
+	var pcs []uint64
 	if len(flag.Args()) == 0 {
-		fmt.Fprintf(os.Stderr, "usage: syz-cover [flags] rawcover.file\n")
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
-	if *flagKernelSrc == "" {
-		*flagKernelSrc = "."
-	}
-	*flagKernelSrc = osutil.Abs(*flagKernelSrc)
-	if *flagKernelObj == "" {
-		*flagKernelObj = *flagKernelSrc
-	}
-	*flagKernelObj = osutil.Abs(*flagKernelObj)
-	if *flagKernelBuildSrc == "" {
-		*flagKernelBuildSrc = *flagKernelSrc
-	}
-	*flagKernelBuildSrc = osutil.Abs(*flagKernelBuildSrc)
-	target := targets.Get(*flagOS, *flagArch)
-	if target == nil {
-		tool.Failf("unknown target %v/%v", *flagOS, *flagArch)
-	}
-	pcs, err := readPCs(flag.Args())
-	if err != nil {
-		tool.Fail(err)
-	}
-	rg, err := cover.MakeReportGenerator(target, *flagVM, *flagKernelObj,
-		*flagKernelSrc, *flagKernelBuildSrc, nil, nil, nil, false)
-	if err != nil {
-		tool.Fail(err)
+		for _, s := range rg.Symbols {
+			pcs = append(pcs, s.PCs...)
+		}
+	} else {
+		pcs, err = readPCs(flag.Args())
+		if err != nil {
+			tool.Fail(err)
+		}
 	}
 	progs := []cover.Prog{{PCs: pcs}}
 	buf := new(bytes.Buffer)
@@ -139,4 +137,16 @@ func readPCs(files []string) ([]uint64, error) {
 		}
 	}
 	return pcs, nil
+}
+
+func loadModules(fname string) ([]host.KernelModule, error) {
+	data, err := os.ReadFile(fname)
+	if err != nil {
+		return nil, err
+	}
+	var modules []host.KernelModule
+	if err := json.Unmarshal(data, &modules); err != nil {
+		return host.ParseModulesText(data)
+	}
+	return modules, nil
 }

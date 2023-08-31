@@ -3,7 +3,7 @@
 
 # See /tools/docker/README.md for details.
 
-FROM debian:bullseye
+FROM debian:bookworm
 
 RUN apt-get update --allow-releaseinfo-change
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
@@ -23,7 +23,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
 	crossbuild-essential-amd64 crossbuild-essential-arm64
 RUN test "$(uname -m)" != x86_64 && exit 0 || \
         DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-	  libc6-dev-i386 libc6-dev-i386-amd64-cross lib32gcc-10-dev lib32stdc++-10-dev \
+	  libc6-dev-i386 libc6-dev-i386-amd64-cross lib32gcc-12-dev lib32stdc++-12-dev \
 	  # These are required to run foreign arch kernels:
 	  qemu-utils qemu-system-misc qemu-system-x86 qemu-system-arm qemu-system-aarch64  \
 	  qemu-system-s390x qemu-system-mips qemu-system-ppc \
@@ -34,32 +34,29 @@ RUN test "$(uname -m)" != x86_64 && exit 0 || \
 RUN curl https://dl.google.com/go/go1.20.1.linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz | tar -C /usr/local -xz
 ENV PATH /usr/local/go/bin:$PATH
 
-# The default clang-11 is too old, install the latest one.
+# The default clang-14 is too old, install the latest one.
 RUN apt-get install -y -q gnupg software-properties-common apt-transport-https
 RUN curl https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -
-RUN add-apt-repository "deb http://apt.llvm.org/bullseye/ llvm-toolchain-bullseye-15 main"
+RUN add-apt-repository "deb http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-15 main"
 RUN apt-get update --allow-releaseinfo-change
-RUN apt-get remove -y -q clang-11
-RUN apt-get install -y -q --no-install-recommends clang-15 clang-format-15 clang-tidy-15 lld-15
+RUN apt-get install -y -q --no-install-recommends llvm-15 clang-15 clang-format-15 clang-tidy-15 lld-15
 RUN apt autoremove -y -q
 RUN sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100
 RUN sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
 RUN sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-15 100
 RUN sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-15 100
 RUN sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/lld-15 100
+RUN sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-15 100
+RUN sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-15 100
+RUN sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-15 100
+RUN sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-15 100
 
 # Not really GRTE, but it's enough to run some scripts that hardcode the path.
 RUN mkdir -p /usr/grte/v5/bin && ln -s /usr/bin/python3 /usr/grte/v5/bin/python2.7
 
 # Install bazel
 # Download the official bazel binary. The APT repository isn't used because there is not packages for arm64.
-RUN sh -c 'curl -o /usr/local/bin/bazel https://releases.bazel.build/5.3.2/release/bazel-5.3.2-linux-$(uname -m | sed s/aarch64/arm64/) && chmod ugo+x /usr/local/bin/bazel'
-
-# Update pahole from 1.20 to 1.22 to avoid this build error seen on 5.10 based kernels:
-# [43990] INT DW_ATE_unsigned_24 Error emitting BTF type
-RUN echo 'deb http://deb.debian.org/debian bullseye-backports main' >> /etc/apt/sources.list
-RUN apt update
-RUN apt install -y -q dwarves/bullseye-backports
+RUN sh -c 'curl -o /usr/local/bin/bazel https://releases.bazel.build/6.2.0/release/bazel-6.2.0-linux-$(uname -m | sed s/aarch64/arm64/) && chmod ugo+x /usr/local/bin/bazel'
 
 # pkg/osutil uses syzkaller user for sandboxing.
 RUN useradd --create-home syzkaller
