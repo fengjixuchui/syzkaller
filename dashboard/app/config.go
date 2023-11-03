@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/auth"
 	"github.com/google/syzkaller/pkg/email"
@@ -99,9 +100,9 @@ type Config struct {
 	Reporting []Reporting
 	// TransformCrash hook is called when a manager uploads a crash.
 	// The hook can transform the crash or discard the crash by returning false.
-	TransformCrash func(build *Build, crash *dashapi.Crash) bool
+	TransformCrash func(build *Build, crash *dashapi.Crash) bool `json:"-"`
 	// NeedRepro hook can be used to prevent reproduction of some bugs.
-	NeedRepro func(bug *Bug) bool
+	NeedRepro func(bug *Bug) bool `json:"-"`
 	// List of kernel repositories for this namespace.
 	// The first repo considered the "main" repo (e.g. fixing commit info is shown against this repo).
 	// Other repos are secondary repos, they may be tested or not.
@@ -113,6 +114,8 @@ type Config struct {
 	Subsystems SubsystemsConfig
 	// Instead of Last acitivity, display Discussions on the main page.
 	DisplayDiscussions bool
+	// Cache what we display on the web dashboard.
+	CacheUIPages bool
 }
 
 // DiscussionEmailConfig defines the correspondence between an email and a DiscussionSource.
@@ -223,7 +226,7 @@ type Reporting struct {
 	// Name used in UI.
 	DisplayTitle string
 	// Filter can be used to conditionally skip this reporting or hold off reporting.
-	Filter ReportingFilter
+	Filter ReportingFilter `json:"-"`
 	// How many new bugs report per day.
 	DailyLimit int
 	// Upstream reports into next reporting after this period.
@@ -336,23 +339,64 @@ func (cfg *Config) ReportingByName(name string) *Reporting {
 	return nil
 }
 
-// config is installed either by tests or from mainConfig in main function
-// (a separate file should install mainConfig in an init function).
+// configDontUse holds the configuration object that is installed either by tests
+// or from mainConfig in main function (a separate file should install mainConfig
+// in an init function).
+// Please access it via the getConfig(context.Context) method.
 var (
-	config     *GlobalConfig
-	mainConfig *GlobalConfig
+	configDontUse *GlobalConfig
+	mainConfig    *GlobalConfig
+)
+
+// To ensure config integrity during tests, we marshal config after it's installed
+// and optionally verify it during execution.
+var (
+	ensureConfigImmutability = false
+	marshaledConfig          = ""
 )
 
 func installConfig(cfg *GlobalConfig) {
 	checkConfig(cfg)
-	if config != nil {
+	if configDontUse != nil {
 		panic("another config is already installed")
 	}
-	config = cfg
+	configDontUse = cfg
+	if ensureConfigImmutability {
+		marshaledConfig = cfg.marshalJSON()
+	}
 	initEmailReporting()
 	initHTTPHandlers()
 	initAPIHandlers()
 	initKcidb()
+}
+
+var contextConfigKey = "Updated config (to be used during tests). Use only in tests!"
+
+func contextWithConfig(c context.Context, cfg *GlobalConfig) context.Context {
+	return context.WithValue(c, &contextConfigKey, cfg)
+}
+
+func getConfig(c context.Context) *GlobalConfig {
+	// Check point.
+	validateGlobalConfig()
+
+	if val, ok := c.Value(&contextConfigKey).(*GlobalConfig); ok {
+		return val
+	}
+	return configDontUse // The base config was not overwriten.
+}
+
+func validateGlobalConfig() {
+	if ensureConfigImmutability {
+		currentConfig := configDontUse.marshalJSON()
+		if diff := cmp.Diff(currentConfig, marshaledConfig); diff != "" {
+			panic("global config changed during execution: " + diff)
+		}
+	}
+}
+
+func getNsConfig(c context.Context, ns string) *Config {
+	return getConfig(c).Namespaces[ns]
 }
 
 func checkConfig(cfg *GlobalConfig) {
@@ -690,34 +734,10 @@ func (cfg *Config) lastActiveReporting() int {
 	return last
 }
 
-var kernelReposKey = "Custom list of kernel repositories"
-
-func contextWithRepos(c context.Context, list []KernelRepo) context.Context {
-	return context.WithValue(c, &kernelReposKey, list)
-}
-
-func getKernelRepos(c context.Context, ns string) []KernelRepo {
-	if val, ok := c.Value(&kernelReposKey).([]KernelRepo); ok {
-		return val
+func (gCfg *GlobalConfig) marshalJSON() string {
+	ret, err := json.MarshalIndent(gCfg, "", " ")
+	if err != nil {
+		panic(err)
 	}
-	return config.Namespaces[ns].Repos
-}
-
-var decommKey = "Custom decommissioned status"
-
-func contextWithDecommission(c context.Context, ns string, value bool) context.Context {
-	mm, _ := c.Value(&decommKey).(map[string]bool)
-	if mm == nil {
-		mm = map[string]bool{}
-	}
-	mm[ns] = value
-	return context.WithValue(c, &decommKey, mm)
-}
-
-func isDecommissioned(c context.Context, ns string) bool {
-	mm, _ := c.Value(&decommKey).(map[string]bool)
-	if val, set := mm[ns]; set {
-		return val
-	}
-	return config.Namespaces[ns].Decommissioned
+	return string(ret)
 }

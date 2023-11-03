@@ -34,6 +34,7 @@ func init() {
 	isBrokenAuthDomainInTest = true
 	obsoleteWhatWontBeFixBisected = true
 	notifyAboutUnsuccessfulBisections = true
+	ensureConfigImmutability = true
 	initMocks()
 	installConfig(testConfig)
 }
@@ -274,6 +275,7 @@ var testConfig = &GlobalConfig{
 				},
 			},
 			FindBugOriginTrees: true,
+			CacheUIPages:       true,
 		},
 		"access-public-email": {
 			AccessLevel: AccessPublic,
