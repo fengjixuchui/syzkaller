@@ -4,6 +4,7 @@
 package starnix
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,7 +22,7 @@ import (
 
 func init() {
 	var _ vmimpl.Infoer = (*instance)(nil)
-	vmimpl.Register("starnix", ctor, true)
+	vmimpl.Register("starnix", ctor, true, false)
 }
 
 type Config struct {
@@ -37,6 +38,7 @@ type Pool struct {
 
 type instance struct {
 	fuchsiaDirectory string
+	ffxBinary        string
 	name             string
 	index            int
 	cfg              *Config
@@ -48,13 +50,14 @@ type instance struct {
 	wpipe            io.WriteCloser
 	fuchsiaLogs      *exec.Cmd
 	adb              *exec.Cmd
+	adbTimeout       time.Duration
+	adbRetryWait     time.Duration
 	executor         string
 	merger           *vmimpl.OutputMerger
 	diagnose         chan bool
 }
 
-const ffxBinary = ".jiri_root/bin/ffx"
-const targetDir = "/data"
+const targetDir = "/tmp"
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	cfg := &Config{}
@@ -99,6 +102,11 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 	}()
 
 	var err error
+	inst.ffxBinary, err = getToolPath(inst.fuchsiaDirectory, "ffx")
+	if err != nil {
+		return nil, err
+	}
+
 	inst.rpipe, inst.wpipe, err = osutil.LongPipe()
 	if err != nil {
 		return nil, err
@@ -129,23 +137,28 @@ func (inst *instance) boot() error {
 	inst.ffx("emu", "stop", inst.name)
 
 	if err := inst.startFuchsiaVM(); err != nil {
-		return fmt.Errorf("could not start Fuchsia VM: %w", err)
+		return fmt.Errorf("instance %s: could not start Fuchsia VM: %w", inst.name, err)
 	}
-
-	if err := inst.startAdbServerAndConnection(1 * time.Minute); err != nil {
-		return fmt.Errorf("could not start and connect to the adb server: %w", err)
+	if err := inst.startAdbServerAndConnection(2*time.Minute, 3*time.Second); err != nil {
+		return fmt.Errorf("instance %s: could not start and connect to the adb server: %w", inst.name, err)
+	}
+	if inst.debug {
+		log.Logf(0, "instance %s: setting up...", inst.name)
+	}
+	if err := inst.restartAdbAsRoot(); err != nil {
+		return fmt.Errorf("instance %s: could not restart adb with root access: %w", inst.name, err)
 	}
 
 	if err := inst.createAdbScript(); err != nil {
-		return fmt.Errorf("could not create adb script: %w", err)
+		return fmt.Errorf("instance %s: could not create adb script: %w", inst.name, err)
 	}
 
 	err := inst.startFuchsiaLogs()
 	if err != nil {
-		return fmt.Errorf("could not start fuchsia logs: %w", err)
+		return fmt.Errorf("instance %s: could not start fuchsia logs: %w", inst.name, err)
 	}
 	if inst.debug {
-		log.Logf(0, "%s booted successfully", inst.name)
+		log.Logf(0, "instance %s: booted successfully", inst.name)
 	}
 	return nil
 }
@@ -172,7 +185,7 @@ func (inst *instance) Close() {
 }
 
 func (inst *instance) startFuchsiaVM() error {
-	err := inst.ffx("emu", "start", "--headless", "--name", inst.name)
+	err := inst.ffx("emu", "start", "--headless", "--name", inst.name, "--net", "user")
 	if err != nil {
 		return err
 	}
@@ -183,34 +196,42 @@ func (inst *instance) startFuchsiaLogs() error {
 	// `ffx log` outputs some buffered logs by default, and logs from early boot
 	// trigger a false positive from the unexpected reboot check. To avoid this,
 	// only request logs from now on.
-	cmd := osutil.Command(ffxBinary, "--target", inst.name, "log", "--since", "now")
+	cmd := osutil.Command(inst.ffxBinary, "--target", inst.name, "log", "--since", "now",
+		"--show-metadata", "--show-full-moniker", "--no-color")
 	cmd.Dir = inst.fuchsiaDirectory
 	cmd.Stdout = inst.wpipe
 	cmd.Stderr = inst.wpipe
 	inst.merger.Add("fuchsia", inst.rpipe)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
 	inst.fuchsiaLogs = cmd
-	return cmd.Start()
+	inst.wpipe.Close()
+	inst.wpipe = nil
+	return nil
 }
 
-func (inst *instance) startAdbServerAndConnection(timeout time.Duration) error {
-	cmd := osutil.Command(ffxBinary, "--target", inst.name, "starnix", "adb", "-p", fmt.Sprintf("%d", inst.port))
+func (inst *instance) startAdbServerAndConnection(timeout, retry time.Duration) error {
+	cmd := osutil.Command(inst.ffxBinary, "--target", inst.name, "starnix", "adb",
+		"-p", fmt.Sprintf("%d", inst.port))
 	cmd.Dir = inst.fuchsiaDirectory
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	if inst.debug {
-		log.Logf(0, fmt.Sprintf("the adb bridge is listening on 127.0.0.1:%d", inst.port))
+		log.Logf(0, fmt.Sprintf("instance %s: the adb bridge is listening on 127.0.0.1:%d", inst.name, inst.port))
 	}
 	inst.adb = cmd
-	return inst.connectToAdb(timeout)
+	inst.adbTimeout = timeout
+	inst.adbRetryWait = retry
+	return inst.connectToAdb()
 }
 
-func (inst *instance) connectToAdb(timeout time.Duration) error {
+func (inst *instance) connectToAdb() error {
 	startTime := time.Now()
 	for {
-		vmimpl.SleepInterruptible(3 * time.Second)
 		if inst.debug {
-			log.Logf(0, "attempting to connect to ADB")
+			log.Logf(1, "instance %s: attempting to connect to adb", inst.name)
 		}
 		connectOutput, err := osutil.RunCmd(
 			2*time.Minute,
@@ -219,40 +240,69 @@ func (inst *instance) connectToAdb(timeout time.Duration) error {
 			"connect",
 			fmt.Sprintf("127.0.0.1:%d", inst.port))
 		if err == nil && strings.HasPrefix(string(connectOutput), "connected to") {
+			if inst.debug {
+				log.Logf(0, "instance %s: connected to adb server", inst.name)
+			}
 			return nil
 		}
 		inst.runCommand("adb", "disconnect", fmt.Sprintf("127.0.0.1:%d", inst.port))
 		if inst.debug {
-			log.Logf(0, "adb connect failed")
+			log.Logf(1, "instance %s: adb connect failed", inst.name)
 		}
-		if time.Since(startTime) > timeout {
-			return fmt.Errorf("can't connect to ADB server")
+		if time.Since(startTime) > (inst.adbTimeout - inst.adbRetryWait) {
+			return fmt.Errorf("instance %s: can't connect to adb server", inst.name)
 		}
+		vmimpl.SleepInterruptible(inst.adbRetryWait)
+	}
+}
+
+func (inst *instance) restartAdbAsRoot() error {
+	startTime := time.Now()
+	for {
+		if inst.debug {
+			log.Logf(1, "instance %s: attempting to restart adbd with root access", inst.name)
+		}
+		err := inst.runCommand(
+			"adb",
+			"-s",
+			fmt.Sprintf("127.0.0.1:%d", inst.port),
+			"root",
+		)
+		if err == nil {
+			return nil
+		}
+		if inst.debug {
+			log.Logf(1, "instance %s: adb root failed", inst.name)
+		}
+		if time.Since(startTime) > (inst.adbTimeout - inst.adbRetryWait) {
+			return fmt.Errorf("instance %s: can't restart adbd with root access", inst.name)
+		}
+		vmimpl.SleepInterruptible(inst.adbRetryWait)
 	}
 }
 
 // Script for telling syz-fuzzer how to connect to syz-executor.
 func (inst *instance) createAdbScript() error {
 	adbScript := fmt.Sprintf(
-		`#!/bin/bash
+		`#!/usr/bin/env bash
 		adb_port=$1
 		fuzzer_args=${@:2}
-		adb -s 127.0.0.1:$adb_port shell "cd %s; ./syz-executor $fuzzer_args"`, targetDir)
+		exec adb -s 127.0.0.1:$adb_port shell "cd %s; ./syz-executor $fuzzer_args"`, targetDir)
 	return os.WriteFile(inst.executor, []byte(adbScript), 0777)
 }
 
 func (inst *instance) ffx(args ...string) error {
-	return inst.runCommand(ffxBinary, args...)
+	return inst.runCommand(inst.ffxBinary, args...)
 }
 
 // Runs a command inside the fuchsia directory.
 func (inst *instance) runCommand(cmd string, args ...string) error {
 	if inst.debug {
-		log.Logf(0, "running command: %s %q", cmd, args)
+		log.Logf(1, "instance %s: running command: %s %q", inst.name, cmd, args)
 	}
 	output, err := osutil.RunCmd(5*time.Minute, inst.fuchsiaDirectory, cmd, args...)
 	if inst.debug {
-		log.Logf(0, "%s", output)
+		log.Logf(1, "instance %s: %s", inst.name, output)
 	}
 	return err
 }
@@ -265,20 +315,77 @@ func (inst *instance) Forward(port int) (string, error) {
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
+	startTime := time.Now()
 	base := filepath.Base(hostSrc)
-	vmDst := filepath.Join(targetDir, base)
 	if base == "syz-fuzzer" || base == "syz-execprog" {
 		return hostSrc, nil // we will run these on host.
 	}
+	vmDst := filepath.Join(targetDir, base)
 
-	err := inst.runCommand(
-		"adb",
-		"-s",
-		fmt.Sprintf("127.0.0.1:%d", inst.port),
-		"push",
-		hostSrc,
-		vmDst)
-	return vmDst, err
+	for {
+		if inst.debug {
+			log.Logf(1, "instance %s: attempting to push executor binary over ADB", inst.name)
+		}
+		output, err := osutil.RunCmd(
+			1*time.Minute,
+			inst.fuchsiaDirectory,
+			"adb",
+			"-s",
+			fmt.Sprintf("127.0.0.1:%d", inst.port),
+			"push",
+			hostSrc,
+			vmDst)
+		if err == nil {
+			err = inst.Chmod(vmDst)
+			return vmDst, err
+		}
+		// Retryable connection errors usually look like "adb: error: ... : device offline"
+		// or "adb: error: ... closed"
+		if !strings.HasPrefix(string(output), "adb: error:") {
+			log.Logf(0, "instance %s: adb push failed: %s", inst.name, string(output))
+			return vmDst, err
+		}
+		if inst.debug {
+			log.Logf(1, "instance %s: adb push failed: %s", inst.name, string(output))
+		}
+		if time.Since(startTime) > (inst.adbTimeout - inst.adbRetryWait) {
+			return vmDst, fmt.Errorf("instance %s: can't push executor binary to VM", inst.name)
+		}
+		vmimpl.SleepInterruptible(inst.adbRetryWait)
+	}
+}
+
+func (inst *instance) Chmod(vmDst string) error {
+	startTime := time.Now()
+	for {
+		if inst.debug {
+			log.Logf(1, "instance %s: attempting to chmod executor script over ADB", inst.name)
+		}
+		output, err := osutil.RunCmd(
+			1*time.Minute,
+			inst.fuchsiaDirectory,
+			"adb",
+			"-s",
+			fmt.Sprintf("127.0.0.1:%d", inst.port),
+			"shell",
+			fmt.Sprintf("chmod +x %s", vmDst))
+		if err == nil {
+			return nil
+		}
+		// Retryable connection errors usually look like "adb: error: ... : device offline"
+		// or "adb: error: ... closed"
+		if !strings.HasPrefix(string(output), "adb: error:") {
+			log.Logf(0, "instance %s: adb shell command failed: %s", inst.name, string(output))
+			return err
+		}
+		if inst.debug {
+			log.Logf(1, "instance %s: adb shell command failed: %s", inst.name, string(output))
+		}
+		if time.Since(startTime) > (inst.adbTimeout - inst.adbRetryWait) {
+			return fmt.Errorf("instance %s: can't chmod executor script for VM", inst.name)
+		}
+		vmimpl.SleepInterruptible(inst.adbRetryWait)
+	}
 }
 
 func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
@@ -300,7 +407,7 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		}
 	}
 	if inst.debug {
-		log.Logf(0, "running command: %#v", args)
+		log.Logf(1, "instance %s: running command: %#v", inst.name, args)
 	}
 	cmd := osutil.Command(args[0], args[1:]...)
 	cmd.Dir = inst.workdir
@@ -355,10 +462,58 @@ func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
 }
 
 func (inst *instance) setFuchsiaVersion() error {
-	version, err := osutil.RunCmd(1*time.Minute, inst.fuchsiaDirectory, ffxBinary, "version")
+	version, err := osutil.RunCmd(1*time.Minute, inst.fuchsiaDirectory, inst.ffxBinary, "version")
 	if err != nil {
 		return err
 	}
 	inst.version = string(version)
 	return nil
+}
+
+// Get the currently-selected build dir in a Fuchsia checkout.
+func getFuchsiaBuildDir(fuchsiaDir string) (string, error) {
+	fxBuildDir := filepath.Join(fuchsiaDir, ".fx-build-dir")
+	contents, err := os.ReadFile(fxBuildDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %q: %w", fxBuildDir, err)
+	}
+
+	buildDir := strings.TrimSpace(string(contents))
+	if !filepath.IsAbs(buildDir) {
+		buildDir = filepath.Join(fuchsiaDir, buildDir)
+	}
+
+	return buildDir, nil
+}
+
+// Subset of data format used in tool_paths.json.
+type toolMetadata struct {
+	Name string
+	Path string
+}
+
+// Resolve a tool by name using tool_paths.json in the build dir.
+func getToolPath(fuchsiaDir, toolName string) (string, error) {
+	buildDir, err := getFuchsiaBuildDir(fuchsiaDir)
+	if err != nil {
+		return "", err
+	}
+
+	jsonPath := filepath.Join(buildDir, "tool_paths.json")
+	jsonBlob, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %q: %w", jsonPath, err)
+	}
+	var metadataList []toolMetadata
+	if err := json.Unmarshal(jsonBlob, &metadataList); err != nil {
+		return "", fmt.Errorf("failed to parse %q: %w", jsonPath, err)
+	}
+
+	for _, metadata := range metadataList {
+		if metadata.Name == toolName {
+			return filepath.Join(buildDir, metadata.Path), nil
+		}
+	}
+
+	return "", fmt.Errorf("no path found for tool %q in %q", toolName, jsonPath)
 }

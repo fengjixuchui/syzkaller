@@ -80,7 +80,7 @@ func init() {
 	ctor := func(env *vmimpl.Env) (vmimpl.Pool, error) {
 		return &testPool{}, nil
 	}
-	vmimpl.Register("test", ctor, false)
+	vmimpl.Register("test", ctor, false, false)
 }
 
 type Test struct {
@@ -88,10 +88,12 @@ type Test struct {
 	Exit           ExitCondition
 	DiagnoseBug    bool // Diagnose produces output that is detected as kernel crash.
 	DiagnoseNoWait bool // Diagnose returns output directly rather than to console.
+	InjectOutput   string
 	Body           func(outc chan []byte, errc chan error)
 	Report         *report.Report
 }
 
+// nolint: goconst // "DIAGNOSE\n", "BUG: bad\n" and "other output\n"
 var tests = []*Test{
 	{
 		Name: "program-exits-normally",
@@ -322,6 +324,31 @@ var tests = []*Test{
 			errc <- nil
 		},
 	},
+	{
+		Name:         "inject-error",
+		Exit:         ExitNormal,
+		InjectOutput: "BUG: foo\n",
+		Body: func(outc chan []byte, errc chan error) {
+			errc <- nil
+		},
+		Report: &report.Report{
+			Title:  "BUG: foo",
+			Report: []byte("BUG: foo\nDIAGNOSE\n"),
+		},
+	},
+	{
+		Name:         "inject-output",
+		Exit:         ExitNormal,
+		InjectOutput: "INJECTED\n",
+		Body: func(outc chan []byte, errc chan error) {
+			time.Sleep(time.Second)
+			outc <- []byte("BUG: foo\n")
+		},
+		Report: &report.Report{
+			Title:  "BUG: foo",
+			Report: []byte("INJECTED\nBUG: foo\nDIAGNOSE\n"),
+		},
+	},
 }
 
 func TestMonitorExecution(t *testing.T) {
@@ -346,6 +373,7 @@ func testMonitorExecution(t *testing.T, test *Test) {
 				Slowdown: 1,
 				NoOutput: 5 * time.Second,
 			},
+			SysTarget: targets.Get(targets.Linux, targets.AMD64),
 		},
 		Workdir: dir,
 		Type:    "test",
@@ -364,10 +392,6 @@ func testMonitorExecution(t *testing.T, test *Test) {
 		t.Fatal(err)
 	}
 	defer inst.Close()
-	outc, errc, err := inst.Run(time.Second, nil, "")
-	if err != nil {
-		t.Fatal(err)
-	}
 	testInst := inst.impl.(*testInstance)
 	testInst.diagnoseBug = test.DiagnoseBug
 	testInst.diagnoseNoWait = test.DiagnoseNoWait
@@ -376,7 +400,16 @@ func testMonitorExecution(t *testing.T, test *Test) {
 		test.Body(testInst.outc, testInst.errc)
 		done <- true
 	}()
-	rep := inst.MonitorExecution(outc, errc, reporter, test.Exit)
+	opts := []any{test.Exit}
+	if test.InjectOutput != "" {
+		c := make(chan []byte, 1)
+		c <- []byte(test.InjectOutput)
+		opts = append(opts, InjectOutput(c))
+	}
+	_, rep, err := inst.Run(time.Second, reporter, "", opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
 	<-done
 	if test.Report != nil && rep == nil {
 		t.Fatalf("got no report")

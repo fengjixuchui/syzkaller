@@ -23,7 +23,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends
 	apt-get clean autoclean && \
 	rm -rf /var/lib/apt/lists/{apt,dpkg,cache,log} /tmp/* /var/tmp/*
 
-RUN curl https://dl.google.com/go/go1.20.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+RUN curl https://dl.google.com/go/go1.21.4.linux-amd64.tar.gz | tar -C /usr/local -xz
 ENV PATH /usr/local/go/bin:/gopath/bin:$PATH
 ENV GOPATH /gopath
 
@@ -48,7 +48,6 @@ RUN sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/b
 
 # Install OS toolchains from pre-built archives.
 # These archives were created with:
-# tar -cz --owner=0 --group=0 --mode=go=u -f akaros-toolchain.tar.gz akaros/toolchain
 # tar -cz --owner=0 --group=0 --mode=go=u -f netbsd-toolchain.tar.gz netbsd/tools netbsd/dest
 # tar -cz --owner=0 --group=0 --mode=go=u -f fuchsia-toolchain.tar.gz fuchsia/prebuilt/third_party/clang \
 #	fuchsia/zircon/system/ulib fuchsia/src/lib/ddk fuchsia/out/x64/fidling/gen \

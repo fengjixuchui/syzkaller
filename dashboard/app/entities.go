@@ -50,6 +50,9 @@ type ManagerStats struct {
 	CrashTypes        int64 // unique crash types
 	SuppressedCrashes int64
 	TotalExecs        int64
+	// These are only recorded once right after corpus is triaged.
+	TriagedCoverage int64
+	TriagedPCs      int64
 }
 
 type Asset struct {
@@ -289,6 +292,16 @@ type Commit struct {
 	Date       time.Time
 }
 
+func (com Commit) toDashapi() *dashapi.Commit {
+	return &dashapi.Commit{
+		Hash:       com.Hash,
+		Title:      com.Title,
+		Author:     com.Author,
+		AuthorName: com.AuthorName,
+		Date:       com.Date,
+	}
+}
+
 type BugDiscussionInfo struct {
 	Source  string
 	Summary DiscussionSummary
@@ -512,12 +525,14 @@ func (r *SubsystemReport) findStage(id string) *SubsystemReportStage {
 
 type SubsystemReportStats struct {
 	Reported int
+	LowPrio  int
 	Fixed    int
 }
 
 func (s *SubsystemReportStats) toDashapi() dashapi.BugListReportStats {
 	return dashapi.BugListReportStats{
 		Reported: s.Reported,
+		LowPrio:  s.LowPrio,
 		Fixed:    s.Fixed,
 	}
 }
@@ -583,8 +598,9 @@ type Job struct {
 	Error       int64 // reference to Error text entity, if set job failed
 	Flags       dashapi.JobDoneFlags
 
-	Reported      bool   // have we reported result back to user?
-	InvalidatedBy string // user who marked this bug as invalid, empty by default
+	Reported         bool   // have we reported result back to user?
+	InvalidatedBy    string // user who marked this bug as invalid, empty by default
+	BackportedCommit Commit
 }
 
 func (job *Job) IsBisection() bool {
@@ -814,6 +830,22 @@ func lastManagerBuild(c context.Context, ns, manager string) (*Build, error) {
 	return loadBuild(c, ns, mgr.CurrentBuild)
 }
 
+func loadBuilds(c context.Context, ns, manager string, typ BuildType) ([]*Build, error) {
+	const limit = 500
+	var builds []*Build
+	_, err := db.NewQuery("Build").
+		Filter("Namespace=", ns).
+		Filter("Manager=", manager).
+		Filter("Type=", typ).
+		Order("-Time").
+		Limit(limit).
+		GetAll(c, &builds)
+	if err != nil {
+		return nil, err
+	}
+	return builds, nil
+}
+
 func (bug *Bug) displayTitle() string {
 	if bug.Seq == 0 {
 		return bug.Title
@@ -966,6 +998,13 @@ func (bug *Bug) dashapiStatus() (dashapi.BugStatus, error) {
 		return status, fmt.Errorf("unknown bugs status %v", bug.Status)
 	}
 	return status, nil
+}
+
+// If an entity of type EmergencyStop exists, syzbot's operation is paused until
+// a support engineer deletes it from the DB.
+type EmergencyStop struct {
+	Time time.Time
+	User string
 }
 
 func addCrashReference(c context.Context, crashID int64, bugKey *db.Key, ref CrashReference) error {

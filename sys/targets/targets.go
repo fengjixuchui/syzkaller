@@ -4,6 +4,7 @@
 package targets
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -38,6 +39,7 @@ type Target struct {
 	NeedSyscallDefine  func(nr uint64) bool
 	HostEndian         binary.ByteOrder
 	SyscallTrampolines map[string]string
+	Addr2Line          func() (string, error)
 
 	init      *sync.Once
 	initOther *sync.Once
@@ -121,7 +123,6 @@ type Timeouts struct {
 }
 
 const (
-	Akaros  = "akaros"
 	FreeBSD = "freebsd"
 	Darwin  = "darwin"
 	Fuchsia = "fuchsia"
@@ -141,6 +142,7 @@ const (
 	S390x               = "s390x"
 	RiscV64             = "riscv64"
 	TestArch64          = "64"
+	TestArch64Fuzz      = "64_fuzz"
 	TestArch64Fork      = "64_fork"
 	TestArch32Shmem     = "32_shmem"
 	TestArch32ForkShmem = "32_fork_shmem"
@@ -175,8 +177,13 @@ var List = map[string]map[string]*Target{
 		TestArch64: {
 			PtrSize:  8,
 			PageSize: 4 << 10,
-			// Compile with -no-pie due to issues with ASan + ASLR on ppc64le.
-			CFlags: []string{"-fsanitize=address", "-no-pie"},
+			CFlags: []string{
+				"-fsanitize=address",
+				// Compile with -no-pie due to issues with ASan + ASLR on ppc64le.
+				"-no-pie",
+				// Otherwise it conflicts with -fsanitize-coverage=trace-pc.
+				"-fno-exceptions",
+			},
 			osCommon: osCommon{
 				SyscallNumbers:         true,
 				SyscallPrefix:          "SYS_",
@@ -184,11 +191,28 @@ var List = map[string]map[string]*Target{
 				ExecutorUsesForkServer: false,
 			},
 		},
+		TestArch64Fuzz: {
+			PtrSize:  8,
+			PageSize: 8 << 10,
+			// -fsanitize=address causes SIGSEGV.
+			CFlags: []string{"-no-pie"},
+			osCommon: osCommon{
+				SyscallNumbers:         true,
+				SyscallPrefix:          "SYS_",
+				ExecutorUsesShmem:      true,
+				ExecutorUsesForkServer: true,
+			},
+		},
 		TestArch64Fork: {
 			PtrSize:  8,
 			PageSize: 8 << 10,
-			// Compile with -no-pie due to issues with ASan + ASLR on ppc64le.
-			CFlags: []string{"-fsanitize=address", "-no-pie"},
+			CFlags: []string{
+				"-fsanitize=address",
+				// Compile with -no-pie due to issues with ASan + ASLR on ppc64le.
+				"-no-pie",
+				// Otherwise it conflicts with -fsanitize-coverage=trace-pc.
+				"-fno-exceptions",
+			},
 			osCommon: osCommon{
 				SyscallNumbers:         true,
 				SyscallPrefix:          "SYS_",
@@ -454,19 +478,6 @@ var List = map[string]map[string]*Target{
 			LittleEndian: true,
 		},
 	},
-	Akaros: {
-		AMD64: {
-			PtrSize:           8,
-			PageSize:          4 << 10,
-			LittleEndian:      true,
-			KernelHeaderArch:  "x86",
-			NeedSyscallDefine: dontNeedSyscallDefine,
-			CCompiler:         sourceDirVar + "/toolchain/x86_64-ucb-akaros-gcc/bin/x86_64-ucb-akaros-g++",
-			CFlags: []string{
-				"-static",
-			},
-		},
-	},
 	Trusty: {
 		ARM: {
 			PtrSize:           4,
@@ -490,6 +501,7 @@ var oses = map[string]osCommon{
 			"syz_io_uring_setup":  {"io_uring_setup"},
 			"syz_clone3":          {"clone3", "exit"},
 			"syz_clone":           {"clone", "exit"},
+			"syz_pidfd_open":      {"pidfd_open"},
 		},
 		cflags: []string{"-static-pie"},
 	},
@@ -562,15 +574,6 @@ var oses = map[string]osCommon{
 		ExecutorUsesForkServer: false,
 		ExeExtension:           ".exe",
 		KernelObject:           "vmlinux",
-	},
-	Akaros: {
-		BuildOS:                Linux,
-		SyscallNumbers:         true,
-		SyscallPrefix:          "SYS_",
-		ExecutorUsesShmem:      false,
-		ExecutorUsesForkServer: true,
-		HostFuzzer:             true,
-		KernelObject:           "akaros-kernel-64b",
 	},
 	Trusty: {
 		SyscallNumbers:   true,
@@ -669,6 +672,9 @@ func init() {
 				target.CFlags[i] = strings.Replace(target.CFlags[i], "-m32", "-m31", -1)
 			}
 		}
+		if runtime.GOOS == OpenBSD {
+			target.BrokenCompiler = "can't build TestOS on OpenBSD due to missing syscall function."
+		}
 		target.BuildOS = goos
 	}
 }
@@ -748,6 +754,52 @@ func initTarget(target *Target, OS, arch string) {
 		target.ExecutorUsesForkServer = false
 		target.HostFuzzer = true
 	}
+	target.initAddr2Line()
+}
+
+func (target *Target) initAddr2Line() {
+	// Initialize addr2line lazily since lots of tests don't need it,
+	// but we invoke a number of external binaries during addr2line detection.
+	var (
+		init sync.Once
+		bin  string
+		err  error
+	)
+	target.Addr2Line = func() (string, error) {
+		init.Do(func() { bin, err = target.findAddr2Line() })
+		return bin, err
+	}
+}
+
+func (target *Target) findAddr2Line() (string, error) {
+	// Try llvm-addr2line first as it's significantly faster on large binaries.
+	// But it's unclear if it works for darwin binaries.
+	if target.OS != Darwin {
+		if path, err := exec.LookPath("llvm-addr2line"); err == nil {
+			return path, nil
+		}
+	}
+	bin := "addr2line"
+	if target.Triple != "" {
+		bin = target.Triple + "-" + bin
+	}
+	if target.OS != Darwin || target.Arch != AMD64 {
+		return bin, nil
+	}
+	// A special check for darwin kernel to produce a more useful error.
+	cmd := exec.Command(bin, "--help")
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("addr2line execution failed: %w", err)
+	}
+	if !bytes.Contains(out, []byte("supported targets:")) {
+		return "", fmt.Errorf("addr2line output didn't contain supported targets")
+	}
+	if !bytes.Contains(out, []byte("mach-o-x86-64")) {
+		return "", fmt.Errorf("addr2line was built without mach-o-x86-64 support")
+	}
+	return bin, nil
 }
 
 func (target *Target) Timeouts(slowdown int) Timeouts {

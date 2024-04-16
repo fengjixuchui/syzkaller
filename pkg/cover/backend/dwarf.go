@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -24,51 +25,59 @@ import (
 )
 
 type dwarfParams struct {
-	target      *targets.Target
-	objDir      string
-	srcDir      string
-	buildDir    string
-	moduleObj   []string
-	hostModules []host.KernelModule
-	// Kernel coverage PCs in the [pcFixUpStart,pcFixUpEnd) range are offsetted by pcFixUpOffset.
-	pcFixUpStart          uint64
-	pcFixUpEnd            uint64
-	pcFixUpOffset         uint64
+	target                *targets.Target
+	objDir                string
+	srcDir                string
+	buildDir              string
+	splitBuildDelimiters  []string
+	moduleObj             []string
+	hostModules           []host.KernelModule
 	readSymbols           func(*Module, *symbolInfo) ([]*Symbol, error)
 	readTextData          func(*Module) ([]byte, error)
 	readModuleCoverPoints func(*targets.Target, *Module, *symbolInfo) ([2][]uint64, error)
 	readTextRanges        func(*Module) ([]pcRange, []*CompileUnit, error)
+	getCompilerVersion    func(string) string
 }
 
 type Arch struct {
+	scanSize      int
 	callLen       int
 	relaOffset    uint64
-	opcodeOffset  int
-	opcodes       [2]byte
 	callRelocType uint64
-	target        func(arch *Arch, insn []byte, pc uint64, opcode byte) uint64
+	isCallInsn    func(arch *Arch, insn []byte) bool
+	callTarget    func(arch *Arch, insn []byte, pc uint64) uint64
 }
 
 var arches = map[string]Arch{
 	targets.AMD64: {
+		scanSize:      1,
 		callLen:       5,
 		relaOffset:    1,
-		opcodes:       [2]byte{0xe8, 0xe8},
 		callRelocType: uint64(elf.R_X86_64_PLT32),
-		target: func(arch *Arch, insn []byte, pc uint64, opcode byte) uint64 {
+		isCallInsn: func(arch *Arch, insn []byte) bool {
+			return insn[0] == 0xe8
+		},
+		callTarget: func(arch *Arch, insn []byte, pc uint64) uint64 {
 			off := uint64(int64(int32(binary.LittleEndian.Uint32(insn[1:]))))
 			return pc + off + uint64(arch.callLen)
 		},
 	},
 	targets.ARM64: {
+		scanSize:      4,
 		callLen:       4,
-		opcodeOffset:  3,
-		opcodes:       [2]byte{0x94, 0x97},
 		callRelocType: uint64(elf.R_AARCH64_CALL26),
-		target: func(arch *Arch, insn []byte, pc uint64, opcode byte) uint64 {
-			off := uint64(binary.LittleEndian.Uint32(insn)) & ((1 << 24) - 1)
-			if opcode == arch.opcodes[1] {
-				off |= 0xffffffffff000000
+		isCallInsn: func(arch *Arch, insn []byte) bool {
+			const mask = uint32(0xfc000000)
+			const opc = uint32(0x94000000)
+			return binary.LittleEndian.Uint32(insn)&mask == opc
+		},
+		callTarget: func(arch *Arch, insn []byte, pc uint64) uint64 {
+			off26 := binary.LittleEndian.Uint32(insn) & 0x3ffffff
+			sign := off26 >> 25
+			off := uint64(off26)
+			// Sign-extend the 26-bit offset stored in the instruction.
+			if sign == 1 {
+				off |= 0xfffffffffc000000
 			}
 			return pc + 4*off
 		},
@@ -90,11 +99,49 @@ func makeDWARF(params *dwarfParams) (impl *Impl, err error) {
 	impl, err = makeDWARFUnsafe(params)
 	return
 }
+
+type Result struct {
+	CoverPoints [2][]uint64
+	Symbols     []*Symbol
+}
+
+func processModule(params *dwarfParams, module *Module, info *symbolInfo,
+	target *targets.Target) (*Result, error) {
+	symbols, err := params.readSymbols(module, info)
+	if err != nil {
+		return nil, err
+	}
+
+	var data []byte
+	var coverPoints [2][]uint64
+	if target.Arch != targets.AMD64 && target.Arch != targets.ARM64 {
+		coverPoints, err = objdump(target, module)
+	} else if module.Name == "" {
+		data, err = params.readTextData(module)
+		if err != nil {
+			return nil, err
+		}
+		coverPoints, err = readCoverPoints(target, info, data)
+	} else {
+		coverPoints, err = params.readModuleCoverPoints(target, module, info)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	result := &Result{
+		Symbols:     symbols,
+		CoverPoints: coverPoints,
+	}
+	return result, nil
+}
+
 func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
 	target := params.target
 	objDir := params.objDir
 	srcDir := params.srcDir
 	buildDir := params.buildDir
+	splitBuildDelimiters := params.splitBuildDelimiters
 	modules, err := discoverModules(target, objDir, params.moduleObj, params.hostModules)
 	if err != nil {
 		return nil, err
@@ -107,40 +154,28 @@ func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
 	var allRanges []pcRange
 	var allUnits []*CompileUnit
 	var pcBase uint64
+	preciseCoverage := true
 	for _, module := range modules {
 		errc := make(chan error, 1)
 		go func() {
 			info := &symbolInfo{
+				tracePC:     make(map[uint64]bool),
 				traceCmp:    make(map[uint64]bool),
 				tracePCIdx:  make(map[int]bool),
 				traceCmpIdx: make(map[int]bool),
 			}
-			symbols, err := params.readSymbols(module, info)
+			result, err := processModule(params, module, info, target)
 			if err != nil {
 				errc <- err
 				return
 			}
-			allSymbols = append(allSymbols, symbols...)
+			allSymbols = append(allSymbols, result.Symbols...)
 			if module.Name == "" {
 				pcBase = info.textAddr
 			}
-			var data []byte
-			var coverPoints [2][]uint64
-			if target.Arch != targets.AMD64 && target.Arch != targets.ARM64 {
-				coverPoints, err = objdump(target, module)
-			} else if module.Name == "" {
-				data, err = params.readTextData(module)
-				if err != nil {
-					errc <- err
-					return
-				}
-				coverPoints, err = readCoverPoints(target, info, data)
-			} else {
-				coverPoints, err = params.readModuleCoverPoints(target, module, info)
-			}
-			allCoverPoints[0] = append(allCoverPoints[0], coverPoints[0]...)
-			allCoverPoints[1] = append(allCoverPoints[1], coverPoints[1]...)
-			if err == nil && module.Name == "" && len(coverPoints[0]) == 0 {
+			allCoverPoints[0] = append(allCoverPoints[0], result.CoverPoints[0]...)
+			allCoverPoints[1] = append(allCoverPoints[1], result.CoverPoints[1]...)
+			if module.Name == "" && len(result.CoverPoints[0]) == 0 {
 				err = fmt.Errorf("%v doesn't contain coverage callbacks (set CONFIG_KCOV=y on linux)", module.Path)
 			}
 			errc <- err
@@ -154,6 +189,9 @@ func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
 		}
 		allRanges = append(allRanges, ranges...)
 		allUnits = append(allUnits, units...)
+		if isKcovBrokenInCompiler(params.getCompilerVersion(module.Path)) {
+			preciseCoverage = false
+		}
 	}
 
 	sort.Slice(allSymbols, func(i, j int) bool {
@@ -175,7 +213,7 @@ func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
 			continue // drop the unit
 		}
 		// TODO: objDir won't work for out-of-tree modules.
-		unit.Name, unit.Path = cleanPath(unit.Name, objDir, srcDir, buildDir)
+		unit.Name, unit.Path = cleanPath(unit.Name, objDir, srcDir, buildDir, splitBuildDelimiters)
 		allUnits[nunit] = unit
 		nunit++
 	}
@@ -187,24 +225,23 @@ func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
 		// On FreeBSD .text address in ELF is 0, but .text is actually mapped at 0xffffffff.
 		pcBase = ^uint64(0)
 	}
+	var interner symbolizer.Interner
 	impl := &Impl{
 		Units:   allUnits,
 		Symbols: allSymbols,
 		Symbolize: func(pcs map[*Module][]uint64) ([]Frame, error) {
-			return symbolize(target, objDir, srcDir, buildDir, pcs)
+			return symbolize(target, &interner, objDir, srcDir, buildDir, splitBuildDelimiters, pcs)
 		},
-		RestorePC: makeRestorePC(params, pcBase),
+		RestorePC:       makeRestorePC(params, pcBase),
+		CallbackPoints:  allCoverPoints[0],
+		PreciseCoverage: preciseCoverage,
 	}
 	return impl, nil
 }
 
 func makeRestorePC(params *dwarfParams, pcBase uint64) func(pc uint32) uint64 {
 	return func(pcLow uint32) uint64 {
-		pc := PreviousInstructionPC(params.target, RestorePC(pcLow, uint32(pcBase>>32)))
-		if pc >= params.pcFixUpStart && pc < params.pcFixUpEnd {
-			pc -= params.pcFixUpOffset
-		}
-		return pc
+		return PreviousInstructionPC(params.target, RestorePC(pcLow, uint32(pcBase>>32)))
 	}
 }
 
@@ -268,9 +305,32 @@ func buildSymbols(symbols []*Symbol, ranges []pcRange, coverPoints [2][]uint64) 
 	return symbols
 }
 
+// Regexps to parse compiler version string in isKcovBrokenInCompiler.
+// Some targets (e.g. NetBSD) use g++ instead of gcc.
+var gccRE = regexp.MustCompile(`gcc|GCC|g\+\+`)
+var gccVersionRE = regexp.MustCompile(`(gcc|GCC|g\+\+).* ([0-9]{1,2})\.[0-9]+\.[0-9]+`)
+
+// GCC < 14 incorrectly tail-calls kcov callbacks, which does not let syzkaller
+// verify that collected coverage points have matching callbacks.
+// See https://github.com/google/syzkaller/issues/4447 for more information.
+func isKcovBrokenInCompiler(versionStr string) bool {
+	if !gccRE.MatchString(versionStr) {
+		return false
+	}
+	groups := gccVersionRE.FindStringSubmatch(versionStr)
+	if len(groups) > 0 {
+		version, err := strconv.Atoi(groups[2])
+		if err == nil {
+			return version < 14
+		}
+	}
+	return true
+}
+
 type symbolInfo struct {
-	textAddr    uint64
-	tracePC     uint64
+	textAddr uint64
+	// Set of addresses that correspond to __sanitizer_cov_trace_pc or its trampolines.
+	tracePC     map[uint64]bool
 	traceCmp    map[uint64]bool
 	tracePCIdx  map[int]bool
 	traceCmpIdx map[int]bool
@@ -330,8 +390,8 @@ func readTextRanges(debugInfo *dwarf.Data, module *Module, pcFix pcFixFn) (
 	return ranges, units, nil
 }
 
-func symbolizeModule(target *targets.Target, objDir, srcDir, buildDir string,
-	mod *Module, pcs []uint64) ([]Frame, error) {
+func symbolizeModule(target *targets.Target, interner *symbolizer.Interner, objDir, srcDir, buildDir string,
+	splitBuildDelimiters []string, mod *Module, pcs []uint64) ([]Frame, error) {
 	procs := runtime.GOMAXPROCS(0) / 2
 	if need := len(pcs) / 1000; procs > need {
 		procs = need
@@ -388,12 +448,14 @@ func symbolizeModule(target *targets.Target, objDir, srcDir, buildDir string,
 			err0 = res.err
 		}
 		for _, frame := range res.frames {
-			name, path := cleanPath(frame.File, objDir, srcDir, buildDir)
+			name, path := cleanPath(frame.File, objDir, srcDir, buildDir, splitBuildDelimiters)
 			frames = append(frames, Frame{
-				Module: mod,
-				PC:     frame.PC + mod.Addr,
-				Name:   name,
-				Path:   path,
+				Module:   mod,
+				PC:       frame.PC + mod.Addr,
+				Name:     interner.Do(name),
+				FuncName: frame.Func,
+				Path:     interner.Do(path),
+				Inline:   frame.Inline,
 				Range: Range{
 					StartLine: frame.Line,
 					StartCol:  0,
@@ -409,11 +471,11 @@ func symbolizeModule(target *targets.Target, objDir, srcDir, buildDir string,
 	return frames, nil
 }
 
-func symbolize(target *targets.Target, objDir, srcDir, buildDir string,
-	pcs map[*Module][]uint64) ([]Frame, error) {
+func symbolize(target *targets.Target, interner *symbolizer.Interner, objDir, srcDir, buildDir string,
+	splitBuildDelimiters []string, pcs map[*Module][]uint64) ([]Frame, error) {
 	var frames []Frame
 	for mod, pcs1 := range pcs {
-		frames1, err := symbolizeModule(target, objDir, srcDir, buildDir, mod, pcs1)
+		frames1, err := symbolizeModule(target, interner, objDir, srcDir, buildDir, splitBuildDelimiters, mod, pcs1)
 		if err != nil {
 			return nil, err
 		}
@@ -422,41 +484,95 @@ func symbolize(target *targets.Target, objDir, srcDir, buildDir string,
 	return frames, nil
 }
 
+// nextCallTarget finds the next call instruction in data[] starting at *pos and returns that
+// instruction's target and pc.
+func nextCallTarget(arch *Arch, textAddr uint64, data []byte, pos *int) (uint64, uint64) {
+	for *pos < len(data) {
+		i := *pos
+		if i+arch.callLen > len(data) {
+			break
+		}
+		*pos += arch.scanSize
+		insn := data[i : i+arch.callLen]
+		if !arch.isCallInsn(arch, insn) {
+			continue
+		}
+		pc := textAddr + uint64(i)
+		callTarget := arch.callTarget(arch, insn, pc)
+		*pos = i + arch.scanSize
+		return callTarget, pc
+	}
+	return 0, 0
+}
+
 // readCoverPoints finds all coverage points (calls of __sanitizer_cov_trace_*) in the object file.
 // Currently it is [amd64|arm64]-specific: looks for opcode and correct offset.
 // Running objdump on the whole object file is too slow.
 func readCoverPoints(target *targets.Target, info *symbolInfo, data []byte) ([2][]uint64, error) {
 	var pcs [2][]uint64
-	if info.tracePC == 0 {
+	if len(info.tracePC) == 0 {
 		return pcs, fmt.Errorf("no __sanitizer_cov_trace_pc symbol in the object file")
 	}
 
-	// Loop that's checking each instruction for the current architectures call
-	// opcode. When found, it compares the call target address with those of the
-	// __sanitizer_cov_trace_* functions we previously collected. When found,
-	// we collect the pc as a coverage point.
-	arch := arches[target.Arch]
-	for i, opcode := range data {
-		if opcode != arch.opcodes[0] && opcode != arch.opcodes[1] {
-			continue
+	i := 0
+	for {
+		arch := arches[target.Arch]
+		callTarget, pc := nextCallTarget(&arch, info.textAddr, data, &i)
+		if callTarget == 0 {
+			break
 		}
-		i -= arch.opcodeOffset
-		if i < 0 || i+arch.callLen > len(data) {
-			continue
-		}
-		pc := info.textAddr + uint64(i)
-		target := arch.target(&arch, data[i:], pc, opcode)
-		if target == info.tracePC {
+		if info.tracePC[callTarget] {
 			pcs[0] = append(pcs[0], pc)
-		} else if info.traceCmp[target] {
+		} else if info.traceCmp[callTarget] {
 			pcs[1] = append(pcs[1], pc)
 		}
 	}
 	return pcs, nil
 }
 
-func cleanPath(path, objDir, srcDir, buildDir string) (string, string) {
+// Source files for Android may be split between two subdirectories: the common AOSP kernel
+// and the device-specific drivers: https://source.android.com/docs/setup/build/building-pixel-kernels.
+// Android build system references these subdirectories in various ways, which often results in
+// paths to non-existent files being recorded in the debug info.
+//
+// cleanPathAndroid() assumes that the subdirectories reside in `srcDir`, with their names being listed in
+// `delimiters`.
+// If one of the `delimiters` occurs in the `path`, it is stripped together with the path prefix, and the
+// remaining file path is appended to `srcDir + delimiter`.
+// If none of the `delimiters` occur in the `path`, `path` is treated as a relative path that needs to be
+// looked up in `srcDir + delimiters[i]`.
+func cleanPathAndroid(path, srcDir string, delimiters []string, existFn func(string) bool) (string, string) {
+	if len(delimiters) == 0 {
+		return "", ""
+	}
+	reStr := "(" + strings.Join(delimiters, "|") + ")(.*)"
+	re := regexp.MustCompile(reStr)
+	match := re.FindStringSubmatch(path)
+	if match != nil {
+		delimiter := match[1]
+		filename := match[2]
+		path := filepath.Clean(srcDir + delimiter + filename)
+		return filename, path
+	}
+	// None of the delimiters found in `path`: it is probably a relative path to the source file.
+	// Try to look it up in every subdirectory of srcDir.
+	for _, delimiter := range delimiters {
+		absPath := filepath.Clean(srcDir + delimiter + path)
+		if existFn(absPath) {
+			return path, absPath
+		}
+	}
+	return "", ""
+}
+
+func cleanPath(path, objDir, srcDir, buildDir string, splitBuildDelimiters []string) (string, string) {
 	filename := ""
+
+	path = filepath.Clean(path)
+	aname, apath := cleanPathAndroid(path, srcDir, splitBuildDelimiters, osutil.IsExist)
+	if aname != "" {
+		return aname, apath
+	}
 	absPath := osutil.Abs(path)
 	switch {
 	case strings.HasPrefix(absPath, objDir):
@@ -555,7 +671,11 @@ func archCallInsn(target *targets.Target) ([][]byte, [][]byte) {
 		return [][]byte{[]byte("\tcall ")}, callName
 	case targets.ARM64:
 		// ffff0000080d9cc0:       bl      ffff00000820f478 <__sanitizer_cov_trace_pc>
-		return [][]byte{[]byte("\tbl\t")}, callName
+		return [][]byte{[]byte("\tbl ")}, [][]byte{
+			[]byte("<__sanitizer_cov_trace_pc>"),
+			[]byte("<____sanitizer_cov_trace_pc_veneer>"),
+		}
+
 	case targets.ARM:
 		// 8010252c:       bl      801c3280 <__sanitizer_cov_trace_pc>
 		return [][]byte{[]byte("\tbl\t")}, callName

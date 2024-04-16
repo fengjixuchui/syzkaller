@@ -16,14 +16,16 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 )
 
-func discoverModules(target *targets.Target, objDir string, moduleObj []string, hostModules []host.KernelModule) (
+func discoverModules(target *targets.Target, objDir string, moduleObj []string,
+	hostModules []host.KernelModule) (
 	[]*Module, error) {
 	modules := []*Module{
 		// A dummy module representing the kernel itself.
 		{Path: filepath.Join(objDir, target.KernelObject)},
 	}
 	if target.OS == targets.Linux {
-		modules1, err := discoverModulesLinux(append([]string{objDir}, moduleObj...), hostModules)
+		modules1, err := discoverModulesLinux(append([]string{objDir}, moduleObj...),
+			hostModules)
 		if err != nil {
 			return nil, err
 		}
@@ -34,7 +36,8 @@ func discoverModules(target *targets.Target, objDir string, moduleObj []string, 
 	return modules, nil
 }
 
-func discoverModulesLinux(dirs []string, hostModules []host.KernelModule) ([]*Module, error) {
+func discoverModulesLinux(dirs []string, hostModules []host.KernelModule,
+) ([]*Module, error) {
 	paths, err := locateModules(dirs)
 	if err != nil {
 		return nil, err

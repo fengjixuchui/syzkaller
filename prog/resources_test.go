@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/syzkaller/pkg/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestResourceCtors(t *testing.T) {
@@ -175,6 +176,9 @@ func testCreateResource(t *testing.T, target *Target, calls map[*Syscall]bool, r
 	r.inGenerateResource = true
 	ct := target.BuildChoiceTable(nil, calls)
 	for call := range calls {
+		if call.Attrs.Disabled {
+			continue
+		}
 		t.Logf("testing call %v", call.Name)
 		ForeachCallType(call, func(typ Type, ctx *TypeCtx) {
 			if res, ok := typ.(*ResourceType); ok && ctx.Dir != DirOut {
@@ -189,4 +193,24 @@ func testCreateResource(t *testing.T, target *Target, calls map[*Syscall]bool, r
 			}
 		})
 	}
+}
+
+func TestPreferPreciseResources(t *testing.T) {
+	target, rs, _ := initRandomTargetTest(t, "test", "64")
+	r := newRand(target, rs)
+	counts := map[string]int{}
+	for i := 0; i < 2000; i++ {
+		s := newState(target, target.DefaultChoiceTable(), nil)
+		calls := r.generateParticularCall(s,
+			target.SyscallMap["test$consume_subtype_of_common"])
+		for _, call := range calls {
+			if call.Meta.Name == "test$consume_subtype_of_common" {
+				continue
+			}
+			counts[call.Meta.Name]++
+		}
+	}
+	assert.Greater(t, counts["test$produce_common"], 70)
+	assert.Greater(t, counts["test$also_produce_common"], 70)
+	assert.Greater(t, counts["test$produce_subtype_of_common"], 1000)
 }

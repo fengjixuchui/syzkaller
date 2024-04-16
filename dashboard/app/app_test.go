@@ -103,7 +103,7 @@ var testConfig = &GlobalConfig{
 			Reporting: []Reporting{
 				{
 					Name:       "reporting1",
-					DailyLimit: 3,
+					DailyLimit: 5,
 					Embargo:    14 * 24 * time.Hour,
 					Filter:     skipWithRepro,
 					Config: &TestConfig{
@@ -112,7 +112,7 @@ var testConfig = &GlobalConfig{
 				},
 				{
 					Name:       "reporting2",
-					DailyLimit: 3,
+					DailyLimit: 5,
 					Config: &TestConfig{
 						Index: 2,
 					},
@@ -276,6 +276,7 @@ var testConfig = &GlobalConfig{
 			},
 			FindBugOriginTrees: true,
 			CacheUIPages:       true,
+			RetestRepros:       true,
 		},
 		"access-public-email": {
 			AccessLevel: AccessPublic,
@@ -481,11 +482,12 @@ var testConfig = &GlobalConfig{
 			},
 			Reporting: []Reporting{
 				{
-					AccessLevel: AccessUser,
-					Name:        "non-public",
+					// Let's emulate public moderation.
+					AccessLevel: AccessPublic,
+					Name:        "moderation",
 					DailyLimit:  1000,
 					Filter: func(bug *Bug) FilterResult {
-						if strings.Contains(bug.Title, "keep private") {
+						if strings.Contains(bug.Title, "keep in moderation") {
 							return FilterReport
 						}
 						return FilterSkip
@@ -565,7 +567,8 @@ var testConfig = &GlobalConfig{
 					},
 				},
 			},
-			FindBugOriginTrees: true,
+			FindBugOriginTrees:     true,
+			RetestMissingBackports: true,
 		},
 	},
 }

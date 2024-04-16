@@ -67,6 +67,11 @@ type Infoer interface {
 	Info() ([]byte, error)
 }
 
+// PprofPortProvider is used when the instance wants to define a custom pprof port.
+type PprofPortProvider interface {
+	PprofPort() int
+}
+
 // Env contains global constant parameters for a pool of VMs.
 type Env struct {
 	// Unique name
@@ -124,16 +129,18 @@ func (err InfraError) InfraError() (string, []byte) {
 }
 
 // Register registers a new VM type within the package.
-func Register(typ string, ctor ctorFunc, allowsOvercommit bool) {
+func Register(typ string, ctor ctorFunc, allowsOvercommit, netCompression bool) {
 	Types[typ] = Type{
-		Ctor:       ctor,
-		Overcommit: allowsOvercommit,
+		Ctor:           ctor,
+		Overcommit:     allowsOvercommit,
+		NetCompression: netCompression,
 	}
 }
 
 type Type struct {
-	Ctor       ctorFunc
-	Overcommit bool
+	Ctor           ctorFunc
+	Overcommit     bool
+	NetCompression bool
 }
 
 type ctorFunc func(env *Env) (Pool, error)
@@ -185,6 +192,9 @@ func Multiplex(cmd *exec.Cmd, merger *OutputMerger, console io.Closer, timeout t
 	}()
 	return merger.Output, errc, nil
 }
+
+// On VMs, pprof will be listening to this port.
+const PprofPort = 6060
 
 func RandomPort() int {
 	n, err := rand.Int(rand.Reader, big.NewInt(64<<10-1<<10))

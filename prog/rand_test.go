@@ -63,8 +63,13 @@ func generateProg(t *testing.T, target *Target, rs rand.Source, ct *ChoiceTable,
 			comps.AddComp(v, v+1)
 			comps.AddComp(v, v+10)
 		}
-		p.MutateWithHints(i, comps, func(p1 *Prog) {
+		// If unbounded, this code may take O(N^2) time to complete.
+		// Since large programs are not uncommon, let's limit the number of hint iterations.
+		limit := 100
+		p.MutateWithHints(i, comps, func(p1 *Prog) bool {
 			p = p1.Clone()
+			limit--
+			return limit > 0
 		})
 	}
 	for _, crash := range []bool{false, true} {

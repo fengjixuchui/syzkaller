@@ -21,24 +21,34 @@ func (p *Prog) debugValidate() {
 	}
 }
 
+func (p *Prog) validate() error {
+	return p.validateWithOpts(validationOptions{})
+}
+
 type validCtx struct {
 	target *Target
+	opts   validationOptions
 	args   map[Arg]bool
 	uses   map[Arg]Arg
 }
 
-func (p *Prog) validate() error {
+type validationOptions struct {
+	ignoreTransient bool
+}
+
+func (p *Prog) validateWithOpts(opts validationOptions) error {
 	ctx := &validCtx{
 		target: p.Target,
+		opts:   opts,
 		args:   make(map[Arg]bool),
 		uses:   make(map[Arg]Arg),
 	}
-	for _, c := range p.Calls {
+	for i, c := range p.Calls {
 		if c.Meta == nil {
 			return fmt.Errorf("call does not have meta information")
 		}
 		if err := ctx.validateCall(c); err != nil {
-			return fmt.Errorf("call %v: %w", c.Meta.Name, err)
+			return fmt.Errorf("call #%d %v: %w", i, c.Meta.Name, err)
 		}
 	}
 	for u, orig := range ctx.uses {
@@ -53,6 +63,9 @@ func (ctx *validCtx) validateCall(c *Call) error {
 	if c.Meta.Attrs.Disabled {
 		return fmt.Errorf("use of a disabled call")
 	}
+	if c.Props.Rerun > 0 && c.Props.FailNth > 0 {
+		return fmt.Errorf("rerun > 0 && fail_nth > 0")
+	}
 	if len(c.Args) != len(c.Meta.Args) {
 		return fmt.Errorf("wrong number of arguments, want %v, got %v",
 			len(c.Meta.Args), len(c.Args))
@@ -61,6 +74,9 @@ func (ctx *validCtx) validateCall(c *Call) error {
 		if err := ctx.validateArg(arg, c.Meta.Args[i].Type, DirIn); err != nil {
 			return err
 		}
+	}
+	if err := c.checkConditions(ctx.target, ctx.opts.ignoreTransient); err != nil {
+		return err
 	}
 	return ctx.validateRet(c)
 }

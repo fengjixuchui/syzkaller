@@ -257,9 +257,13 @@ func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, err
 	// This validation is done even in non-debug mode because deserialization
 	// procedure does not catch all bugs (e.g. mismatched types).
 	// And we can receive bad programs from corpus and hub.
-	if err := prog.validate(); err != nil {
+	if err := prog.validateWithOpts(validationOptions{
+		// Don't validate auto-set conditional fields. We'll patch them later.
+		ignoreTransient: true,
+	}); err != nil {
 		return nil, err
 	}
+	p.fixupConditionals(prog)
 	if p.autos != nil {
 		p.fixupAutos(prog)
 	}
@@ -457,7 +461,7 @@ func (p *parser) parseArgImpl(typ Type, dir Dir) (Arg, error) {
 		return p.parseAuto(typ, dir)
 	default:
 		return nil, fmt.Errorf("failed to parse argument at '%c' (line #%v/%v: %v)",
-			p.Char(), p.l, p.i, p.s)
+			p.Char(), p.l, p.i, highlightError(p.s, p.i))
 	}
 }
 
@@ -489,9 +493,20 @@ func (p *parser) parseArgInt(typ Type, dir Dir) (Arg, error) {
 }
 
 func (p *parser) parseAuto(typ Type, dir Dir) (Arg, error) {
-	switch typ.(type) {
+	switch t1 := typ.(type) {
 	case *ConstType, *LenType, *CsumType:
 		return p.auto(MakeConstArg(typ, dir, 0)), nil
+	case *StructType:
+		var inner []Arg
+		for len(inner) < len(t1.Fields) {
+			field := t1.Fields[len(inner)]
+			innerArg, err := p.parseAuto(field.Type, dir)
+			if err != nil {
+				return nil, err
+			}
+			inner = append(inner, innerArg)
+		}
+		return MakeGroupArg(typ, dir, inner), nil
 	default:
 		return nil, fmt.Errorf("wrong type %T for AUTO", typ)
 	}
@@ -532,9 +547,10 @@ func (p *parser) parseArgRes(typ Type, dir Dir) (Arg, error) {
 func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 	var elem Type
 	elemDir := DirInOut
+	squashableElem := false
 	switch t1 := typ.(type) {
 	case *PtrType:
-		elem, elemDir = t1.Elem, t1.ElemDir
+		elem, elemDir, squashableElem = t1.Elem, t1.ElemDir, t1.SquashableElem
 	case *VmaType:
 	default:
 		p.eatExcessive(true, "wrong addr arg %T", typ)
@@ -562,13 +578,15 @@ func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 	var inner Arg
 	if p.Char() == '=' {
 		p.Parse('=')
-		if p.Char() == 'A' {
+		if p.HasNext("ANY") {
 			p.Parse('A')
 			p.Parse('N')
 			p.Parse('Y')
 			p.Parse('=')
-			anyPtr := p.target.getAnyPtrType(typ.Size())
-			typ, elem, elemDir = anyPtr, anyPtr.Elem, anyPtr.ElemDir
+			if squashableElem {
+				anyPtr := p.target.getAnyPtrType(typ.Size())
+				typ, elem, elemDir = anyPtr, anyPtr.Elem, anyPtr.ElemDir
+			}
 		}
 		var err error
 		inner, err = p.parseArg(elem, elemDir)
@@ -736,6 +754,7 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 	var (
 		optType Type
 		optDir  Dir
+		options []string
 	)
 	index := -1
 	for i, field := range t1.Fields {
@@ -743,9 +762,11 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 			optType, index, optDir = field.Type, i, field.Dir(dir)
 			break
 		}
+		options = append(options, fmt.Sprintf("%q", field.Name))
 	}
 	if optType == nil {
-		p.eatExcessive(true, "wrong union option")
+		p.eatExcessive(true, "wrong option %q of union %q, available options are: %s",
+			name, typ.Name(), strings.Join(options, ", "))
 		return typ.DefaultArg(dir), nil
 	}
 	var opt Arg
@@ -1140,6 +1161,13 @@ func (p *parser) fixupAutos(prog *Prog) {
 	}
 }
 
+func (p *parser) fixupConditionals(prog *Prog) {
+	for _, c := range prog.Calls {
+		// Only overwrite transient union fields.
+		c.setDefaultConditions(p.target, true)
+	}
+}
+
 func (p *parser) Scan() bool {
 	if p.e != nil || len(p.data) == 0 {
 		return false
@@ -1178,6 +1206,21 @@ func (p *parser) Char() byte {
 		return 0
 	}
 	return p.s[p.i]
+}
+
+func (p *parser) HasNext(str string) bool {
+	if p.e != nil {
+		return false
+	}
+	if len(p.s) < p.i+len(str) {
+		return false
+	}
+	for i := 0; i < len(str); i++ {
+		if p.s[p.i+i] != str[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *parser) Parse(ch byte) {
@@ -1235,7 +1278,8 @@ func (p *parser) Ident() string {
 
 func (p *parser) failf(msg string, args ...interface{}) {
 	if p.e == nil {
-		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i, p.s)
+		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i,
+			highlightError(p.s, p.i))
 	}
 }
 
@@ -1284,4 +1328,8 @@ func CallSet(data []byte) (map[string]struct{}, int, error) {
 		return nil, 0, fmt.Errorf("program does not contain any calls")
 	}
 	return calls, ncalls, nil
+}
+
+func highlightError(s string, offset int) string {
+	return s[:offset] + "<<<!!ERROR!!>>>" + s[offset:]
 }

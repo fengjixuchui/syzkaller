@@ -25,7 +25,7 @@ import (
 )
 
 func init() {
-	vmimpl.Register("gvisor", ctor, true)
+	vmimpl.Register("gvisor", ctor, true, false)
 }
 
 type Config struct {
@@ -243,6 +243,14 @@ func (inst *instance) Info() ([]byte, error) {
 	return []byte(info), nil
 }
 
+func (inst *instance) PprofPort() int {
+	// Some of the gVisor instances use the host's network namespace, which
+	// results in conflicting bind operations on the same HTTP port.
+	// Until there's an actual need to debug gVisor VMs with pprof, let's
+	// just disable it.
+	return 0
+}
+
 func (inst *instance) runscCmd(add ...string) *exec.Cmd {
 	cmd := osutil.Command(inst.image, append(inst.args(), add...)...)
 	cmd.Env = []string{
@@ -421,29 +429,32 @@ const configTempl = `
 		"readonly": true
 	},
 	"linux": {
-	  "cgroupsPath": "%[3]v",
-	  "resources": {
-		  "cpu": {
-			"shares": 1024
-		  },
-		  "memory": {
-			"limit": %[4]d,
-			"reservation": %[4]d,
-			"disableOOMKiller": false
-		  }
-	  }
+		"cgroupsPath": "%[3]v",
+		"resources": {
+			"cpu": {
+				"shares": 1024
+			},
+			"memory": {
+				"limit": %[4]d,
+				"reservation": %[4]d,
+				"disableOOMKiller": false
+			}
+		},
+		"sysctl": {
+			"fs.nr_open": "1048576"
+		}
 	},
 	"process":{
-                "args": ["/init"],
-                "cwd": "/tmp",
-                "env": ["SYZ_GVISOR_PROXY=1"],
-                "capabilities": {
-                	"bounding": [%[2]v],
-                	"effective": [%[2]v],
-                	"inheritable": [%[2]v],
-                	"permitted": [%[2]v],
-                	"ambient": [%[2]v]
-                }
+		"args": ["/init"],
+		"cwd": "/tmp",
+		"env": ["SYZ_GVISOR_PROXY=1"],
+		"capabilities": {
+			"bounding": [%[2]v],
+			"effective": [%[2]v],
+			"inheritable": [%[2]v],
+			"permitted": [%[2]v],
+			"ambient": [%[2]v]
+		}
 	}
 }
 `

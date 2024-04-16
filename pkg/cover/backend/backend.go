@@ -11,11 +11,13 @@ import (
 )
 
 type Impl struct {
-	Units     []*CompileUnit
-	Symbols   []*Symbol
-	Frames    []Frame
-	Symbolize func(pcs map[*Module][]uint64) ([]Frame, error)
-	RestorePC func(pc uint32) uint64
+	Units           []*CompileUnit
+	Symbols         []*Symbol
+	Frames          []Frame
+	Symbolize       func(pcs map[*Module][]uint64) ([]Frame, error)
+	RestorePC       func(pc uint32) uint64
+	CallbackPoints  []uint64
+	PreciseCoverage bool
 }
 
 type Module struct {
@@ -47,10 +49,12 @@ type ObjectUnit struct {
 }
 
 type Frame struct {
-	Module *Module
-	PC     uint64
-	Name   string
-	Path   string
+	Module   *Module
+	PC       uint64
+	Name     string
+	FuncName string
+	Path     string
+	Inline   bool
 	Range
 }
 
@@ -63,7 +67,7 @@ type Range struct {
 
 const LineEnd = 1 << 30
 
-func Make(target *targets.Target, vm, objDir, srcDir, buildDir string,
+func Make(target *targets.Target, vm, objDir, srcDir, buildDir string, splitBuild bool,
 	moduleObj []string, modules []host.KernelModule) (*Impl, error) {
 	if objDir == "" {
 		return nil, fmt.Errorf("kernel obj directory is not specified")
@@ -74,5 +78,12 @@ func Make(target *targets.Target, vm, objDir, srcDir, buildDir string,
 	if vm == "gvisor" {
 		return makeGvisor(target, objDir, srcDir, buildDir, modules)
 	}
-	return makeELF(target, objDir, srcDir, buildDir, moduleObj, modules)
+	var delimiters []string
+	if splitBuild {
+		// Path prefixes used by Android Pixel kernels. See
+		// https://source.android.com/docs/setup/build/building-pixel-kernels for more
+		// details.
+		delimiters = []string{"/aosp/", "/private/"}
+	}
+	return makeELF(target, objDir, srcDir, buildDir, delimiters, moduleObj, modules)
 }

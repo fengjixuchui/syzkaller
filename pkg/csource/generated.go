@@ -80,14 +80,6 @@ static __thread int clone_ongoing;
 static __thread int skip_segv;
 static __thread jmp_buf segv_env;
 
-#if GOOS_akaros
-#include <parlib/parlib.h>
-static void recover(void)
-{
-	_longjmp(segv_env, 1);
-}
-#endif
-
 static void segv_handler(int sig, siginfo_t* info, void* ctx)
 {
 
@@ -106,13 +98,7 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx)
 #endif
 	if (skip && valid) {
 		debug("SIGSEGV on %p, skipping\n", (void*)addr);
-#if GOOS_akaros
-		struct user_context* uctx = (struct user_context*)ctx;
-		uctx->tf.hw_tf.tf_rip = (long)(void*)recover;
-		return;
-#else
 		_longjmp(segv_env, 1);
-#endif
 	}
 	debug("SIGSEGV on %p, exiting\n", (void*)addr);
 	doexit(sig);
@@ -212,7 +198,7 @@ static void use_temporary_dir(void)
 #endif
 #endif
 
-#if GOOS_akaros || GOOS_netbsd || GOOS_freebsd || GOOS_darwin || GOOS_openbsd || GOOS_test
+#if GOOS_netbsd || GOOS_freebsd || GOOS_darwin || GOOS_openbsd || GOOS_test
 #if (SYZ_EXECUTOR || SYZ_REPEAT) && SYZ_EXECUTOR_USES_FORK_SERVER && (SYZ_EXECUTOR || SYZ_USE_TMP_DIR)
 #include <dirent.h>
 #include <errno.h>
@@ -334,7 +320,7 @@ static void thread_start(void* (*fn)(void*), void* arg)
 #endif
 #endif
 
-#if GOOS_freebsd || GOOS_darwin || GOOS_netbsd || GOOS_openbsd || GOOS_akaros || GOOS_test
+#if GOOS_freebsd || GOOS_darwin || GOOS_netbsd || GOOS_openbsd || GOOS_test
 #if SYZ_EXECUTOR || SYZ_THREADED
 
 #include <pthread.h>
@@ -449,40 +435,7 @@ static uint16 csum_inet_digest(struct csum_inet* csum)
 }
 #endif
 
-#if GOOS_akaros
-
-#include <ros/syscall.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
-static void loop();
-static int do_sandbox_none(void)
-{
-	loop();
-	return 0;
-}
-#endif
-
-#if SYZ_EXECUTOR || SYZ_REPEAT
-static void execute_one();
-const char* program_name;
-
-void child()
-{
-#if SYZ_EXECUTOR || SYZ_HANDLE_SEGV
-	install_segv_handler();
-#endif
-#if SYZ_EXECUTOR
-	receive_execute();
-	close(kInPipeFd);
-#endif
-	execute_one();
-	doexit(0);
-}
-#endif
-
-#elif GOOS_freebsd || GOOS_darwin || GOOS_netbsd
+#if GOOS_freebsd || GOOS_darwin || GOOS_netbsd
 
 #include <unistd.h>
 
@@ -2909,6 +2862,11 @@ static void find_vf_interface(void)
 static int netlink_send_ext(struct nlmsg* nlmsg, int sock,
 			    uint16 reply_type, int* reply_len, bool dofail)
 {
+#if SYZ_EXECUTOR
+	if (in_execute_one && dofail) {
+		failmsg("invalid netlink_send_ext arguments", "dofail is true during syscall execution");
+	}
+#endif
 	if (nlmsg->pos > nlmsg->buf + sizeof(nlmsg->buf) || nlmsg->nesting)
 		fail("nlmsg overflow/bad nesting");
 	struct nlmsghdr* hdr = (struct nlmsghdr*)nlmsg->buf;
@@ -2963,8 +2921,7 @@ static int netlink_send_ext(struct nlmsg* nlmsg, int sock,
 	return -errno;
 }
 
-#if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154 || \
-    __NR_syz_80211_join_ibss || __NR_syz_80211_inject_frame
+#if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154
 static int netlink_send(struct nlmsg* nlmsg, int sock)
 {
 	return netlink_send_ext(nlmsg, sock, 0, NULL, true);
@@ -3365,7 +3322,7 @@ static void initialize_tun(void)
 }
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI
+#if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI || __NR_syz_socket_connect_nvme_tcp
 const int kInitNetNsFd = 201;
 #endif
 
@@ -3575,7 +3532,8 @@ static int set_interface_state(const char* interface_name, int on)
 	return 0;
 }
 
-static int nl80211_set_interface(struct nlmsg* nlmsg, int sock, int nl80211_family, uint32 ifindex, uint32 iftype)
+static int nl80211_set_interface(struct nlmsg* nlmsg, int sock, int nl80211_family, uint32 ifindex,
+				 uint32 iftype, bool dofail)
 {
 	struct genlmsghdr genlhdr;
 
@@ -3584,14 +3542,15 @@ static int nl80211_set_interface(struct nlmsg* nlmsg, int sock, int nl80211_fami
 	netlink_init(nlmsg, nl80211_family, 0, &genlhdr, sizeof(genlhdr));
 	netlink_attr(nlmsg, NL80211_ATTR_IFINDEX, &ifindex, sizeof(ifindex));
 	netlink_attr(nlmsg, NL80211_ATTR_IFTYPE, &iftype, sizeof(iftype));
-	int err = netlink_send(nlmsg, sock);
+	int err = netlink_send_ext(nlmsg, sock, 0, NULL, dofail);
 	if (err < 0) {
 		debug("nl80211_set_interface failed: %s\n", strerror(errno));
 	}
 	return err;
 }
 
-static int nl80211_join_ibss(struct nlmsg* nlmsg, int sock, int nl80211_family, uint32 ifindex, struct join_ibss_props* props)
+static int nl80211_join_ibss(struct nlmsg* nlmsg, int sock, int nl80211_family, uint32 ifindex,
+			     struct join_ibss_props* props, bool dofail)
 {
 	struct genlmsghdr genlhdr;
 
@@ -3605,14 +3564,14 @@ static int nl80211_join_ibss(struct nlmsg* nlmsg, int sock, int nl80211_family, 
 		netlink_attr(nlmsg, NL80211_ATTR_MAC, props->mac, ETH_ALEN);
 	if (props->wiphy_freq_fixed)
 		netlink_attr(nlmsg, NL80211_ATTR_FREQ_FIXED, NULL, 0);
-	int err = netlink_send(nlmsg, sock);
+	int err = netlink_send_ext(nlmsg, sock, 0, NULL, dofail);
 	if (err < 0) {
 		debug("nl80211_join_ibss failed: %s\n", strerror(errno));
 	}
 	return err;
 }
 
-static int get_ifla_operstate(struct nlmsg* nlmsg, int ifindex)
+static int get_ifla_operstate(struct nlmsg* nlmsg, int ifindex, bool dofail)
 {
 	struct ifinfomsg info;
 	memset(&info, 0, sizeof(info));
@@ -3627,7 +3586,7 @@ static int get_ifla_operstate(struct nlmsg* nlmsg, int ifindex)
 
 	netlink_init(nlmsg, RTM_GETLINK, 0, &info, sizeof(info));
 	int n;
-	int err = netlink_send_ext(nlmsg, sock, RTM_NEWLINK, &n, true);
+	int err = netlink_send_ext(nlmsg, sock, RTM_NEWLINK, &n, dofail);
 	close(sock);
 
 	if (err) {
@@ -3644,12 +3603,12 @@ static int get_ifla_operstate(struct nlmsg* nlmsg, int ifindex)
 	return -1;
 }
 
-static int await_ifla_operstate(struct nlmsg* nlmsg, char* interface, int operstate)
+static int await_ifla_operstate(struct nlmsg* nlmsg, char* interface, int operstate, bool dofail)
 {
 	int ifindex = if_nametoindex(interface);
 	while (true) {
 		usleep(1000);
-		int ret = get_ifla_operstate(nlmsg, ifindex);
+		int ret = get_ifla_operstate(nlmsg, ifindex, dofail);
 		if (ret < 0)
 			return ret;
 		if (ret == operstate)
@@ -3658,7 +3617,8 @@ static int await_ifla_operstate(struct nlmsg* nlmsg, char* interface, int operst
 	return 0;
 }
 
-static int nl80211_setup_ibss_interface(struct nlmsg* nlmsg, int sock, int nl80211_family_id, char* interface, struct join_ibss_props* ibss_props)
+static int nl80211_setup_ibss_interface(struct nlmsg* nlmsg, int sock, int nl80211_family_id, char* interface,
+					struct join_ibss_props* ibss_props, bool dofail)
 {
 	int ifindex = if_nametoindex(interface);
 	if (ifindex == 0) {
@@ -3666,7 +3626,7 @@ static int nl80211_setup_ibss_interface(struct nlmsg* nlmsg, int sock, int nl802
 		return -1;
 	}
 
-	int ret = nl80211_set_interface(nlmsg, sock, nl80211_family_id, ifindex, NL80211_IFTYPE_ADHOC);
+	int ret = nl80211_set_interface(nlmsg, sock, nl80211_family_id, ifindex, NL80211_IFTYPE_ADHOC, dofail);
 	if (ret < 0) {
 		debug("nl80211_setup_ibss_interface: nl80211_set_interface failed for %.32s, ret %d\n", interface, ret);
 		return -1;
@@ -3678,7 +3638,7 @@ static int nl80211_setup_ibss_interface(struct nlmsg* nlmsg, int sock, int nl802
 		return -1;
 	}
 
-	ret = nl80211_join_ibss(nlmsg, sock, nl80211_family_id, ifindex, ibss_props);
+	ret = nl80211_join_ibss(nlmsg, sock, nl80211_family_id, ifindex, ibss_props, dofail);
 	if (ret < 0) {
 		debug("nl80211_setup_ibss_interface: nl80211_join_ibss failed for %.32s, ret %d\n", interface, ret);
 		return -1;
@@ -3751,13 +3711,13 @@ static void initialize_wifi_devices(void)
 		char interface[6] = "wlan0";
 		interface[4] += device_id;
 
-		if (nl80211_setup_ibss_interface(&nlmsg, sock, nl80211_family_id, interface, &ibss_props) < 0)
+		if (nl80211_setup_ibss_interface(&nlmsg, sock, nl80211_family_id, interface, &ibss_props, true) < 0)
 			failmsg("initialize_wifi_devices: failed set up IBSS network", "device=%d", device_id);
 	}
 	for (int device_id = 0; device_id < WIFI_INITIAL_DEVICE_COUNT; device_id++) {
 		char interface[6] = "wlan0";
 		interface[4] += device_id;
-		int ret = await_ifla_operstate(&nlmsg, interface, IF_OPER_UP);
+		int ret = await_ifla_operstate(&nlmsg, interface, IF_OPER_UP, true);
 		if (ret < 0)
 			failmsg("initialize_wifi_devices: get_ifla_operstate failed",
 				"device=%d, ret=%d", device_id, ret);
@@ -4444,6 +4404,8 @@ struct io_uring_params {
 
 #define IORING_OFF_SQ_RING 0
 #define IORING_OFF_SQES 0x10000000ULL
+#define IORING_SETUP_SQE128 (1U << 10)
+#define IORING_SETUP_CQE32 (1U << 11)
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -4453,7 +4415,7 @@ static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long
 	struct io_uring_params* setup_params = (struct io_uring_params*)a1;
 	void** ring_ptr_out = (void**)a2;
 	void** sqes_ptr_out = (void**)a3;
-
+	setup_params->flags &= ~(IORING_SETUP_CQE32 | IORING_SETUP_SQE128);
 	uint32 fd_io_uring = syscall(__NR_io_uring_setup, entries, setup_params);
 	uint32 sq_ring_sz = setup_params->sq_off.array + setup_params->sq_entries * sizeof(uint32);
 	uint32 cq_ring_sz = setup_params->cq_off.cqes + setup_params->cq_entries * SIZEOF_IO_URING_CQE;
@@ -6282,8 +6244,9 @@ static long syz_init_net_socket(volatile long domain, volatile long type, volati
 		return -1;
 	int sock = syscall(__NR_socket, domain, type, proto);
 	int err = errno;
-	if (setns(netns, 0))
-		fail("setns(netns) failed");
+	if (setns(netns, 0)) {
+		exitf("setns(netns) failed");
+	}
 	close(netns);
 	errno = err;
 	return sock;
@@ -6292,6 +6255,50 @@ static long syz_init_net_socket(volatile long domain, volatile long type, volati
 static long syz_init_net_socket(volatile long domain, volatile long type, volatile long proto)
 {
 	return syscall(__NR_socket, domain, type, proto);
+}
+#endif
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_socket_connect_nvme_tcp
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sched.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+static long syz_socket_connect_nvme_tcp()
+{
+	struct sockaddr_in nvme_local_address;
+	int netns = open("/proc/self/ns/net", O_RDONLY);
+	if (netns == -1)
+		return netns;
+	if (setns(kInitNetNsFd, 0))
+		return -1;
+	int sock = syscall(__NR_socket, AF_INET, SOCK_STREAM, 0x0);
+	int err = errno;
+	if (setns(netns, 0)) {
+		exitf("setns(netns) failed");
+	}
+	close(netns);
+	errno = err;
+	nvme_local_address.sin_family = AF_INET;
+	nvme_local_address.sin_port = htobe16(4420);
+	nvme_local_address.sin_addr.s_addr = htobe32(0x7f000001);
+	err = syscall(__NR_connect, sock, &nvme_local_address, sizeof(nvme_local_address));
+	if (err != 0) {
+		close(sock);
+		return -1;
+	}
+	return sock;
+}
+#else
+static long syz_socket_connect_nvme_tcp()
+{
+	return syscall(__NR_socket, -1, 0, 0);
 }
 #endif
 #endif
@@ -7050,6 +7057,7 @@ static int setup_loop_device(unsigned char* data, unsigned long size, const char
 	loopfd = open(loopname, O_RDWR);
 	if (loopfd == -1) {
 		err = errno;
+		debug("setup_loop_device: open failed: %d\n", errno);
 		goto error_close_memfd;
 	}
 	if (ioctl(loopfd, LOOP_SET_FD, memfd)) {
@@ -7077,6 +7085,24 @@ error:
 	errno = err;
 	return -1;
 }
+
+#if SYZ_EXECUTOR || __NR_syz_mount_image
+
+static void reset_loop_device(const char* loopname)
+{
+	int loopfd = open(loopname, O_RDWR);
+	if (loopfd == -1) {
+		debug("reset_loop_device: open failed: %d\n", errno);
+		return;
+	}
+	if (ioctl(loopfd, LOOP_CLR_FD, 0)) {
+		debug("reset_loop_device: LOOP_CLR_FD failed: %d\n", errno);
+	}
+	close(loopfd);
+}
+
+#endif
+
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_read_part_table
@@ -7138,7 +7164,7 @@ static long syz_mount_image(
     volatile long image)
 {
 	unsigned char* data = (unsigned char*)image;
-	int res = -1, err = 0, loopfd = -1, need_loop_device = !!size;
+	int res = -1, err = 0, need_loop_device = !!size;
 	char* mount_opts = (char*)optsarg;
 	char* target = (char*)dir;
 	char* fs = (char*)fsarg;
@@ -7146,10 +7172,12 @@ static long syz_mount_image(
 	char loopname[64];
 
 	if (need_loop_device) {
+		int loopfd;
 		memset(loopname, 0, sizeof(loopname));
 		snprintf(loopname, sizeof(loopname), "/dev/loop%llu", procid);
 		if (setup_loop_device(data, size, loopname, &loopfd) == -1)
 			return -1;
+		close(loopfd);
 		source = loopname;
 	}
 
@@ -7200,10 +7228,8 @@ static long syz_mount_image(
 	}
 
 error_clear_loop:
-	if (need_loop_device) {
-		ioctl(loopfd, LOOP_CLR_FD, 0);
-		close(loopfd);
-	}
+	if (need_loop_device)
+		reset_loop_device(loopname);
 	errno = err;
 	return res;
 }
@@ -7604,6 +7630,7 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 	uint64* gdt = (uint64*)(host_mem + sregs.gdt.base);
 
 	struct kvm_segment seg_ldt;
+	memset(&seg_ldt, 0, sizeof(seg_ldt));
 	seg_ldt.selector = SEL_LDT;
 	seg_ldt.type = 2;
 	seg_ldt.base = guest_mem + ADDR_LDT;
@@ -7618,6 +7645,7 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 	uint64* ldt = (uint64*)(host_mem + sregs.ldt.base);
 
 	struct kvm_segment seg_cs16;
+	memset(&seg_cs16, 0, sizeof(seg_cs16));
 	seg_cs16.selector = SEL_CS16;
 	seg_cs16.type = 11;
 	seg_cs16.base = 0;
@@ -7673,6 +7701,7 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 	seg_ds64_cpl3.dpl = 3;
 
 	struct kvm_segment seg_tss32;
+	memset(&seg_tss32, 0, sizeof(seg_tss32));
 	seg_tss32.selector = SEL_TSS32;
 	seg_tss32.type = 9;
 	seg_tss32.base = ADDR_VAR_TSS32;
@@ -7723,6 +7752,7 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 	seg_tss64_cpl3.dpl = 3;
 
 	struct kvm_segment seg_cgate16;
+	memset(&seg_cgate16, 0, sizeof(seg_cgate16));
 	seg_cgate16.selector = SEL_CGATE16;
 	seg_cgate16.type = 4;
 	seg_cgate16.base = SEL_CS16 | (2 << 16);
@@ -8655,6 +8685,7 @@ static void checkpoint_iptables(struct ipt_table_desc* tables, int num_tables, i
 		switch (errno) {
 		case EAFNOSUPPORT:
 		case ENOPROTOOPT:
+		case ENOENT:
 			return;
 		}
 		failmsg("iptable checkpoint: socket(SOCK_STREAM, IPPROTO_TCP) failed", "family=%d", family);
@@ -8708,6 +8739,7 @@ static void reset_iptables(struct ipt_table_desc* tables, int num_tables, int fa
 		switch (errno) {
 		case EAFNOSUPPORT:
 		case ENOPROTOOPT:
+		case ENOENT:
 			return;
 		}
 		failmsg("iptable: socket(SOCK_STREAM, IPPROTO_TCP) failed", "family=%d", family);
@@ -8754,6 +8786,7 @@ static void checkpoint_arptables(void)
 		switch (errno) {
 		case EAFNOSUPPORT:
 		case ENOPROTOOPT:
+		case ENOENT:
 			return;
 		}
 		fail("arptable checkpoint: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) failed");
@@ -8804,6 +8837,7 @@ static void reset_arptables()
 		switch (errno) {
 		case EAFNOSUPPORT:
 		case ENOPROTOOPT:
+		case ENOENT:
 			return;
 		}
 		fail("arptable: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
@@ -8893,6 +8927,7 @@ static void checkpoint_ebtables(void)
 		switch (errno) {
 		case EAFNOSUPPORT:
 		case ENOPROTOOPT:
+		case ENOENT:
 			return;
 		}
 		fail("ebtable checkpoint: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
@@ -8934,6 +8969,7 @@ static void reset_ebtables()
 		switch (errno) {
 		case EAFNOSUPPORT:
 		case ENOPROTOOPT:
+		case ENOENT:
 			return;
 		}
 		fail("ebtable: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
@@ -9212,7 +9248,7 @@ static void sandbox_common()
 	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 	setsid();
 
-#if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI
+#if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI || __NR_syz_socket_connect_nvme_tcp
 	int netns = open("/proc/self/ns/net", O_RDONLY);
 	if (netns == -1)
 		fail("open(/proc/self/ns/net) failed");
@@ -10740,10 +10776,11 @@ static void remove_dir(const char* dir)
 	DIR* dp = 0;
 retry:
 #if SYZ_EXECUTOR || !SYZ_SANDBOX_ANDROID
+	const int umount_flags = MNT_FORCE | UMOUNT_NOFOLLOW;
 #if SYZ_EXECUTOR
 	if (!flag_sandbox_android)
 #endif
-		while (umount2(dir, MNT_DETACH | UMOUNT_NOFOLLOW) == 0) {
+		while (umount2(dir, umount_flags) == 0) {
 			debug("umount(%s)\n", dir);
 		}
 #endif
@@ -10764,7 +10801,7 @@ retry:
 #if SYZ_EXECUTOR
 		if (!flag_sandbox_android)
 #endif
-			while (umount2(filename, MNT_DETACH | UMOUNT_NOFOLLOW) == 0) {
+			while (umount2(filename, umount_flags) == 0) {
 				debug("umount(%s)\n", filename);
 			}
 #endif
@@ -10801,7 +10838,7 @@ retry:
 			if (!flag_sandbox_android) {
 #endif
 				debug("umount(%s)\n", filename);
-				if (umount2(filename, MNT_DETACH | UMOUNT_NOFOLLOW))
+				if (umount2(filename, umount_flags))
 					exitf("umount(%s) failed", filename);
 #if SYZ_EXECUTOR
 			}
@@ -10835,7 +10872,7 @@ retry:
 				if (!flag_sandbox_android) {
 #endif
 					debug("umount(%s)\n", dir);
-					if (umount2(dir, MNT_DETACH | UMOUNT_NOFOLLOW))
+					if (umount2(dir, umount_flags))
 						exitf("umount(%s) failed", dir);
 #if SYZ_EXECUTOR
 				}
@@ -11539,7 +11576,7 @@ static int hwsim_register_socket(struct nlmsg* nlmsg, int sock, int hwsim_family
 	memset(&genlhdr, 0, sizeof(genlhdr));
 	genlhdr.cmd = HWSIM_CMD_REGISTER;
 	netlink_init(nlmsg, hwsim_family, 0, &genlhdr, sizeof(genlhdr));
-	int err = netlink_send(nlmsg, sock);
+	int err = netlink_send_ext(nlmsg, sock, 0, NULL, false);
 	if (err < 0) {
 		debug("hwsim_register_device failed: %s\n", strerror(errno));
 	}
@@ -11559,7 +11596,7 @@ static int hwsim_inject_frame(struct nlmsg* nlmsg, int sock, int hwsim_family, u
 	netlink_attr(nlmsg, HWSIM_ATTR_SIGNAL, &signal, sizeof(signal));
 	netlink_attr(nlmsg, HWSIM_ATTR_ADDR_RECEIVER, mac_addr, ETH_ALEN);
 	netlink_attr(nlmsg, HWSIM_ATTR_FRAME, data, len);
-	int err = netlink_send(nlmsg, sock);
+	int err = netlink_send_ext(nlmsg, sock, 0, NULL, false);
 	if (err < 0) {
 		debug("hwsim_inject_frame failed: %s\n", strerror(errno));
 	}
@@ -11584,7 +11621,7 @@ static long syz_80211_inject_frame(volatile long a0, volatile long a1, volatile 
 		return -1;
 	}
 
-	int hwsim_family_id = netlink_query_family_id(&tmp_msg, sock, "MAC80211_HWSIM", true);
+	int hwsim_family_id = netlink_query_family_id(&tmp_msg, sock, "MAC80211_HWSIM", false);
 	int ret = hwsim_register_socket(&tmp_msg, sock, hwsim_family_id);
 	if (ret < 0) {
 		debug("syz_80211_inject_frame: failed to register socket, ret %d\n", ret);
@@ -11638,7 +11675,7 @@ static long syz_80211_join_ibss(volatile long a0, volatile long a1, volatile lon
 		return -1;
 	}
 
-	int nl80211_family_id = netlink_query_family_id(&tmp_msg, sock, "nl80211", true);
+	int nl80211_family_id = netlink_query_family_id(&tmp_msg, sock, "nl80211", false);
 	struct join_ibss_props ibss_props = {
 	    .wiphy_freq = WIFI_DEFAULT_FREQUENCY,
 	    .wiphy_freq_fixed = (mode == WIFI_JOIN_IBSS_NO_SCAN || mode == WIFI_JOIN_IBSS_BG_NO_SCAN),
@@ -11646,7 +11683,7 @@ static long syz_80211_join_ibss(volatile long a0, volatile long a1, volatile lon
 	    .ssid = ssid,
 	    .ssid_len = ssid_len};
 
-	int ret = nl80211_setup_ibss_interface(&tmp_msg, sock, nl80211_family_id, interface, &ibss_props);
+	int ret = nl80211_setup_ibss_interface(&tmp_msg, sock, nl80211_family_id, interface, &ibss_props, false);
 	close(sock);
 	if (ret < 0) {
 		debug("syz_80211_join_ibss: failed set up IBSS network for %.32s\n", interface);
@@ -11654,7 +11691,7 @@ static long syz_80211_join_ibss(volatile long a0, volatile long a1, volatile lon
 	}
 
 	if (mode == WIFI_JOIN_IBSS_NO_SCAN) {
-		ret = await_ifla_operstate(&tmp_msg, interface, IF_OPER_UP);
+		ret = await_ifla_operstate(&tmp_msg, interface, IF_OPER_UP, false);
 		if (ret < 0) {
 			debug("syz_80211_join_ibss: await_ifla_operstate failed for %.32s, ret %d\n", interface, ret);
 			return -1;
@@ -11776,6 +11813,18 @@ static void setup_swap()
 		failmsg("swapon failed", "file: %s", SWAP_FILE);
 		return;
 	}
+}
+
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_pidfd_open
+#include <sys/syscall.h>
+static long syz_pidfd_open(volatile long pid, volatile long flags)
+{
+	if (pid == 1) {
+		pid = 0;
+	}
+	return syscall(__NR_pidfd_open, pid, flags);
 }
 
 #endif
@@ -12245,6 +12294,25 @@ static int do_sandbox_none(void)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_test_fuzzer1
+
+static void fake_crash(const char* name)
+{
+	failmsg("crash", "{{CRASH: %s}}", name);
+	doexit(1);
+}
+
+static long syz_test_fuzzer1(volatile long a, volatile long b, volatile long c)
+{
+	if (a == 1 && b == 1 && c == 1)
+		fake_crash("first bug");
+	if (a == 1 && b == 2 && c == 3)
+		fake_crash("second bug");
+	return 0;
+}
+
+#endif
+
 #elif GOOS_windows
 
 #include <direct.h>
@@ -12482,11 +12550,6 @@ static void loop(void)
 #if SYZ_EXECUTOR
 	reply_handshake();
 #endif
-#if SYZ_EXECUTOR && GOOS_akaros
-	int child_pipe[2];
-	if (pipe(child_pipe))
-		fail("pipe failed");
-#endif
 	int iter = 0;
 #if SYZ_REPEAT_TIMES
 	for (; iter < /*{{{REPEAT_TIMES}}}*/; iter++) {
@@ -12519,15 +12582,6 @@ static void loop(void)
 #if SYZ_HAVE_SETUP_EXT_TEST
 			setup_ext_test();
 #endif
-#if GOOS_akaros
-#if SYZ_EXECUTOR
-			dup2(child_pipe[0], kInPipeFd);
-			close(child_pipe[0]);
-			close(child_pipe[1]);
-#endif
-			execl(program_name, program_name, "child", NULL);
-			fail("execl failed");
-#else
 #if SYZ_EXECUTOR
 			close(kInPipeFd);
 #endif
@@ -12539,13 +12593,8 @@ static void loop(void)
 			close_fds();
 #endif
 			doexit(0);
-#endif
 		}
 		debug("spawned worker pid %d\n", pid);
-
-#if SYZ_EXECUTOR && GOOS_akaros
-		resend_execute(child_pipe[1]);
-#endif
 		int status = 0;
 		uint64 start = current_time_ms();
 #if SYZ_EXECUTOR && SYZ_EXECUTOR_USES_SHMEM
@@ -12623,21 +12672,9 @@ void loop(void)
 #endif
 }
 #endif
-#if GOOS_akaros && SYZ_REPEAT
-#include <string.h>
-
-int main(int argc, char** argv)
-{
-	/*{{{MMAP_DATA}}}*/
-
-	program_name = argv[0];
-	if (argc == 2 && strcmp(argv[1], "child") == 0)
-		child();
-#else
 int main(void)
 {
 	/*{{{MMAP_DATA}}}*/
-#endif
 
 #if SYZ_SYSCTL
 	setup_sysctl();

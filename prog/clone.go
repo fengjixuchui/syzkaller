@@ -8,7 +8,10 @@ import (
 )
 
 func (p *Prog) Clone() *Prog {
-	newargs := make(map[*ResultArg]*ResultArg)
+	return p.cloneWithMap(make(map[*ResultArg]*ResultArg))
+}
+
+func (p *Prog) cloneWithMap(newargs map[*ResultArg]*ResultArg) *Prog {
 	p1 := &Prog{
 		Target: p.Target,
 		Calls:  cloneCalls(p.Calls, newargs),
@@ -37,6 +40,10 @@ func cloneCall(c *Call, newargs map[*ResultArg]*ResultArg) *Call {
 	}
 	c1.Props = c.Props
 	return c1
+}
+
+func CloneArg(arg Arg) Arg {
+	return clone(arg, nil)
 }
 
 func clone(arg Arg, newargs map[*ResultArg]*ResultArg) Arg {

@@ -51,7 +51,7 @@ var skipDevAppserverTests = func() bool {
 	_, err := exec.LookPath("dev_appserver.py")
 	// Don't silently skip tests on CI, we should have gcloud sdk installed there.
 	return err != nil && os.Getenv("SYZ_ENV") == "" ||
-		os.Getenv("SYZ_SKIP_DASHBOARD") != ""
+		os.Getenv("SYZ_SKIP_DEV_APPSERVER_TESTS") != ""
 }()
 
 func NewCtx(t *testing.T) *Ctx {
@@ -274,6 +274,17 @@ func (c *Ctx) decommission(ns string) {
 	}
 }
 
+func (c *Ctx) setWaitForRepro(ns string, d time.Duration) {
+	c.transformContext = func(c context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+			ret := *cfg
+			ret.WaitForRepro = d
+			return &ret
+		})
+		return contextWithConfig(c, newConfig)
+	}
+}
+
 // GET sends admin-authorized HTTP GET request to the app.
 func (c *Ctx) GET(url string) ([]byte, error) {
 	return c.AuthGET(AccessAdmin, url)
@@ -316,6 +327,7 @@ func (c *Ctx) httpRequest(method, url, body string, access AccessLevel) (*httpte
 	if err != nil {
 		c.t.Fatal(err)
 	}
+	r.Header.Add("X-Appengine-User-IP", "127.0.0.1")
 	r = registerRequest(r, c)
 	r = r.WithContext(c.transformContext(r.Context()))
 	if access == AccessAdmin || access == AccessUser {

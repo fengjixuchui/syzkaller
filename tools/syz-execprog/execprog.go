@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/db"
 	"github.com/google/syzkaller/pkg/host"
@@ -25,6 +27,7 @@ import (
 	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 var (
@@ -72,6 +75,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+
 	progs := loadPrograms(target, flag.Args())
 	if len(progs) == 0 {
 		return
@@ -102,13 +106,17 @@ func main() {
 			}
 		}
 	}
+	sysTarget := targets.Get(*flagOS, *flagArch)
+	upperBase := getKernelUpperBase(sysTarget)
 	ctx := &Context{
-		progs:    progs,
-		config:   config,
-		execOpts: execOpts,
-		gate:     ipc.NewGate(2**flagProcs, gateCallback),
-		shutdown: make(chan struct{}),
-		repeat:   *flagRepeat,
+		progs:     progs,
+		config:    config,
+		execOpts:  execOpts,
+		gate:      ipc.NewGate(2**flagProcs, gateCallback),
+		shutdown:  make(chan struct{}),
+		repeat:    *flagRepeat,
+		target:    sysTarget,
+		upperBase: upperBase,
 	}
 	var wg sync.WaitGroup
 	wg.Add(*flagProcs)
@@ -134,6 +142,8 @@ type Context struct {
 	repeat    int
 	pos       int
 	lastPrint time.Time
+	target    *targets.Target
+	upperBase uint32
 }
 
 func (ctx *Context) run(pid int) {
@@ -171,11 +181,13 @@ func (ctx *Context) execute(pid int, env *ipc.Env, p *prog.Prog, progIndex int) 
 		output, info, hanged, err := env.Exec(callOpts, p)
 		if err != nil && err != prog.ErrExecBufferTooSmall {
 			if try > 10 {
-				log.Fatalf("executor failed %v times: %v\n%s", try, err, output)
+				log.SyzFatalf("executor %d failed %d times: %v\n%s", pid, try, err, output)
 			}
 			// Don't print err/output in this case as it may contain "SYZFAIL" and we want to fail yet.
 			log.Logf(1, "executor failed, retrying")
-			time.Sleep(time.Second)
+			if try > 3 {
+				time.Sleep(100 * time.Millisecond)
+			}
 			continue
 		}
 		if ctx.config.Flags&ipc.FlagDebug != 0 || err != nil {
@@ -241,14 +253,41 @@ func (ctx *Context) printHints(p *prog.Prog, info *ipc.ProgInfo) {
 				fmt.Printf("\n")
 			}
 		}
-		p.MutateWithHints(i, comps, func(p *prog.Prog) {
+		p.MutateWithHints(i, comps, func(p *prog.Prog) bool {
 			ncandidates++
 			if *flagOutput {
 				log.Logf(1, "PROGRAM:\n%s", p.Serialize())
 			}
+			return true
 		})
 	}
 	log.Logf(0, "ncomps=%v ncandidates=%v", ncomps, ncandidates)
+}
+
+func getKernelUpperBase(target *targets.Target) uint32 {
+	defaultRet := uint32(0xffffffff)
+	if target.OS == targets.Linux {
+		// Read the first 8 bytes from /proc/kallsyms.
+		f, err := os.Open("/proc/kallsyms")
+		if err != nil {
+			log.Logf(1, "could not get kernel fixup address: %v", err)
+			return defaultRet
+		}
+		defer f.Close()
+		data := make([]byte, 8)
+		_, err = f.ReadAt(data, 0)
+		if err != nil {
+			log.Logf(1, "could not get kernel fixup address: %v", err)
+			return defaultRet
+		}
+		value, err := strconv.ParseUint(string(data), 16, 32)
+		if err != nil {
+			log.Logf(1, "could not get kernel fixup address: %v", err)
+			return defaultRet
+		}
+		return uint32(value)
+	}
+	return defaultRet
 }
 
 func (ctx *Context) dumpCallCoverage(coverFile string, info *ipc.CallInfo) {
@@ -257,7 +296,7 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *ipc.CallInfo) {
 	}
 	buf := new(bytes.Buffer)
 	for _, pc := range info.Cover {
-		fmt.Fprintf(buf, "0x%x\n", cover.RestorePC(pc, 0xffffffff))
+		fmt.Fprintf(buf, "0x%x\n", backend.PreviousInstructionPC(ctx.target, cover.RestorePC(pc, ctx.upperBase)))
 	}
 	err := osutil.WriteFile(coverFile, buf.Bytes())
 	if err != nil {

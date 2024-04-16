@@ -226,12 +226,12 @@ func TestDeserialize(t *testing.T) {
 		{
 			In:        `test$type_confusion1(&(0x7f0000000000)=@unknown)`,
 			Out:       `test$type_confusion1(&(0x7f0000000000))`,
-			StrictErr: "wrong union option",
+			StrictErr: `wrong option "unknown" of union "type_confusion", available options are: "f1"`,
 		},
 		{
 			In:        `test$type_confusion1(&(0x7f0000000000)=@unknown={0x0, 'abc'}, 0x0)`,
 			Out:       `test$type_confusion1(&(0x7f0000000000))`,
-			StrictErr: "wrong union option",
+			StrictErr: `wrong option "unknown" of union "type_confusion", available options are: "f1"`,
 		},
 		{
 			In:        `test$excessive_fields1(&(0x7f0000000000)=0x0)`,
@@ -259,6 +259,22 @@ func TestDeserialize(t *testing.T) {
 		{
 			In:  `test$auto0(AUTO, &AUTO={AUTO, AUTO, AUTO}, AUTO, 0x0)`,
 			Err: `wrong type *prog.IntType for AUTO`,
+		},
+		{
+			In:  `test$auto1(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
+			Out: `test$auto1(0x42, &(0x7f0000000040)={0xc, 0x43, 0x0}, 0xc, 0x0)`,
+		},
+		{
+			In:  `test$auto2(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
+			Out: `test$auto2(0x42, &(0x7f0000000040)={0x10, {0xc, 0x43, 0x0}}, 0x10, 0x0)`,
+		},
+		{
+			In:  `test$auto0(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
+			Err: `wrong type *prog.IntType for AUTO`,
+		},
+		{
+			In:  `test$bf2(&AUTO={AUTO, 0x10, 0x0, AUTO})`,
+			Out: `test$bf2(&(0x7f0000000040)={0x8, 0x10, 0x0, 0x18})`,
 		},
 		{
 			In:  `test$str0(&AUTO="303100090a0d7022273a")`,
@@ -362,6 +378,11 @@ func TestSerializeDeserialize(t *testing.T) {
 		{
 			In: `serialize3(&(0x7f0000000000)="$eJwqrqzKTszJSS0CBAAA//8TyQPi")`,
 		},
+		{
+			In:        `foo$any_filename(&(0x7f0000000000)=ANY=[@ANYBLOB='/'])`,
+			Out:       `foo$any_filename(&(0x7f0000000000)=@complex={0x0, 0x0, 0x0, 0x0, {0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, []})`,
+			StrictErr: `wrong array arg`,
+		},
 	})
 }
 
@@ -383,11 +404,11 @@ func TestSerializeDeserializeRandom(t *testing.T) {
 			if ok {
 				t.Log("flaky?")
 			}
-			decoded0, err := target.DeserializeExec(data0[:n0])
+			decoded0, err := target.DeserializeExec(data0[:n0], nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			decoded1, err := target.DeserializeExec(data1[:n1])
+			decoded1, err := target.DeserializeExec(data1[:n1], nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -513,5 +534,28 @@ serialize0(0x0)
 	}
 	if !reflect.DeepEqual(p.Comments, wantComments) {
 		t.Errorf("bad program comments %q\nwant: %q", p.Comments, wantComments)
+	}
+}
+
+func TestHasNext(t *testing.T) {
+	testCases := []struct {
+		input    string
+		expected bool
+	}{
+		{"abcdef", true},
+		{"xyz", false},
+		{"ab", false},
+		{"abc", true},
+	}
+	for _, testCase := range testCases {
+		p := newParser(nil, []byte(testCase.input), true)
+		if !p.Scan() {
+			t.Fatalf("parser does not scan")
+		}
+		result := p.HasNext("abc")
+		if result != testCase.expected {
+			t.Errorf("expected HasNext(\"abc\") on input %q to be %v, but got %v",
+				testCase.input, testCase.expected, result)
+		}
 	}
 }

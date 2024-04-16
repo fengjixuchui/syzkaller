@@ -27,11 +27,9 @@ endef
 
 RED := $(shell tput setaf 1)
 RESET := $(shell tput sgr0)
-
-ifndef SILENCE_SYZ_ENV_HINT
+ifndef SYZ_ENV
 $(warning $(RED)run command via tools/syz-env for best compatibility, see:$(RESET))
 $(warning $(RED)https://github.com/google/syzkaller/blob/master/docs/contributing.md#using-syz-env$(RESET))
-export SILENCE_SYZ_ENV_HINT=1
 endif
 
 ENV := $(subst \n,$(newline),$(shell CI=$(CI)\
@@ -89,11 +87,6 @@ ifeq ("$(TARGETOS)", "test")
 	TARGETGOARCH := $(HOSTARCH)
 endif
 
-ifeq ("$(TARGETOS)", "akaros")
-	TARGETGOOS := $(HOSTOS)
-	TARGETGOARCH := $(HOSTARCH)
-endif
-
 ifeq ("$(TARGETOS)", "fuchsia")
 	TARGETGOOS := $(HOSTOS)
 	TARGETGOARCH := $(HOSTARCH)
@@ -116,7 +109,7 @@ endif
 	check_copyright check_language check_whitespace check_links check_diff check_commits check_shebang \
 	presubmit presubmit_aux presubmit_build presubmit_arch_linux presubmit_arch_freebsd \
 	presubmit_arch_netbsd presubmit_arch_openbsd presubmit_arch_darwin presubmit_arch_windows \
-	presubmit_arch_executor presubmit_dashboard presubmit_race presubmit_old
+	presubmit_arch_executor presubmit_dashboard presubmit_race presubmit_race_dashboard presubmit_old
 
 all: host target
 host: manager runtest repro mutate prog2c db upgrade
@@ -289,11 +282,15 @@ tidy: descriptions
 		-extra-arg=-DHOSTGOOS_$(HOSTOS)=1 -extra-arg=-DGIT_REVISION=\"$(REV)\" \
 		executor/*.cc
 
+ifdef CI
+  LINT-FLAGS := --out-format github-actions
+endif
+
 lint:
 	# This should install the command from our vendor dir.
 	CGO_ENABLED=1 $(HOSTGO) install github.com/golangci/golangci-lint/cmd/golangci-lint
 	CGO_ENABLED=1 $(HOSTGO) build -buildmode=plugin -o bin/syz-linter.so ./tools/syz-linter
-	bin/golangci-lint run ./...
+	bin/golangci-lint run $(LINT-FLAGS) ./...
 
 presubmit:
 	$(MAKE) presubmit_aux
@@ -306,6 +303,7 @@ presubmit:
 	$(MAKE) presubmit_arch_windows
 	$(MAKE) presubmit_arch_executor
 	$(MAKE) presubmit_race
+	$(MAKE) presubmit_race_dashboard
 
 presubmit_aux:
 	$(MAKE) generate
@@ -316,7 +314,7 @@ presubmit_build: descriptions
 	# This does not check build of test files, but running go test takes too long (even for building).
 	$(GO) build ./...
 	$(MAKE) lint
-	SYZ_SKIP_DASHBOARD=1 $(MAKE) test
+	SYZ_SKIP_DEV_APPSERVER_TESTS=1 $(MAKE) test
 
 presubmit_arch_linux: descriptions
 	env HOSTOS=linux HOSTARCH=amd64 $(MAKE) host
@@ -352,7 +350,6 @@ presubmit_arch_windows: descriptions
 
 presubmit_arch_executor: descriptions
 	env TARGETOS=linux TARGETARCH=amd64 SYZ_CLANG=yes $(MAKE) executor
-	env TARGETOS=akaros TARGETARCH=amd64 $(MAKE) executor
 	env TARGETOS=fuchsia TARGETARCH=amd64 $(MAKE) executor
 	env TARGETOS=fuchsia TARGETARCH=arm64 $(MAKE) executor
 	env TARGETOS=test TARGETARCH=64 $(MAKE) executor
@@ -370,7 +367,13 @@ presubmit_dashboard: descriptions
 presubmit_race: descriptions
 	# -race requires cgo
 	env CGO_ENABLED=1 $(GO) test -race; if test $$? -ne 2; then \
-	env CGO_ENABLED=1 $(GO) test -race -short -vet=off -bench=.* -benchtime=.2s ./... ;\
+	env CGO_ENABLED=1 SYZ_SKIP_DEV_APPSERVER_TESTS=1 $(GO) test -race -short -vet=off -bench=.* -benchtime=.2s ./... ;\
+	fi
+
+presubmit_race_dashboard: descriptions
+	# -race requires cgo
+	env CGO_ENABLED=1 $(GO) test -race; if test $$? -ne 2; then \
+	env CGO_ENABLED=1 $(GO) test -race -short -vet=off -bench=.* -benchtime=.2s ./dashboard/app/... ;\
 	fi
 
 presubmit_old: descriptions

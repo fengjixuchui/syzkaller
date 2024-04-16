@@ -357,8 +357,18 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 		return baseDuration + time.Duration(entries/4)*time.Second
 	}
 
+	// First check if replaying the log may crash the kernel at all.
+	ret, err := ctx.testProgs(entries, duration(len(entries)), opts)
+	if !ret {
+		ctx.reproLogf(3, "replaying the whole log did not cause a kernel crash")
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	// Bisect the log to find multiple guilty programs.
-	entries, err := ctx.bisectProgs(entries, func(progs []*prog.LogEntry) (bool, error) {
+	entries, err = ctx.bisectProgs(entries, func(progs []*prog.LogEntry) (bool, error) {
 		return ctx.testProgs(progs, duration(len(progs)), opts)
 	})
 	if err != nil {
@@ -612,8 +622,8 @@ func (ctx *context) testCProg(p *prog.Prog, duration time.Duration, opts csource
 }
 
 func (ctx *context) returnInstance(inst *reproInstance) {
-	ctx.bootRequests <- inst.index
 	inst.execProg.Close()
+	ctx.bootRequests <- inst.index
 }
 
 func (ctx *context) reproLogf(level int, format string, args ...interface{}) {
@@ -640,7 +650,7 @@ func (ctx *context) bisectProgs(progs []*prog.LogEntry, pred func([]*prog.LogEnt
 		Pred: minimizePred,
 		// For flaky crashes we usually end up with too many chunks.
 		// Continuing bisection would just take a lot of time and likely produce no result.
-		MaxChunks: 8,
+		MaxChunks: 6,
 		Logf: func(msg string, args ...interface{}) {
 			ctx.reproLogf(3, "bisect: "+msg, args...)
 		},
@@ -660,28 +670,21 @@ func (ctx *context) createInstances(cfg *mgrconfig.Config, vmPool *vm.Pool) {
 		go func() {
 			defer wg.Done()
 
-			var inst *instance.ExecProgInstance
-			maxTry := 3
-			for try := 0; try < maxTry; try++ {
+			for try := 0; ; try++ {
 				select {
 				case <-vm.Shutdown:
-					try = maxTry
-					continue
+					return
 				default:
 				}
-				var err error
-				inst, err = instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
+				inst, err := instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
 					ctx.reporter, &instance.OptionalConfig{Logf: ctx.reproLogf})
 				if err != nil {
-					ctx.reproLogf(0, "failed to init instance: %v, attempt %d/%d",
-						err, try+1, maxTry)
+					ctx.reproLogf(0, "failed to boot instance (try %v): %v", try+1, err)
 					time.Sleep(10 * time.Second)
 					continue
 				}
-				break
-			}
-			if inst != nil {
 				ctx.instances <- &reproInstance{execProg: inst, index: vmIndex}
+				break
 			}
 		}()
 	}

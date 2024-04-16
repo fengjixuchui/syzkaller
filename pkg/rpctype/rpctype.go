@@ -7,27 +7,57 @@ package rpctype
 
 import (
 	"math"
+	"time"
 
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/signal"
 )
 
-type Input struct {
-	Call     string
-	Prog     []byte
-	Signal   signal.Serial
-	Cover    []uint32
-	CallID   int // seq number of call in the prog to which the item is related (-1 for extra)
-	RawCover []uint32
+type SignalType int
+
+const (
+	NoSignal  SignalType = 0 // we don't need any signal
+	NewSignal SignalType = 1 // we need the newly seen signal
+	AllSignal SignalType = 2 // we need all signal
+)
+
+// ExecutionRequest describes the task of executing a particular program.
+// Corresponds to Fuzzer.Request.
+type ExecutionRequest struct {
+	ID               int64
+	ProgData         []byte
+	NeedCover        bool
+	NeedRawCover     bool
+	NeedHints        bool
+	NeedSignal       SignalType
+	SignalFilter     signal.Signal
+	SignalFilterCall int
 }
 
-type Candidate struct {
-	Prog      []byte
-	Minimized bool
-	Smashed   bool
+// ExecutionResult is sent after ExecutionRequest is completed.
+type ExecutionResult struct {
+	ID   int64
+	Info ipc.ProgInfo
 }
 
+// ExchangeInfoRequest is periodically sent by syz-fuzzer to syz-manager.
+type ExchangeInfoRequest struct {
+	Name       string
+	NeedProgs  int
+	StatsDelta map[string]uint64
+	Results    []ExecutionResult
+	Latency    time.Duration // latency of the previous ExchangeInfo request
+}
+
+// ExchangeInfoReply is a reply to ExchangeInfoRequest.
+type ExchangeInfoReply struct {
+	Requests      []ExecutionRequest
+	NewMaxSignal  []uint32
+	DropMaxSignal []uint32
+}
+
+// TODO: merge ExecutionRequest and ExecTask.
 type ExecTask struct {
 	Prog []byte
 	ID   int64
@@ -40,12 +70,12 @@ type ConnectArgs struct {
 }
 
 type ConnectRes struct {
-	EnabledCalls      []int
-	NoMutateCalls     map[int]bool
-	GitRevision       string
-	TargetRevision    string
-	AllSandboxes      bool
-	CheckResult       *CheckArgs
+	EnabledCalls   []int
+	GitRevision    string
+	TargetRevision string
+	AllSandboxes   bool
+	// This is forwarded from CheckArgs, if checking was already done.
+	Features          *host.Features
 	MemoryLeakFrames  []string
 	DataRaceFrames    []string
 	CoverFilterBitmap []byte
@@ -63,24 +93,6 @@ type CheckArgs struct {
 type SyscallReason struct {
 	ID     int
 	Reason string
-}
-
-type NewInputArgs struct {
-	Name string
-	Input
-}
-
-type PollArgs struct {
-	Name           string
-	NeedCandidates bool
-	MaxSignal      signal.Serial
-	Stats          map[string]uint64
-}
-
-type PollRes struct {
-	Candidates []Candidate
-	NewInputs  []Input
-	MaxSignal  signal.Serial
 }
 
 type RunnerConnectArgs struct {

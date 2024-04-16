@@ -41,9 +41,10 @@ func main() {
 	var (
 		flagConfig  = flag.String("config", "", "configuration file")
 		flagModules = flag.String("modules", "",
-			"modules info obtained from /modules or file from /proc/modules (optional)")
+			"modules JSON info obtained from /modules (optional)")
 		flagExportCSV      = flag.String("csv", "", "export coverage data in csv format (optional)")
 		flagExportLineJSON = flag.String("json", "", "export coverage data with source line info in json format (optional)")
+		flagExportJSONL    = flag.String("jsonl", "", "export jsonl coverage data (optional)")
 		flagExportHTML     = flag.String("html", "", "save coverage HTML report to file (optional)")
 	)
 	defer tool.Init()()
@@ -77,8 +78,14 @@ func main() {
 	}
 	progs := []cover.Prog{{PCs: pcs}}
 	buf := new(bytes.Buffer)
+	params := cover.CoverHandlerParams{
+		Progs:       progs,
+		CoverFilter: nil,
+		Debug:       false,
+		Force:       false,
+	}
 	if *flagExportCSV != "" {
-		if err := rg.DoCSV(buf, progs, nil); err != nil {
+		if err := rg.DoCSV(buf, params); err != nil {
 			tool.Fail(err)
 		}
 		if err := osutil.WriteFile(*flagExportCSV, buf.Bytes()); err != nil {
@@ -87,7 +94,7 @@ func main() {
 		return
 	}
 	if *flagExportLineJSON != "" {
-		if err := rg.DoLineJSON(buf, progs, nil); err != nil {
+		if err := rg.DoLineJSON(buf, params); err != nil {
 			tool.Fail(err)
 		}
 		if err := osutil.WriteFile(*flagExportLineJSON, buf.Bytes()); err != nil {
@@ -95,7 +102,16 @@ func main() {
 		}
 		return
 	}
-	if err := rg.DoHTML(buf, progs, nil); err != nil {
+	if *flagExportJSONL != "" {
+		if err := rg.DoCoverJSONL(buf, params); err != nil {
+			tool.Fail(err)
+		}
+		if err := osutil.WriteFile(*flagExportJSONL, buf.Bytes()); err != nil {
+			tool.Fail(err)
+		}
+		return
+	}
+	if err := rg.DoHTML(buf, params); err != nil {
 		tool.Fail(err)
 	}
 	if *flagExportHTML != "" {
@@ -145,8 +161,9 @@ func loadModules(fname string) ([]host.KernelModule, error) {
 		return nil, err
 	}
 	var modules []host.KernelModule
-	if err := json.Unmarshal(data, &modules); err != nil {
-		return host.ParseModulesText(data)
+	err = json.Unmarshal(data, &modules)
+	if err != nil {
+		return nil, err
 	}
 	return modules, nil
 }

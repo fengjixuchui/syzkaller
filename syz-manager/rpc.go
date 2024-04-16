@@ -5,50 +5,62 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
+	"github.com/google/syzkaller/pkg/stats"
 	"github.com/google/syzkaller/prog"
 )
 
 type RPCServer struct {
 	mgr                   RPCManagerView
 	cfg                   *mgrconfig.Config
+	server                *rpctype.RPCServer
 	modules               []host.KernelModule
 	port                  int
 	targetEnabledSyscalls map[*prog.Syscall]bool
 	coverFilter           map[uint32]uint32
-	stats                 *Stats
-	batchSize             int
 	canonicalModules      *cover.Canonicalizer
 
 	mu            sync.Mutex
-	fuzzers       map[string]*Fuzzer
-	checkResult   *rpctype.CheckArgs
-	maxSignal     signal.Signal
-	corpusSignal  signal.Signal
-	corpusCover   cover.Cover
-	rotator       *prog.Rotator
-	rnd           *rand.Rand
+	runners       sync.Map // Instead of map[string]*Runner.
+	checkFeatures *host.Features
+
 	checkFailures int
+
+	// We did not finish these requests because of VM restarts.
+	// They will be eventually given to other VMs.
+	rescuedInputs []*fuzzer.Request
+
+	statVMRestarts            *stats.Val
+	statExchangeCalls         *stats.Val
+	statExchangeProgs         *stats.Val
+	statExchangeServerLatency *stats.Val
+	statExchangeClientLatency *stats.Val
+	statCorpusCoverFiltered   *stats.Val
 }
 
-type Fuzzer struct {
-	name          string
-	rotated       bool
-	inputs        []rpctype.Input
+type Runner struct {
+	name string
+
+	machineInfo []byte
+	instModules *cover.CanonicalizerInstance
+
+	// The mutex protects newMaxSignal, dropMaxSignal, and requests.
+	mu            sync.Mutex
 	newMaxSignal  signal.Signal
-	rotatedSignal signal.Signal
-	machineInfo   []byte
-	instModules   *cover.CanonicalizerInstance
+	dropMaxSignal signal.Signal
+	nextRequestID atomic.Int64
+	requests      map[int64]*fuzzer.Request
 }
 
 type BugFrames struct {
@@ -58,163 +70,91 @@ type BugFrames struct {
 
 // RPCManagerView restricts interface between RPCServer and Manager.
 type RPCManagerView interface {
-	fuzzerConnect([]host.KernelModule) (
-		[]rpctype.Input, BugFrames, map[uint32]uint32, map[uint32]uint32, error)
-	machineChecked(result *rpctype.CheckArgs, enabledSyscalls map[*prog.Syscall]bool)
-	newInput(inp rpctype.Input, sign signal.Signal) bool
-	candidateBatch(size int) []rpctype.Candidate
-	rotateCorpus() bool
+	fuzzerConnect([]host.KernelModule) (BugFrames, map[uint32]uint32, map[uint32]uint32, error)
+	machineChecked(features *host.Features, globFiles map[string][]string, enabledSyscalls map[*prog.Syscall]bool)
+	getFuzzer() *fuzzer.Fuzzer
 }
 
 func startRPCServer(mgr *Manager) (*RPCServer, error) {
 	serv := &RPCServer{
-		mgr:     mgr,
-		cfg:     mgr.cfg,
-		stats:   mgr.stats,
-		fuzzers: make(map[string]*Fuzzer),
-		rnd:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		mgr: mgr,
+		cfg: mgr.cfg,
+		statVMRestarts: stats.Create("vm restarts", "Total number of VM starts",
+			stats.Rate{}, stats.NoGraph),
+		statExchangeCalls: stats.Create("exchange calls", "Number of RPC Exchange calls",
+			stats.Rate{}),
+		statExchangeProgs: stats.Create("exchange progs", "Test programs exchanged per RPC call",
+			stats.Distribution{}),
+		statExchangeServerLatency: stats.Create("exchange manager latency",
+			"Manager RPC Exchange call latency (us)", stats.Distribution{}),
+		statExchangeClientLatency: stats.Create("exchange fuzzer latency",
+			"End-to-end fuzzer RPC Exchange call latency (us)", stats.Distribution{}),
+		statCorpusCoverFiltered: stats.Create("filtered coverage", "", stats.NoGraph),
 	}
-	serv.batchSize = 5
-	if serv.batchSize < mgr.cfg.Procs {
-		serv.batchSize = mgr.cfg.Procs
-	}
-	s, err := rpctype.NewRPCServer(mgr.cfg.RPC, "Manager", serv)
+	s, err := rpctype.NewRPCServer(mgr.cfg.RPC, "Manager", serv, mgr.netCompression)
 	if err != nil {
 		return nil, err
 	}
 	log.Logf(0, "serving rpc on tcp://%v", s.Addr())
 	serv.port = s.Addr().(*net.TCPAddr).Port
+	serv.server = s
 	go s.Serve()
 	return serv, nil
 }
 
 func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) error {
 	log.Logf(1, "fuzzer %v connected", a.Name)
-	serv.stats.vmRestarts.inc()
+	serv.statVMRestarts.Add(1)
 
+	serv.mu.Lock()
 	if serv.canonicalModules == nil {
 		serv.canonicalModules = cover.NewCanonicalizer(a.Modules, serv.cfg.Cover)
 		serv.modules = a.Modules
 	}
-	corpus, bugFrames, coverFilter, execCoverFilter, err := serv.mgr.fuzzerConnect(serv.modules)
+	serv.mu.Unlock()
+
+	bugFrames, coverFilter, execCoverFilter, err := serv.mgr.fuzzerConnect(serv.modules)
 	if err != nil {
 		return err
 	}
-	serv.coverFilter = coverFilter
 
 	serv.mu.Lock()
 	defer serv.mu.Unlock()
 
-	f := &Fuzzer{
+	serv.coverFilter = coverFilter
+
+	runner := &Runner{
 		name:        a.Name,
 		machineInfo: a.MachineInfo,
 		instModules: serv.canonicalModules.NewInstance(a.Modules),
+		requests:    make(map[int64]*fuzzer.Request),
 	}
-	serv.fuzzers[a.Name] = f
+	if _, loaded := serv.runners.LoadOrStore(a.Name, runner); loaded {
+		return fmt.Errorf("duplicate connection from %s", a.Name)
+	}
 	r.MemoryLeakFrames = bugFrames.memoryLeaks
 	r.DataRaceFrames = bugFrames.dataRaces
 
-	instCoverFilter := f.instModules.DecanonicalizeFilter(execCoverFilter)
+	instCoverFilter := runner.instModules.DecanonicalizeFilter(execCoverFilter)
 	r.CoverFilterBitmap = createCoverageBitmap(serv.cfg.SysTarget, instCoverFilter)
 	r.EnabledCalls = serv.cfg.Syscalls
-	r.NoMutateCalls = serv.cfg.NoMutateCalls
 	r.GitRevision = prog.GitRevision
 	r.TargetRevision = serv.cfg.Target.Revision
-	if serv.mgr.rotateCorpus() && serv.rnd.Intn(5) == 0 {
-		// We do rotation every other time because there are no objective
-		// proofs regarding its efficiency either way.
-		// Also, rotation gives significantly skewed syscall selection
-		// (run prog.TestRotationCoverage), it may or may not be OK.
-		r.CheckResult = serv.rotateCorpus(f, corpus)
-	} else {
-		r.CheckResult = serv.checkResult
-		f.inputs = corpus
-		f.newMaxSignal = serv.maxSignal.Copy()
+	r.Features = serv.checkFeatures
+
+	if fuzzer := serv.mgr.getFuzzer(); fuzzer != nil {
+		// A Fuzzer object is created after the first Check() call.
+		// If there was none, there would be no collected max signal either.
+		runner.newMaxSignal = fuzzer.Cover.CopyMaxSignal()
 	}
 	return nil
-}
-
-func (serv *RPCServer) rotateCorpus(f *Fuzzer, corpus []rpctype.Input) *rpctype.CheckArgs {
-	// Fuzzing tends to stuck in some local optimum and then it fails to cover
-	// other state space points since code coverage is only a very approximate
-	// measure of logic coverage. To overcome this we introduce some variation
-	// into the process which should cause steady corpus rotation over time
-	// (the same coverage is achieved in different ways).
-	//
-	// First, we select a subset of all syscalls for each VM run (result.EnabledCalls).
-	// This serves 2 goals: (1) target fuzzer at a particular area of state space,
-	// (2) disable syscalls that cause frequent crashes at least in some runs
-	// to allow it to do actual fuzzing.
-	//
-	// Then, we remove programs that contain disabled syscalls from corpus
-	// that will be sent to the VM (f.inputs). We also remove 10% of remaining
-	// programs at random to allow to rediscover different variations of these programs.
-	//
-	// Then, we drop signal provided by the removed programs and also 10%
-	// of the remaining signal at random (f.newMaxSignal). This again allows
-	// rediscovery of this signal by different programs.
-	//
-	// Finally, we adjust criteria for accepting new programs from this VM (f.rotatedSignal).
-	// This allows to accept rediscovered varied programs even if they don't
-	// increase overall coverage. As the result we have multiple programs
-	// providing the same duplicate coverage, these are removed during periodic
-	// corpus minimization process. The minimization process is specifically
-	// non-deterministic to allow the corpus rotation.
-	//
-	// Note: at no point we drop anything globally and permanently.
-	// Everything we remove during this process is temporal and specific to a single VM.
-	calls := serv.rotator.Select()
-
-	var callIDs []int
-	callNames := make(map[string]bool)
-	for call := range calls {
-		callNames[call.Name] = true
-		callIDs = append(callIDs, call.ID)
-	}
-
-	f.inputs, f.newMaxSignal = serv.selectInputs(callNames, corpus, serv.maxSignal)
-	// Remove the corresponding signal from rotatedSignal which will
-	// be used to accept new inputs from this manager.
-	f.rotatedSignal = serv.corpusSignal.Intersection(f.newMaxSignal)
-	f.rotated = true
-
-	result := *serv.checkResult
-	result.EnabledCalls = map[string][]int{serv.cfg.Sandbox: callIDs}
-	return &result
-}
-
-func (serv *RPCServer) selectInputs(enabled map[string]bool, inputs0 []rpctype.Input, signal0 signal.Signal) (
-	inputs []rpctype.Input, signal signal.Signal) {
-	signal = signal0.Copy()
-	for _, inp := range inputs0 {
-		calls, _, err := prog.CallSet(inp.Prog)
-		if err != nil {
-			panic(fmt.Sprintf("rotateInputs: CallSet failed: %v\n%s", err, inp.Prog))
-		}
-		for call := range calls {
-			if !enabled[call] {
-				goto drop
-			}
-		}
-		if serv.rnd.Float64() > 0.9 {
-			goto drop
-		}
-		inputs = append(inputs, inp)
-		continue
-	drop:
-		for _, sig := range inp.Signal.Elems {
-			delete(signal, sig)
-		}
-	}
-	signal.Split(len(signal) / 10)
-	return inputs, signal
 }
 
 func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
 	serv.mu.Lock()
 	defer serv.mu.Unlock()
 
-	if serv.checkResult != nil {
+	if serv.checkFeatures != nil {
 		return nil // another VM has already made the check
 	}
 	// Note: need to print disbled syscalls before failing due to an error.
@@ -248,151 +188,182 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
 	for _, feat := range a.Features.Supported() {
 		log.Logf(0, "%-24v: %v", feat.Name, feat.Reason)
 	}
-	serv.mgr.machineChecked(a, serv.targetEnabledSyscalls)
-	a.DisabledCalls = nil
-	serv.checkResult = a
-	serv.rotator = prog.MakeRotator(serv.cfg.Target, serv.targetEnabledSyscalls, serv.rnd)
+	serv.mgr.machineChecked(a.Features, a.GlobFiles, serv.targetEnabledSyscalls)
+	serv.checkFeatures = a.Features
 	return nil
 }
 
-func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
-	bad, disabled := checkProgram(serv.cfg.Target, serv.targetEnabledSyscalls, a.Input.Prog)
-	if bad || disabled {
-		log.Logf(0, "rejecting program from fuzzer (bad=%v, disabled=%v):\n%s", bad, disabled, a.Input.Prog)
-		return nil
-	}
-	serv.mu.Lock()
-	defer serv.mu.Unlock()
-
-	f := serv.fuzzers[a.Name]
-	if f != nil {
-		a.Cover, a.Signal = f.instModules.Canonicalize(a.Cover, a.Signal)
-	}
-	inputSignal := a.Signal.Deserialize()
-	log.Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",
-		a.Name, a.Call, inputSignal.Len(), len(a.Cover))
-	// Note: f may be nil if we called shutdownInstance,
-	// but this request is already in-flight.
-	genuine := !serv.corpusSignal.Diff(inputSignal).Empty()
-	rotated := false
-	if !genuine && f != nil && f.rotated {
-		rotated = !f.rotatedSignal.Diff(inputSignal).Empty()
-	}
-	if !genuine && !rotated {
-		return nil
-	}
-	if !serv.mgr.newInput(a.Input, inputSignal) {
+func (serv *RPCServer) ExchangeInfo(a *rpctype.ExchangeInfoRequest, r *rpctype.ExchangeInfoReply) error {
+	start := time.Now()
+	var runner *Runner
+	if val, _ := serv.runners.Load(a.Name); val != nil {
+		runner = val.(*Runner)
+	} else {
+		// There might be a parallel shutdownInstance().
+		// Ignore the request then.
 		return nil
 	}
 
-	if f != nil && f.rotated {
-		f.rotatedSignal.Merge(inputSignal)
-	}
-	diff := serv.corpusCover.MergeDiff(a.Cover)
-	serv.stats.corpusCover.set(len(serv.corpusCover))
-	if len(diff) != 0 && serv.coverFilter != nil {
-		// Note: ReportGenerator is already initialized if coverFilter is enabled.
-		rg, err := getReportGenerator(serv.cfg, serv.modules)
-		if err != nil {
-			return err
-		}
-		filtered := 0
-		for _, pc := range diff {
-			if serv.coverFilter[uint32(rg.RestorePC(pc))] != 0 {
-				filtered++
-			}
-		}
-		serv.stats.corpusCoverFiltered.add(filtered)
-	}
-	serv.stats.newInputs.inc()
-	if rotated {
-		serv.stats.rotatedInputs.inc()
-	}
-
-	if genuine {
-		serv.corpusSignal.Merge(inputSignal)
-		serv.stats.corpusSignal.set(serv.corpusSignal.Len())
-
-		a.Input.Cover = nil // Don't send coverage back to all fuzzers.
-		a.Input.RawCover = nil
-		for _, other := range serv.fuzzers {
-			if other == f || other.rotated {
-				continue
-			}
-			other.inputs = append(other.inputs, a.Input)
-		}
-	}
-	return nil
-}
-
-func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
-	serv.stats.mergeNamed(a.Stats)
-
-	serv.mu.Lock()
-	defer serv.mu.Unlock()
-
-	f := serv.fuzzers[a.Name]
-	if f == nil {
-		// This is possible if we called shutdownInstance,
-		// but already have a pending request from this instance in-flight.
-		log.Logf(1, "poll: fuzzer %v is not connected", a.Name)
-		return nil
-	}
-	newMaxSignal := serv.maxSignal.Diff(a.MaxSignal.Deserialize())
-	if !newMaxSignal.Empty() {
-		serv.maxSignal.Merge(newMaxSignal)
-		serv.stats.maxSignal.set(len(serv.maxSignal))
-		for _, f1 := range serv.fuzzers {
-			if f1 == f || f1.rotated {
-				continue
-			}
-			f1.newMaxSignal.Merge(newMaxSignal)
-		}
-	}
-	if f.rotated {
-		// Let rotated VMs run in isolation, don't send them anything.
-		return nil
-	}
-	r.MaxSignal = f.newMaxSignal.Split(2000).Serialize()
-	if a.NeedCandidates {
-		r.Candidates = serv.mgr.candidateBatch(serv.batchSize)
-	}
-	if len(r.Candidates) == 0 {
-		batchSize := serv.batchSize
-		// When the fuzzer starts, it pumps the whole corpus.
-		// If we do it using the final batchSize, it can be very slow
-		// (batch of size 6 can take more than 10 mins for 50K corpus and slow kernel).
-		// So use a larger batch initially (we use no stats as approximation of initial pump).
-		const initialBatch = 50
-		if len(a.Stats) == 0 && batchSize < initialBatch {
-			batchSize = initialBatch
-		}
-		for i := 0; i < batchSize && len(f.inputs) > 0; i++ {
-			last := len(f.inputs) - 1
-			r.NewInputs = append(r.NewInputs, f.inputs[last])
-			f.inputs[last] = rpctype.Input{}
-			f.inputs = f.inputs[:last]
-		}
-		if len(f.inputs) == 0 {
-			f.inputs = nil
-		}
-	}
-	for _, inp := range r.NewInputs {
-		inp.Cover, inp.Signal = f.instModules.Decanonicalize(inp.Cover, inp.Signal)
-	}
-	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v",
-		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems))
-	return nil
-}
-
-func (serv *RPCServer) shutdownInstance(name string) []byte {
-	serv.mu.Lock()
-	defer serv.mu.Unlock()
-
-	fuzzer := serv.fuzzers[name]
+	fuzzer := serv.mgr.getFuzzer()
 	if fuzzer == nil {
+		// ExchangeInfo calls follow MachineCheck, so the fuzzer must have been initialized.
+		panic("exchange info call with nil fuzzer")
+	}
+
+	// Try to collect some of the postponed requests.
+	if serv.mu.TryLock() {
+		for i := len(serv.rescuedInputs) - 1; i >= 0 && a.NeedProgs > 0; i-- {
+			inp := serv.rescuedInputs[i]
+			serv.rescuedInputs[i] = nil
+			serv.rescuedInputs = serv.rescuedInputs[:i]
+			r.Requests = append(r.Requests, runner.newRequest(inp))
+			a.NeedProgs--
+		}
+		serv.mu.Unlock()
+	}
+
+	// First query new inputs and only then post results.
+	// It should foster a more even distribution of executions
+	// across all VMs.
+	for i := 0; i < a.NeedProgs; i++ {
+		inp := fuzzer.NextInput()
+		r.Requests = append(r.Requests, runner.newRequest(inp))
+	}
+
+	for _, result := range a.Results {
+		runner.doneRequest(result, fuzzer)
+	}
+
+	stats.Import(a.StatsDelta)
+
+	runner.mu.Lock()
+	// Let's transfer new max signal in portions.
+
+	const transferMaxSignal = 500000
+	newSignal := runner.newMaxSignal.Split(transferMaxSignal)
+	dropSignal := runner.dropMaxSignal.Split(transferMaxSignal)
+	runner.mu.Unlock()
+
+	r.NewMaxSignal = runner.instModules.Decanonicalize(newSignal.ToRaw())
+	r.DropMaxSignal = runner.instModules.Decanonicalize(dropSignal.ToRaw())
+
+	log.Logf(2, "exchange with %s: %d done, %d new requests, %d new max signal, %d drop signal",
+		a.Name, len(a.Results), len(r.Requests), len(r.NewMaxSignal), len(r.DropMaxSignal))
+
+	serv.statExchangeCalls.Add(1)
+	serv.statExchangeProgs.Add(a.NeedProgs)
+	serv.statExchangeClientLatency.Add(int(a.Latency.Microseconds()))
+	serv.statExchangeServerLatency.Add(int(time.Since(start).Microseconds()))
+	return nil
+}
+
+func (serv *RPCServer) updateFilteredCover(pcs []uint32) error {
+	if len(pcs) == 0 || serv.coverFilter == nil {
 		return nil
 	}
-	delete(serv.fuzzers, name)
-	return fuzzer.machineInfo
+	// Note: ReportGenerator is already initialized if coverFilter is enabled.
+	rg, err := getReportGenerator(serv.cfg, serv.modules)
+	if err != nil {
+		return err
+	}
+	filtered := 0
+	for _, pc := range pcs {
+		if serv.coverFilter[uint32(rg.RestorePC(pc))] != 0 {
+			filtered++
+		}
+	}
+	serv.statCorpusCoverFiltered.Add(filtered)
+	return nil
+}
+
+func (serv *RPCServer) shutdownInstance(name string, crashed bool) []byte {
+	var runner *Runner
+	if val, _ := serv.runners.LoadAndDelete(name); val != nil {
+		runner = val.(*Runner)
+	} else {
+		return nil
+	}
+
+	runner.mu.Lock()
+	if runner.requests == nil {
+		// We are supposed to invoke this code only once.
+		panic("Runner.requests is already nil")
+	}
+	oldRequests := runner.requests
+	runner.requests = nil
+	runner.mu.Unlock()
+
+	if crashed {
+		// The VM likely crashed, so let's tell pkg/fuzzer to abort the affected jobs.
+		// fuzzerObj may be null, but in that case oldRequests would be empty as well.
+		fuzzerObj := serv.mgr.getFuzzer()
+		for _, req := range oldRequests {
+			fuzzerObj.Done(req, &fuzzer.Result{Stop: true})
+		}
+	} else {
+		// We will resend these inputs to another VM.
+		serv.mu.Lock()
+		for _, req := range oldRequests {
+			serv.rescuedInputs = append(serv.rescuedInputs, req)
+		}
+		serv.mu.Unlock()
+	}
+	return runner.machineInfo
+}
+
+func (serv *RPCServer) distributeSignalDelta(plus, minus signal.Signal) {
+	serv.runners.Range(func(key, value any) bool {
+		runner := value.(*Runner)
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		runner.newMaxSignal.Merge(plus)
+		runner.dropMaxSignal.Merge(minus)
+		return true
+	})
+}
+
+func (runner *Runner) doneRequest(resp rpctype.ExecutionResult, fuzzerObj *fuzzer.Fuzzer) {
+	runner.mu.Lock()
+	req, ok := runner.requests[resp.ID]
+	if ok {
+		delete(runner.requests, resp.ID)
+	}
+	runner.mu.Unlock()
+	if !ok {
+		// There may be a concurrent shutdownInstance() call.
+		return
+	}
+	info := &resp.Info
+	for i := 0; i < len(info.Calls); i++ {
+		call := &info.Calls[i]
+		call.Cover = runner.instModules.Canonicalize(call.Cover)
+		call.Signal = runner.instModules.Canonicalize(call.Signal)
+	}
+	info.Extra.Cover = runner.instModules.Canonicalize(info.Extra.Cover)
+	info.Extra.Signal = runner.instModules.Canonicalize(info.Extra.Signal)
+	fuzzerObj.Done(req, &fuzzer.Result{Info: info})
+}
+
+func (runner *Runner) newRequest(req *fuzzer.Request) rpctype.ExecutionRequest {
+	var signalFilter signal.Signal
+	if req.SignalFilter != nil {
+		newRawSignal := runner.instModules.Decanonicalize(req.SignalFilter.ToRaw())
+		// We don't care about specific priorities here.
+		signalFilter = signal.FromRaw(newRawSignal, 0)
+	}
+	id := runner.nextRequestID.Add(1)
+	runner.mu.Lock()
+	if runner.requests != nil {
+		runner.requests[id] = req
+	}
+	runner.mu.Unlock()
+	return rpctype.ExecutionRequest{
+		ID:               id,
+		ProgData:         req.Prog.Serialize(),
+		NeedCover:        req.NeedCover,
+		NeedSignal:       req.NeedSignal,
+		SignalFilter:     signalFilter,
+		SignalFilterCall: req.SignalFilterCall,
+		NeedHints:        req.NeedHints,
+	}
 }

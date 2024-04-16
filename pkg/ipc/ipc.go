@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -68,6 +69,7 @@ type Config struct {
 
 	UseShmem      bool // use shared memory instead of pipes for communication
 	UseForkServer bool // use extended protocol with handshake
+	RateLimit     bool // rate limit start of new processes for host fuzzer mode
 
 	// Flags are configuation flags, defined above.
 	Flags      EnvFlags
@@ -95,8 +97,9 @@ type CallInfo struct {
 }
 
 type ProgInfo struct {
-	Calls []CallInfo
-	Extra CallInfo // stores Signal and Cover collected from background threads
+	Calls   []CallInfo
+	Extra   CallInfo      // stores Signal and Cover collected from background threads
+	Elapsed time.Duration // total execution time of the program
 }
 
 type Env struct {
@@ -245,8 +248,6 @@ func (env *Env) Close() error {
 	}
 }
 
-var rateLimit = time.NewTicker(1 * time.Second)
-
 // Exec starts executor binary to execute program p and returns information about the execution:
 // output: process output
 // info: per-call info
@@ -270,20 +271,14 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
 	}
 
 	atomic.AddUint64(&env.StatExecs, 1)
-	if env.cmd == nil {
-		if p.Target.OS != targets.TestOS && targets.Get(p.Target.OS, p.Target.Arch).HostFuzzer {
-			// The executor is actually ssh,
-			// starting them too frequently leads to timeouts.
-			<-rateLimit.C
-		}
-		tmpDirPath := "./"
-		atomic.AddUint64(&env.StatRestarts, 1)
-		env.cmd, err0 = makeCommand(env.pid, env.bin, env.config, env.inFile, env.outFile, env.out, tmpDirPath)
-		if err0 != nil {
-			return
-		}
+	err0 = env.RestartIfNeeded()
+	if err0 != nil {
+		return
 	}
+
+	start := osutil.MonotonicNano()
 	output, hanged, err0 = env.cmd.exec(opts, progData)
+	elapsed := osutil.MonotonicNano() - start
 	if err0 != nil {
 		env.cmd.close()
 		env.cmd = nil
@@ -291,8 +286,11 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
 	}
 
 	info, err0 = env.parseOutput(p, opts)
-	if info != nil && env.config.Flags&FlagSignal == 0 {
-		addFallbackSignal(p, info)
+	if info != nil {
+		info.Elapsed = elapsed
+		if env.config.Flags&FlagSignal == 0 {
+			addFallbackSignal(p, info)
+		}
 	}
 	if !env.config.UseForkServer {
 		env.cmd.close()
@@ -300,6 +298,36 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
 	}
 	return
 }
+
+func (env *Env) ForceRestart() {
+	if env.cmd != nil {
+		env.cmd.close()
+		env.cmd = nil
+	}
+}
+
+// RestartIfNeeded brings up an executor process if it was stopped.
+func (env *Env) RestartIfNeeded() error {
+	if env.cmd != nil {
+		return nil
+	}
+	if env.config.RateLimit {
+		rateLimiterOnce.Do(func() {
+			rateLimiter = time.NewTicker(1 * time.Second).C
+		})
+		<-rateLimiter
+	}
+	tmpDirPath := "./"
+	atomic.AddUint64(&env.StatRestarts, 1)
+	var err error
+	env.cmd, err = makeCommand(env.pid, env.bin, env.config, env.inFile, env.outFile, env.out, tmpDirPath)
+	return err
+}
+
+var (
+	rateLimiterOnce sync.Once
+	rateLimiter     <-chan time.Time
+)
 
 // addFallbackSignal computes simple fallback signal in cases we don't have real coverage signal.
 // We use syscall number or-ed with returned errno value as signal.
@@ -477,13 +505,17 @@ func readUint32Array(outp *[]byte, size uint32) ([]uint32, bool) {
 	if int(size)*4 > len(out) {
 		return nil, false
 	}
+	// "Convert" the data to uint32.
 	var res []uint32
 	hdr := (*reflect.SliceHeader)((unsafe.Pointer(&res)))
 	hdr.Data = uintptr(unsafe.Pointer(&out[0]))
 	hdr.Len = int(size)
 	hdr.Cap = int(size)
 	*outp = out[size*4:]
-	return res, true
+	// Now duplicate the resulting array.
+	dupRes := make([]uint32, size)
+	copy(dupRes, res)
+	return dupRes, true
 }
 
 type command struct {
@@ -561,7 +593,7 @@ func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File
 		// Executor has an internal timeout and protects against most hangs when fork server is enabled,
 		// so we use quite large timeout. Executor can be slow due to global locks in namespaces
 		// and other things, so let's better wait than report false misleading crashes.
-		timeout *= 10
+		timeout *= 5
 	}
 
 	c := &command{
